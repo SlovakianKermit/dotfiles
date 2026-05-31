@@ -1,0 +1,17 @@
+configs/brave/
+configs/discord/
+configs/legcord/
+configs/vesktop/
+configs/sunshine/
+configs/BraveSoftware/
+dotfiles/xnviewmp/Thumb.db
+dotfiles/xnviewmp/XnView.db
+dotfiles/qBittorrent/lockfile
+configs/obsidian/IndexedDB/
+configs/obsidian/Cache/
+configs/obsidian/Code Cache/
+configs/obsidian/GPUCache/
+configs/obsidian/DawnGraphiteCache/
+configs/obsidian/DawnWebGPUCache/
+configs/obsidian/Session Storage/
+configs/obsidian/Local Storage/

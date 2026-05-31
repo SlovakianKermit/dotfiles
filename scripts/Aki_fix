@@ -1,0 +1,235 @@
+#!/bin/bash
+
+BASE="$HOME/Pictures/img/Akihime"
+cd "$BASE" || exit 1
+
+move() {
+    local folder="$1"
+    local dest="$2"
+    if [ -d "$folder" ]; then
+        mkdir -p "$dest"
+        mv "$folder" "$dest/"
+    fi
+}
+
+rename_and_move() {
+    local old="$1"
+    local new="$2"
+    local dest="$3"
+    if [ -d "$old" ]; then
+        mv "$old" "$new"
+        mkdir -p "$dest"
+        mv "$new" "$dest/"
+    fi
+}
+
+# --- 2026.04 ---
+move "Epsilon"         "2026.04"
+move "Cissia"          "2026.04"
+
+# --- 2026.03 ---
+move "Cinderella"      "2026.03"
+move "Seira"           "2026.03"
+move "Phrolova"        "2026.03"
+move "Mornye"          "2026.03"
+move "Carlotta"        "2026.03"
+move "Cantarella"      "2026.03"
+move "Aqua"            "2026.03"
+rename_and_move "StLuois"  "StLouis"   "2026.03"
+move "Ellen"           "2026.03"
+rename_and_move "Toki"     "AsumaToki" "2026.03"
+
+# --- 2026.02 ---
+rename_and_move "Kakfa"    "Kafka"     "2026.02"
+move "Karin"           "2026.02"
+move "Yanagi"          "2026.02"
+move "Iuno"            "2026.02"
+move "Maxwell"         "2026.02"
+move "Momo"            "2026.02"
+move "Nelliel"         "2026.02"
+move "MarinShizuku"    "2026.02"
+move "MarinLiz"        "2026.02"
+
+# --- 2026.01 ---
+move "RionAkao"        "2026.01"
+move "Nicole"          "2026.01"
+move "Leona"           "2026.01"
+move "Camilla"         "2026.01"
+move "IchinoseAsuna"   "2026.01"
+move "Castorice"       "2026.01"
+move "JaneDoe"         "2026.01"
+move "Dialyn"          "2026.01"
+
+# --- 2025.12 ---
+move "YeShunguang"     "2025.12"
+move "Nihilister"      "2025.12"
+move "Nefer2"          "2025.12"
+move "Esdeath"         "2025.12"
+move "Aoi"             "2025.12"
+move "Feixiao"         "2025.12"
+move "Amo"             "2025.12"
+rename_and_move "Reaper"   "RiyoReaper" "2025.12"
+move "Shikimori"       "2025.12"
+move "Ayaka"           "2025.12"
+move "Mitsuki"         "2025.12"
+move "Alpha"           "2025.12"
+
+# --- 2025.11 ---
+move "Reze"            "2025.11"
+move "Midnight"        "2025.11"
+move "MtLady"          "2025.11"
+move "Zani"            "2025.11"
+move "Nayuta"          "2025.11"
+rename_and_move "Orpheus"  "Orphie"    "2025.11"
+move "Yidhari"         "2025.11"
+move "Ruby"            "2025.11"
+move "Freya"           "2025.11"
+
+# --- 2025.10 ---
+move "Evernight"       "2025.10"
+move "Trigger"         "2025.10"
+move "HoshinoAi"       "2025.10"
+move "Masha"           "2025.10"
+move "Mualani"         "2025.10"
+move "TheHerta"        "2025.10"
+
+# --- 2025.09 ---
+move "Eclipse"         "2025.09"
+move "Miyabi"          "2025.09"
+move "Alya"            "2025.09"
+move "Darkness"        "2025.09"
+move "Darkness(1)"     "2025.09"
+move "Yuzuha"          "2025.09"
+move "Rio"             "2025.09"
+move "Arisa"           "2025.09"
+move "AliceThymefield" "2025.09"
+move "YamadaAnna"      "2025.09"
+move "Marin"           "2025.09"
+
+# --- 2025.08 ---
+move "Yor2"            "2025.08"
+move "Tohru"           "2025.08"
+move "Ubel"            "2025.08"
+move "Ubel(1)"         "2025.08"
+move "Evelyn"          "2025.08"
+move "Kallen"          "2025.08"
+move "Maomao"          "2025.08"
+move "Hapi"            "2025.08"
+move "Alexia"          "2025.08"
+move "Hestia2"         "2025.08"
+move "Elizabeth"       "2025.08"
+
+# --- 2025.07 ---
+move "Emilia"          "2025.07"
+move "Firefly"         "2025.07"
+move "Toga"            "2025.07"
+rename_and_move "Nagant"   "KainaTsutsumi" "2025.07"
+move "Caesar"          "2025.07"
+move "ZhuYuan"         "2025.07"
+move "Skirk"           "2025.07"
+move "Uraraka"         "2025.07"
+move "Utsushimi"       "2025.07"
+
+# --- 2025.06 ---
+move "Nejire"          "2025.06"
+move "Mirko"           "2025.06"
+move "Fleurdelys"      "2025.06"
+move "Chizuru"         "2025.06"
+move "Raiden"          "2025.06"
+move "Mandalay"        "2025.06"
+move "YiXuan"          "2025.06"
+move "Varesa"          "2025.06"
+move "Burnice"         "2025.06"
+move "Vivian"          "2025.06"
+move "Nezuko"          "2025.06"
+move "Takina"          "2025.06"
+
+# --- 2025.05 ---
+move "Rangiku"         "2025.05"
+move "RinTohsaka"      "2025.05"
+move "Nino"            "2025.05"
+move "Kanao"           "2025.05"
+move "Alice"           "2025.05"
+move "Erina"           "2025.05"
+move "Akane"           "2025.05"
+move "Vi"              "2025.05"
+move "Jinx"            "2025.05"
+move "Holo"            "2025.05"
+move "Setsuna"         "2025.05"
+move "Jalter"          "2025.05"
+move "Robin"           "2025.05"
+
+# --- 2025.04 ---
+move "Asuka"           "2025.04"
+move "Arlecchino"      "2025.04"
+move "Samus"           "2025.04"
+move "Rina"            "2025.04"
+move "Shalltear"       "2025.04"
+move "Priscilla"       "2025.04"
+move "Mizuki"          "2025.04"
+move "Xenovia"         "2025.04"
+move "RiasGremory"     "2025.04"
+move "Albedo"          "2025.04"
+move "Jin-Ah"          "2025.04"
+move "EsilRadiru"      "2025.04"
+move "ChaHaeIn"        "2025.04"
+move "SeikoAyase"      "2025.04"
+move "MomoAyase"       "2025.04"
+move "Beta"            "2025.04"
+
+# --- 2025.03 ---
+move "Ganyu"           "2025.03"
+move "Eula"            "2025.03"
+move "Delta"           "2025.03"
+move "DeltaSFW"        "2025.03"
+move "Keqing"          "2025.03"
+move "Frieren"         "2025.03"
+move "Orihime"         "2025.03"
+move "Mona"            "2025.03"
+move "JaneDoe(1)"      "2025.03"
+
+# --- 2025.02 ---
+move "KanaxRuby"       "2025.02"
+move "KanaxAkane"      "2025.02"
+move "ArimaKana"       "2025.02"
+move "2B"              "2025.02"
+move "Rem"             "2025.02"
+move "ShinobuKocho"    "2025.02"
+move "MitsurixShinobu" "2025.02"
+move "MitsuriKanroji"  "2025.02"
+move "TamakiKotatsu"   "2025.02"
+move "TamakiXIris"     "2025.02"
+move "AkenoHimejimai"  "2025.02"
+move "RukiaKuchiki"    "2025.02"
+
+# --- 2025.01 ---
+move "AliceZuberg"     "2025.01"
+move "YoruichiShihouin" "2025.01"
+move "Fubuki"          "2025.01"
+move "HoshimiMiyabi"   "2025.01"
+move "SylphaLanglis"   "2025.01"
+move "Rosaria"         "2025.01"
+move "Hestia"          "2025.01"
+move "YorForger"       "2025.01"
+
+# --- 2024.12 ---
+move "SilverWolf"      "2024.12"
+move "Fern"            "2024.12"
+move "Aqua(1)"         "2024.12"
+move "EllenJoe"        "2024.12"
+move "ChisatoNishikigi" "2024.12"
+move "KurumiTokisaki"  "2024.12"
+move "RubyHoshino"     "2024.12"
+move "NinoNakano"      "2024.12"
+move "VladilenaMilize" "2024.12"
+
+# --- misc ---
+move "2"               "misc"
+move "Beach"           "misc"
+move "Pics"            "misc"
+move "pics"            "misc"
+move "Pics(1)"         "misc"
+move "Random"          "misc"
+move "Random1"         "misc"
+
+echo "Done."

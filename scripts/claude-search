@@ -1,0 +1,45 @@
+#!/usr/bin/env fish
+# Search through exported Claude conversations using ripgrep + fzf
+# Usage: claude-search [directory] [initial query]
+# If no directory given, uses CLAUDE_EXPORT_DIR env var or ~/claude-conversations
+
+set search_dir $argv[1]
+
+if test -z "$search_dir"
+    if set -q CLAUDE_EXPORT_DIR
+        set search_dir $CLAUDE_EXPORT_DIR
+    else
+        set search_dir ~/claude-conversations
+    end
+end
+
+if not test -d "$search_dir"
+    echo "Error: Directory not found: $search_dir"
+    echo "Run claude-export-to-md.py first, or set CLAUDE_EXPORT_DIR"
+    exit 1
+end
+
+if not command -q rg
+    echo "Error: ripgrep (rg) not installed. Install with: paru -S ripgrep"
+    exit 1
+end
+
+if not command -q fzf
+    echo "Error: fzf not installed. Install with: paru -S fzf"
+    exit 1
+end
+
+set INITIAL_QUERY $argv[2]
+
+rg --files-with-matches --smart-case '' $search_dir \
+| sort \
+| fzf \
+    --ansi \
+    --query "$INITIAL_QUERY" \
+    --prompt '  Search conversations > ' \
+    --preview 'echo "--- {} ---" && echo && grep -i --color=always -C 3 {q} {} 2>/dev/null | sed "s/^#\+\s//; s/\*\*//g; s/__//g; s/\*//g; s/\`//g; s/^---$//" || cat {}' \
+    --preview-window 'right:60%:wrap' \
+    --header 'ENTER to open in nvim | CTRL-C to exit' \
+    --disabled \
+    --bind "change:reload(rg --files-with-matches --smart-case {q} $search_dir 2>/dev/null | sort || true)" \
+    --bind 'enter:execute(nvim {1})'

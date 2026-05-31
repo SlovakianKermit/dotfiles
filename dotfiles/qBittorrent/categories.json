@@ -1,0 +1,14 @@
+{
+    "Image": {
+        "download_path": "/home/kilian/Pictures/img/Downloads/Cooking",
+        "save_path": "/home/kilian/Pictures/img/Downloads"
+    },
+    "Movies": {
+        "download_path": false,
+        "save_path": ""
+    },
+    "Shows": {
+        "download_path": false,
+        "save_path": ""
+    }
+}

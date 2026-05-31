@@ -1,0 +1,16 @@
+[StreamInputs]
+inputDevice=alsa_input.usb-Focusrite_Scarlett_2i2_USB_Y834X2X1B15239-00.pro-input-0
+
+[StreamOutputs]
+outputDevice=alsa_output.usb-Focusrite_Scarlett_2i2_USB_Y834X2X1B15239-00.pro-output-0
+plugins=equalizer#0,equalizer#1
+visiblePage=pluginsPage
+visiblePlugin=equalizer#1
+
+[TestSignals]
+signalType=pinkNoise
+
+[Window]
+height=1380
+visiblePipeWirePage=testSignalsPage
+width=2560
