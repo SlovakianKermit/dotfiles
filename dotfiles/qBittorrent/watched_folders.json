@@ -1,5 +1,5 @@
 {
-    "/home/kilian/Downloads": {
+    "/home/killian/Downloads": {
         "add_torrent_params": {
             "category": "Image",
             "download_limit": -1,
@@ -14,9 +14,7 @@
             "ssl_certificate": "",
             "ssl_dh_params": "",
             "ssl_private_key": "",
-            "stopped": false,
             "tags": [
-                "Image"
             ],
             "upload_limit": -1,
             "use_auto_tmm": true

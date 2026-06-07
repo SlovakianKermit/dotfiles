@@ -1,13 +1,13 @@
 #!/bin/bash
 cd /tmp || exit 1
-BASE_ROOT="/home/kilian/Pictures/img"
+BASE_ROOT="$HOME/Pictures/img"
 if [[ "$1" =~ ^[0-9]+$ ]]; then
   BASE="$BASE_ROOT"
-  QUALITY="${1:-90}"
+  QUALITY="${1:-85}"
   METHOD="${2:-4}"
 else
-  BASE="${BASE_ROOT}${1:+/$1}"
-  QUALITY="${2:-90}"
+  [[ "$1" == /* ]] && BASE="$1" || BASE="${BASE_ROOT}${1:+/$1}"
+  QUALITY="${2:-85}"
   METHOD="${3:-4}"
 fi
 TARGET_W=2560

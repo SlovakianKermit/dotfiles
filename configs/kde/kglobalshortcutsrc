@@ -1,6 +1,7 @@
 [ActivityManager]
 _k_friendly_name=Activity Manager
 switch-to-activity-0cfe51f4-0f34-4b04-922b-d1f7e4c2d8f9=none,none,Switch to activity "Default"
+switch-to-activity-2b89c19e-c34f-4dac-9e1f-23dd667f384c=none,none,Switch to activity "Default"
 
 [KDE Keyboard Layout Switcher]
 Switch to Last-Used Keyboard Layout=Meta+Alt+L,Meta+Alt+L,Switch to Last-Used Keyboard Layout
@@ -19,8 +20,8 @@ decrease_volume_small=Shift+Volume Down,Shift+Volume Down,Decrease Volume by 1%
 increase_microphone_volume=Microphone Volume Up,Microphone Volume Up,Increase Microphone Volume
 increase_volume=Volume Up,Volume Up,Increase Volume
 increase_volume_small=Shift+Volume Up,Shift+Volume Up,Increase Volume by 1%
-mic_mute=Meta+Volume Mute\tNum++\tMicrophone Mute\tEnd,Microphone Mute\tMeta+Volume Mute,Mute Microphone
-mute=Num+-\tVolume Mute\tPgDown,Volume Mute,Mute
+mic_mute=End\tMicrophone Mute\tMeta+Volume Mute,Microphone Mute\tMeta+Volume Mute,Mute Microphone
+mute=Volume Mute\tPgDown,Volume Mute,Mute
 
 [ksmserver]
 Halt Without Confirmation=,,Shut Down Without Confirmation
@@ -46,7 +47,7 @@ ExposeClass=Meta+F7\tCtrl+F7,Meta+F7\tCtrl+F7,Toggle Present Windows (Window cla
 ExposeClassCurrentDesktop=none,none,Toggle Present Windows (Window class on current desktop)
 Grid View=Meta+G,Meta+G,Toggle Grid View
 Increase Opacity=,,Increase Opacity of Active Window by 5%
-Kill Window=none,Meta+Ctrl+Esc,Kill Window
+Kill Window=Meta+Ctrl+Esc,Meta+Ctrl+Esc,Kill Window
 Move Tablet to Next LogicalOutput=none,none,Move the tablet to the next output
 MoveMouseToCenter=Meta+F6,Meta+F6,Move Mouse to Centre
 MoveMouseToFocus=Meta+F5,Meta+F5,Move Mouse to Focus
@@ -108,17 +109,17 @@ Switch to Screen to the Left=,,Switch to Screen to the Left
 Switch to Screen to the Right=,,Switch to Screen to the Right
 Toggle Night Color=none,none,Suspend/Resume Night Light
 Toggle Window Raise/Lower=,,Toggle Window Raise/Lower
-Walk Through Windows=none,Meta+Tab\tAlt+Tab,Walk Through Windows
-Walk Through Windows (Reverse)=none,Meta+Shift+Tab\tAlt+Shift+Tab,Walk Through Windows (Reverse)
+Walk Through Windows=Meta+Tab,Meta+Tab\tAlt+Tab,Walk Through Windows
+Walk Through Windows (Reverse)=Meta+Shift+Tab,Meta+Shift+Tab\tAlt+Shift+Tab,Walk Through Windows (Reverse)
 Walk Through Windows Alternative=Alt+Tab,none,Walk Through Windows Alternative
 Walk Through Windows Alternative (Reverse)=Alt+Shift+Tab,none,Walk Through Windows Alternative (Reverse)
 Walk Through Windows of Current Application=Meta+`\tAlt+`,Meta+`\tAlt+`,Walk Through Windows of Current Application
 Walk Through Windows of Current Application (Reverse)=Meta+~\tAlt+~,Meta+~\tAlt+~,Walk Through Windows of Current Application (Reverse)
 Walk Through Windows of Current Application Alternative=none,none,Walk Through Windows of Current Application Alternative
 Walk Through Windows of Current Application Alternative (Reverse)=none,none,Walk Through Windows of Current Application Alternative (Reverse)
-Window Above Other Windows=Meta+Alt+F,,Keep Window Above Others
+Window Above Other Windows=,,Keep Window Above Others
 Window Below Other Windows=,,Keep Window Below Others
-Window Close=Meta+W,Alt+F4,Close Window
+Window Close=Meta+W\tAlt+F4,Alt+F4,Close Window
 Window Custom Quick Tile Bottom=,,Custom Quick Tile Window to the Bottom
 Window Custom Quick Tile Left=,,Custom Quick Tile Window to the Left
 Window Custom Quick Tile Right=,,Custom Quick Tile Window to the Right
@@ -253,6 +254,7 @@ activate task manager entry 7=Meta+7,Meta+7,Activate Task Manager Entry 7
 activate task manager entry 8=Meta+8,Meta+8,Activate Task Manager Entry 8
 activate task manager entry 9=Meta+9,Meta+9,Activate Task Manager Entry 9
 activate widget 47=,none,Activate Application Launcher Widget
+activate widget 48=,none,Activate Minimise All Windows Widget
 activate widget 51=,none,Activate System Tray Widget
 clear-history=,,Clear Clipboard History
 clipboard_action=Meta+Ctrl+X,Meta+Ctrl+X,Automatic Action Popup Menu
@@ -274,6 +276,12 @@ toggle do not disturb=,,Toggle do not disturb
 [services][com.mitchellh.ghostty.desktop]
 new-window=Meta+Return
 
+[services][net.local.pkg-install-aur.sh.desktop]
+_launch=Meta+I
+
+[services][net.local.pkg-install.sh.desktop]
+_launch=Meta+O
+
 [services][org.kde.kcalc.desktop]
 _launch=Calculator\tMeta+Shift+C
 
@@ -293,5 +301,8 @@ _launch=Meta+Shift+U
 [services][pkg-installer.desktop]
 _launch=Meta+Shift+I
 
+[services][pkg-remove.desktop]
+_launch=Meta+Shift+Y
+
 [services][systemsettings.desktop]
-_launch=Meta+I
+_launch=Meta+S

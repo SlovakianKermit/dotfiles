@@ -10,6 +10,7 @@ awesome-terminal-fonts
 base
 base-devel
 bash-completion
+bc
 bind
 bluedevil
 blueman
@@ -23,6 +24,7 @@ breeze-gtk
 btop
 btrfs-assistant
 btrfs-progs
+cachy-update
 cachyos-emerald-kde-theme-git
 cachyos-fish-config
 cachyos-gaming-applications
@@ -39,8 +41,10 @@ cachyos-mirrorlist
 cachyos-nord-kde-theme-git
 cachyos-packageinstaller
 cachyos-plymouth-bootanimation
+cachyos-plymouth-theme
 cachyos-rate-mirrors
 cachyos-settings
+cachyos-snapper-support
 cachyos-themes-sddm
 cachyos-v3-mirrorlist
 cachyos-v4-mirrorlist
@@ -62,6 +66,7 @@ dmraid
 dnsmasq
 dolphin
 dosfstools
+dotnet-runtime-8.0
 duf
 e2fsprogs
 easyeffects
@@ -69,6 +74,7 @@ efibootmgr
 efitools
 egl-wayland
 ethtool
+evtest
 exfatprogs
 f2fs-tools
 fastfetch
@@ -86,7 +92,6 @@ ghostty
 gimp
 git
 glances
-go
 godot
 gopls
 grub
@@ -104,7 +109,6 @@ hwdetect
 hwinfo
 inetutils
 iperf3
-iptables
 iwd
 jdk21-openjdk
 jdownloader2
@@ -125,6 +129,8 @@ kwallet-pam
 kwalletmanager
 legcord
 less
+lib32-nvidia-utils
+lib32-opencl-nvidia
 lib32-vulkan-icd-loader
 libdvdcss
 libgsf
@@ -134,10 +140,15 @@ libreoffice-fresh
 libva-nvidia-driver
 libvips
 libwebp-utils
+limine
+limine-mkinitcpio-hook
+limine-snapper-sync
 linux-cachyos
 linux-cachyos-headers
 linux-cachyos-lts
 linux-cachyos-lts-headers
+linux-cachyos-lts-nvidia-open
+linux-cachyos-nvidia-open
 linux-firmware
 localsend
 logrotate
@@ -172,11 +183,13 @@ noto-fonts-cjk
 noto-fonts-emoji
 nss-mdns
 ntfs-3g
-nvidia-580xx-dkms
 nvidia-settings
+nvidia-utils
+nvme-cli
 nvtop
 obsidian
 octopi
+opencl-nvidia
 openssh
 os-prober
 pacman-contrib
@@ -221,9 +234,11 @@ reflector
 ripgrep
 rnote
 rsync
+ryujinx
 s-nail
 scrcpy
 sg3_utils
+shelly
 smartmontools
 smplayer
 snapper
@@ -246,6 +261,7 @@ ttf-liberation
 ttf-meslo-nerd
 ttf-opensans
 ufw
+ufw-extras
 unrar
 unzip
 upower
@@ -259,10 +275,10 @@ vlc-plugins-all
 vulkan-icd-loader
 wget
 which
-wireless-regdb
 wireplumber
 wl-clipboard
 wpa_supplicant
+xclip
 xdg-user-dirs
 xfsprogs
 xl2tpd

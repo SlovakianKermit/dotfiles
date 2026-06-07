@@ -1,14 +1,26 @@
 {
     "Image": {
-        "download_path": "/home/kilian/Pictures/img/Downloads/Cooking",
-        "save_path": "/home/kilian/Pictures/img/Downloads"
+        "download_path": "/home/killian/Pictures/img/Downloads/Cooking",
+        "inactive_seeding_time_limit": -2,
+        "ratio_limit": -2,
+        "save_path": "/home/killian/Pictures/img/Downloads",
+        "seeding_time_limit": -2,
+        "share_limit_action": "Default"
     },
     "Movies": {
         "download_path": false,
-        "save_path": ""
+        "inactive_seeding_time_limit": -2,
+        "ratio_limit": -2,
+        "save_path": "/mnt/shared/Media/Movies",
+        "seeding_time_limit": -2,
+        "share_limit_action": "Default"
     },
     "Shows": {
         "download_path": false,
-        "save_path": ""
+        "inactive_seeding_time_limit": -2,
+        "ratio_limit": -2,
+        "save_path": "",
+        "seeding_time_limit": -2,
+        "share_limit_action": "Default"
     }
 }

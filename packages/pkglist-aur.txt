@@ -2,6 +2,7 @@ balena-etcher
 bottles
 cemu
 deadlock-modmanager-bin
+eden-bin
 fuzzy-pkg-finder
 losslesscut-bin
 ludusavi-bin
@@ -9,7 +10,6 @@ megacmd
 megatools
 mpv-uosc
 pkgbrowser
-qownnotes
 r2modman-bin
 typing_test
 waifu2x-ncnn-vulkan-git

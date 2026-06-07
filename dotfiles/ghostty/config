@@ -48,6 +48,9 @@
 # # Just for example:
 # resize-overlay-duration = 4s 200ms
 theme = Catppuccin Mocha
-gtk-titlebar = false
+gtk-titlebar = true
+window-theme = ghostty
 window-width = 150
 window-height = 40
+
+gtk-custom-css = ~/.config/ghostty/tab-style.css
