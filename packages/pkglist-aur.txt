@@ -11,6 +11,7 @@ megatools
 mpv-uosc
 pkgbrowser
 r2modman-bin
+thorium-browser-bin
 typing_test
 waifu2x-ncnn-vulkan-git
 wthrr-bin

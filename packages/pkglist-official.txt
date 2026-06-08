@@ -138,6 +138,7 @@ libmythes
 libopenraw
 libreoffice-fresh
 libva-nvidia-driver
+libva-utils
 libvips
 libwebp-utils
 limine
@@ -227,6 +228,7 @@ python
 python-defusedxml
 python-packaging
 python-pip
+python-pytorch-cuda
 qbittorrent
 rclone
 rebuild-detector
