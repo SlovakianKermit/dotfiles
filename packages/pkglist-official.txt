@@ -50,12 +50,14 @@ cachyos-v3-mirrorlist
 cachyos-v4-mirrorlist
 cachyos-wallpapers
 cachyos-zsh-config
+calf
 cantarell-fonts
 char-white
 chwd
 copyparty
 cpupower
 cryptsetup
+cuda
 device-mapper
 diffutils
 digikam
@@ -161,6 +163,7 @@ man-db
 man-pages
 mangojuice
 mariadb
+mda.lv2
 mdadm
 meld
 mesa-utils
@@ -228,7 +231,6 @@ python
 python-defusedxml
 python-packaging
 python-pip
-python-pytorch-cuda
 qbittorrent
 rclone
 rebuild-detector
@@ -287,4 +289,5 @@ xl2tpd
 xsettingsd
 yay-bin
 yt-dlp
+zam-plugins
 zen-browser-bin
