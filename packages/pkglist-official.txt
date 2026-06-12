@@ -74,7 +74,6 @@ e2fsprogs
 easyeffects
 efibootmgr
 efitools
-egl-wayland
 ethtool
 evtest
 exfatprogs
@@ -101,6 +100,7 @@ grub-btrfs-support
 grub-hook
 gst-libav
 gst-plugin-pipewire
+gst-plugin-va
 gst-plugins-bad
 gst-plugins-ugly
 gwenview
@@ -131,15 +131,13 @@ kwallet-pam
 kwalletmanager
 legcord
 less
-lib32-nvidia-utils
-lib32-opencl-nvidia
-lib32-vulkan-icd-loader
+lib32-opencl-mesa
+lib32-vulkan-radeon
 libdvdcss
 libgsf
 libmythes
 libopenraw
 libreoffice-fresh
-libva-nvidia-driver
 libva-utils
 libvips
 libwebp-utils
@@ -187,13 +185,11 @@ noto-fonts-cjk
 noto-fonts-emoji
 nss-mdns
 ntfs-3g
-nvidia-settings
-nvidia-utils
 nvme-cli
 nvtop
 obsidian
 octopi
-opencl-nvidia
+opencl-mesa
 openssh
 os-prober
 pacman-contrib
@@ -276,7 +272,7 @@ vesktop
 vim
 vlc
 vlc-plugins-all
-vulkan-icd-loader
+vulkan-radeon
 wget
 which
 wireplumber
@@ -284,6 +280,7 @@ wl-clipboard
 wpa_supplicant
 xclip
 xdg-user-dirs
+xf86-video-amdgpu
 xfsprogs
 xl2tpd
 xsettingsd
