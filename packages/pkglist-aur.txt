@@ -1,9 +1,11 @@
+amf-amdgpu-pro
 balena-etcher
 bottles
 cemu
 deadlock-modmanager-bin
 eden-bin
 fuzzy-pkg-finder
+handbrake-full
 losslesscut-bin
 ludusavi-bin
 megacmd

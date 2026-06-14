@@ -104,7 +104,7 @@ gst-plugin-va
 gst-plugins-bad
 gst-plugins-ugly
 gwenview
-handbrake
+handbrake-cli
 haruna
 hdparm
 hwdetect
@@ -185,6 +185,7 @@ noto-fonts-cjk
 noto-fonts-emoji
 nss-mdns
 ntfs-3g
+ntfsprogs
 nvme-cli
 nvtop
 obsidian
