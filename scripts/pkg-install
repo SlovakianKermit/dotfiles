@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 
+# Get installed packages for fast awk lookup
+installed_file=$(mktemp)
+pacman -Qq 2>/dev/null | sort -u >"$installed_file"
+
+cleanup() { rm -f "$installed_file"; }
+trap cleanup EXIT
+
 fzf_args=(
   --multi
-  --preview 'pacman -Sii {1}'
+  --preview 'pacman -Sii {2}'
   --preview-label='alt-p: toggle preview | alt-j/k: scroll preview | tab: multi-select'
   --preview-label-pos='bottom'
   --preview-window 'down:65%:wrap'
@@ -13,7 +20,15 @@ fzf_args=(
   --bind 'ctrl-j:down,ctrl-k:up'
 )
 
-pkg_names=$(pacman -Slq | fzf "${fzf_args[@]}")
+pkg_names=$(
+  pacman -Slq |
+    awk -v installed="$installed_file" '
+      BEGIN { while (getline < installed) pkgs[$1]=1 }
+      { if ($1 in pkgs) printf "★ %s\n", $1; else printf "○ %s\n", $1 }
+    ' |
+    fzf "${fzf_args[@]}" |
+    awk '{print $2}'
+)
 
 if [ -n "$pkg_names" ]; then
   echo "$pkg_names" | tr '\n' ' ' | xargs paru -S --noconfirm

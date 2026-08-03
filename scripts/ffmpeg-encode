@@ -1,0 +1,916 @@
+#!/usr/bin/env python3
+"""Batch HEVC VAAPI encoder with curses TUI — pause, resume, and live queue."""
+
+import argparse
+import curses
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# ═══════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════
+
+EXTENSIONS = ("mkv", "mp4", "avi", "mov", "webm", "ts", "mts")
+PRESET_FLAGS = {"speed": ["-preset", "fast"], "balanced": [], "quality": ["-preset", "slow"]}
+HWACCEL = "vaapi"
+ENCODER = "hevc_vaapi"
+DEFAULT_INPUT_DIR = "/mnt/shared/Compressing"
+DEFAULT_OUTPUT_DIR = "/mnt/shared/Handbraked"
+DEFAULT_QUALITY = 28
+DEFAULT_PRESET = "balanced"
+
+# ═══════════════════════════════════════════════════════════════════════
+# Data
+# ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Job:
+    input_path: str
+    output_path: str
+    status: str = "pending"
+    input_size: int = 0
+    output_size: int = 0
+    duration: float = 0.0
+    error: str = ""
+
+    @property
+    def basename(self) -> str:
+        return os.path.basename(self.input_path)
+
+@dataclass
+class SharedState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    percentage: int = 0
+    fps: float = 0.0
+    out_time_us: int = 0
+    status: str = "idle"
+    ffmpeg_pid: Optional[int] = None
+    file_start: float = 0.0
+    file_paused_accum: float = 0.0
+    worker_done: threading.Event = field(default_factory=threading.Event)
+    quit: bool = False
+    skip: bool = False
+    total_in_bytes: int = 0
+    total_out_bytes: int = 0
+
+# ═══════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+def human_bytes(n: int) -> str:
+    if n < 0:
+        return "-" + human_bytes(-n)
+    if n == 0:
+        return "0 B"
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit in units:
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} PiB"
+
+def get_duration(path: str) -> float:
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(r.stdout.strip() or 0)
+    except Exception:
+        return 0.0
+
+def collect_files(directory: str) -> List[str]:
+    files: List[str] = []
+    root = pathlib.Path(directory)
+    if not root.is_dir():
+        return files
+    for ext in EXTENSIONS:
+        files.extend(str(p) for p in root.rglob(f"*.{ext}"))
+        files.extend(str(p) for p in root.rglob(f"*.{ext.upper()}"))
+    return sorted(files)
+
+def check_vaapi() -> bool:
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-hwaccels"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return "vaapi" in r.stdout
+    except Exception:
+        return False
+
+# ═══════════════════════════════════════════════════════════════════════
+# Queue
+# ═══════════════════════════════════════════════════════════════════════
+
+class Queue:
+    def __init__(self, input_dir: str, output_dir: str):
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.jobs: List[Job] = []
+
+    def add_file(self, path: str) -> Optional[Job]:
+        p = pathlib.Path(path)
+        if not p.is_file():
+            return None
+
+        try:
+            rel = str(p.relative_to(self.input_dir))
+        except ValueError:
+            rel = p.name
+
+        output_path = str(pathlib.Path(self.output_dir) / rel)
+        output_path = str(pathlib.Path(output_path).with_suffix(".mkv"))
+
+        job = Job(
+            input_path=str(p),
+            output_path=output_path,
+            input_size=os.path.getsize(str(p)),
+            duration=get_duration(str(p)),
+        )
+        self.jobs.append(job)
+        return job
+
+    @property
+    def pending(self) -> List[Job]:
+        return [j for j in self.jobs if j.status == "pending"]
+
+    @property
+    def stats(self):
+        done = sum(1 for j in self.jobs if j.status == "done")
+        failed = sum(1 for j in self.jobs if j.status == "failed")
+        skipped = sum(1 for j in self.jobs if j.status == "skipped")
+        total_in = sum(j.input_size for j in self.jobs if j.status in ("done", "failed"))
+        total_out = sum(j.output_size for j in self.jobs if j.status == "done")
+        return done, failed, skipped, total_in, total_out
+
+# ═══════════════════════════════════════════════════════════════════════
+# Worker thread
+# ═══════════════════════════════════════════════════════════════════════
+
+def _build_ffmpeg_cmd(job: Job, preset: str, quality: int) -> List[str]:
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-progress", "pipe:1", "-nostats",
+        "-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL,
+        "-i", job.input_path,
+        "-c:v", ENCODER,
+    ]
+    if PRESET_FLAGS[preset]:
+        cmd.extend(PRESET_FLAGS[preset])
+    cmd.extend(["-b:v", "0", "-qp", str(quality)])
+    cmd.extend(["-c:a", "copy"])
+    cmd.extend(["-map", "0:v?", "-map", "0:a?"])
+    cmd.extend(["-y", job.output_path])
+    return cmd
+
+def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
+                  delete_original: bool):
+    cmd = _build_ffmpeg_cmd(job, preset, quality)
+    os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
+        )
+
+        with state.lock:
+            state.ffmpeg_pid = proc.pid
+            state.status = "encoding"
+            state.percentage = 0
+            state.fps = 0.0
+            state.file_start = time.time()
+            state.worker_done.clear()
+            state.skip = False
+            job.status = "encoding"
+
+        out_time_us = 0
+        duration = job.duration or get_duration(job.input_path)
+
+        for line in proc.stdout:
+            if "=" not in line:
+                continue
+            key, _, value = line.strip().partition("=")
+
+            if key == "out_time_us":
+                try:
+                    out_time_us = int(value)
+                    with state.lock:
+                        state.out_time_us = out_time_us
+                except ValueError:
+                    pass
+            elif key == "fps":
+                try:
+                    with state.lock:
+                        state.fps = float(value)
+                except ValueError:
+                    pass
+            elif key == "progress":
+                if duration > 0:
+                    pct = min(100, max(0,
+                        int((out_time_us / 1_000_000) / duration * 100 + 0.5)))
+                    with state.lock:
+                        state.percentage = pct
+                if value == "end":
+                    break
+
+        proc.wait()
+
+        with state.lock:
+            if state.skip:
+                job.status = "skipped"
+            elif proc.returncode == 0 and os.path.getsize(job.output_path) > 0:
+                job.status = "done"
+                job.output_size = os.path.getsize(job.output_path)
+                state.percentage = 100
+                state.total_in_bytes += job.input_size
+                state.total_out_bytes += job.output_size
+                if delete_original:
+                    try:
+                        os.remove(job.input_path)
+                    except OSError:
+                        pass
+            else:
+                job.status = "failed"
+                if proc.returncode != 0:
+                    stderr_text = proc.stderr.read()
+                    job.error = stderr_text[:300] if stderr_text else f"exit {proc.returncode}"
+                else:
+                    job.error = "output file empty"
+                if os.path.exists(job.output_path) and os.path.getsize(job.output_path) == 0:
+                    try:
+                        os.remove(job.output_path)
+                    except OSError:
+                        pass
+
+            state.ffmpeg_pid = None
+            state.status = "idle"
+
+    except Exception as exc:
+        job.status = "failed"
+        job.error = str(exc)
+        with state.lock:
+            state.status = "idle"
+            state.ffmpeg_pid = None
+    finally:
+        state.worker_done.set()
+
+# ═══════════════════════════════════════════════════════════════════════
+# Curses TUI
+# ═══════════════════════════════════════════════════════════════════════
+
+_BAR_FILL   = "█"
+_BAR_EMPTY  = "░"
+
+class TUI:
+    def __init__(self, stdscr, queue: Queue, state: SharedState, args):
+        self.stdscr = stdscr
+        self.queue = queue
+        self.state = state
+        self.args = args
+        self.start_time = time.time()
+        self.total_paused = 0.0
+        self.pause_start = 0.0
+
+        # smooth-speed tracking
+        self._prev_ous = 0
+        self._prev_active = 0.0
+        self._smooth_speed = 0.0
+
+        self.add_mode = False
+        self.add_input = ""
+        self.add_cursor = 0
+
+        self._init_colors()
+
+    def _init_colors(self):
+        if not curses.has_colors():
+            return
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN,    -1)
+        curses.init_pair(2, curses.COLOR_GREEN,   -1)
+        curses.init_pair(3, curses.COLOR_YELLOW,  -1)
+        curses.init_pair(4, curses.COLOR_RED,     -1)
+        curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(6, curses.COLOR_WHITE,   -1)
+        curses.init_pair(7, -1, curses.COLOR_CYAN)    # reverse: bg is cyan
+        curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_CYAN)  # dim bar fill
+
+    def _color(self, pair: int) -> int:
+        return curses.color_pair(pair) if curses.has_colors() else 0
+
+    def _bold(self, pair: int) -> int:
+        return (curses.A_BOLD | curses.color_pair(pair)) if curses.has_colors() else curses.A_BOLD
+
+    # ── Run loop ────────────────────────────────────────────────────
+
+    def run(self):
+        self.stdscr.nodelay(True)
+        curses.curs_set(0)
+
+        self._maybe_start_job()
+
+        while not self.state.quit:
+            try:
+                self._handle_input()
+                self._check_worker()
+                self._render()
+                time.sleep(0.05)
+            except KeyboardInterrupt:
+                self.state.quit = True
+
+        self._shutdown()
+
+    # ── Job lifecycle ───────────────────────────────────────────────
+
+    def _maybe_start_job(self):
+        with self.state.lock:
+            if self.state.status not in ("idle",):
+                return
+
+        for job in self.queue.jobs:
+            if job.status == "pending":
+                with self.state.lock:
+                    self.state.file_paused_accum = 0.0
+                self._prev_ous = 0
+                self._prev_active = 0.0
+                self._smooth_speed = 0.0
+                t = threading.Thread(
+                    target=ffmpeg_worker,
+                    args=(job, self.state, self.args.preset, self.args.quality,
+                          self.args.delete),
+                    daemon=True,
+                )
+                t.start()
+                return
+
+    def _check_worker(self):
+        if self.state.worker_done.is_set():
+            self._maybe_start_job()
+
+    def _shutdown(self):
+        with self.state.lock:
+            pid = self.state.ffmpeg_pid
+            self.state.quit = True
+
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(0.5)
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            except OSError:
+                pass
+
+    # ── Input ────────────────────────────────────────────────────────
+
+    def _handle_input(self):
+        key = self.stdscr.getch()
+        if key == -1:
+            return
+
+        if self.add_mode:
+            self._handle_add_key(key)
+            return
+
+        ch = key
+        if ch == ord('p'):
+            self._toggle_pause()
+        elif ch == ord('r'):
+            self._resume()
+        elif ch == ord('a'):
+            self.add_mode = True
+            self.add_input = ""
+            self.add_cursor = 0
+            curses.curs_set(1)
+        elif ch == ord('A'):
+            added = self._scan_and_add()
+            if added > 0:
+                self._maybe_start_job()
+        elif ch == ord('s'):
+            self._skip()
+        elif ch == ord('q'):
+            self.state.quit = True
+        elif ch == 3:  # Ctrl+C
+            self.state.quit = True
+        elif ch == curses.KEY_RESIZE:
+            pass
+
+    def _toggle_pause(self):
+        with self.state.lock:
+            if self.state.status == "encoding":
+                if self.state.ffmpeg_pid:
+                    os.kill(self.state.ffmpeg_pid, signal.SIGSTOP)
+                self.state.status = "paused"
+                self.pause_start = time.time()
+            elif self.state.status == "paused":
+                now = time.time()
+                elapsed = now - self.pause_start
+                self.total_paused += elapsed
+                self.state.file_paused_accum += elapsed
+                self.pause_start = 0.0
+                if self.state.ffmpeg_pid:
+                    os.kill(self.state.ffmpeg_pid, signal.SIGCONT)
+                self.state.status = "encoding"
+
+    def _resume(self):
+        with self.state.lock:
+            if self.state.status == "paused":
+                now = time.time()
+                elapsed = now - self.pause_start
+                self.total_paused += elapsed
+                self.state.file_paused_accum += elapsed
+                self.pause_start = 0.0
+                if self.state.ffmpeg_pid:
+                    os.kill(self.state.ffmpeg_pid, signal.SIGCONT)
+                self.state.status = "encoding"
+
+    def _skip(self):
+        with self.state.lock:
+            if self.state.ffmpeg_pid and self.state.status in ("encoding", "paused"):
+                self.state.skip = True
+                if self.state.status == "paused":
+                    os.kill(self.state.ffmpeg_pid, signal.SIGCONT)
+                os.kill(self.state.ffmpeg_pid, signal.SIGTERM)
+
+    # ── Add-file input ──────────────────────────────────────────────
+
+    def _handle_add_key(self, key):
+        if key in (27,):  # Escape
+            self.add_mode = False
+            curses.curs_set(0)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            path = self.add_input.strip()
+            if path:
+                job = self.queue.add_file(path)
+                if job is None:
+                    self.add_input = f"[invalid: {path}]"
+                else:
+                    self.add_mode = False
+                    curses.curs_set(0)
+                    self._maybe_start_job()
+            else:
+                self.add_mode = False
+                curses.curs_set(0)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.add_cursor > 0:
+                self.add_input = (self.add_input[:self.add_cursor - 1] +
+                                  self.add_input[self.add_cursor:])
+                self.add_cursor -= 1
+        elif key == curses.KEY_DC:
+            if self.add_cursor < len(self.add_input):
+                self.add_input = (self.add_input[:self.add_cursor] +
+                                  self.add_input[self.add_cursor + 1:])
+        elif key == curses.KEY_LEFT:
+            if self.add_cursor > 0:
+                self.add_cursor -= 1
+        elif key == curses.KEY_RIGHT:
+            if self.add_cursor < len(self.add_input):
+                self.add_cursor += 1
+        elif key == curses.KEY_HOME:
+            self.add_cursor = 0
+        elif key == curses.KEY_END:
+            self.add_cursor = len(self.add_input)
+        elif key == 21:  # Ctrl+U — clear line
+            self.add_input = ""
+            self.add_cursor = 0
+        elif key == 23:  # Ctrl+W — delete word
+            before = self.add_input[:self.add_cursor].rstrip()
+            idx = before.rfind(" ") + 1 if " " in before else 0
+            self.add_input = self.add_input[:idx] + self.add_input[self.add_cursor:]
+            self.add_cursor = idx
+        elif 32 <= key <= 126:
+            ch = chr(key)
+            self.add_input = (self.add_input[:self.add_cursor] + ch +
+                              self.add_input[self.add_cursor:])
+            self.add_cursor += 1
+
+    def _scan_and_add(self):
+        existing = {job.input_path for job in self.queue.jobs}
+        files = collect_files(self.args.i)
+        added = 0
+        for f in files:
+            if f not in existing:
+                job = self.queue.add_file(f)
+                if job:
+                    added += 1
+        return added
+
+    # ═══════════════════════════════════════════════════════════════════
+    # Render
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _render(self):
+        self.stdscr.erase()
+        max_y, max_x = self.stdscr.getmaxyx()
+
+        if max_y < 10 or max_x < 60:
+            self._render_small(max_y, max_x)
+            self.stdscr.refresh()
+            return
+
+        row = 0
+        row = self._render_header(row, max_x)
+        row += 1
+        row = self._render_current_file(row, max_x)
+        row += 1
+        row = self._render_queue(row, max_y, max_x)
+
+        # Bottom bar (needs 2 rows: separator + key bar)
+        bottom_y = max_y - 2
+        if row < bottom_y:
+            self._render_bottom(bottom_y, max_x)
+
+        self.stdscr.refresh()
+
+    def _render_small(self, max_y, max_x):
+        msg = "Terminal too small — need at least 80×24"
+        y = max(0, max_y // 2)
+        x = max(0, (max_x - len(msg)) // 2)
+        try:
+            self.stdscr.addstr(y, x, msg, self._bold(4))
+        except curses.error:
+            pass
+
+    # ── Header ──────────────────────────────────────────────────────
+
+    def _render_header(self, row: int, max_x: int) -> int:
+        now = time.time()
+        active_elapsed = now - self.start_time - self.total_paused
+        if self.pause_start > 0:
+            active_elapsed -= (now - self.pause_start)
+        active_elapsed = max(0, int(active_elapsed))
+        ts = f"{active_elapsed // 3600:02d}:{(active_elapsed % 3600) // 60:02d}:{active_elapsed % 60:02d}"
+
+        pending_count = sum(1 for j in self.queue.jobs if j.status == "pending")
+
+        left = f" ffmpeg-encode "
+        right = f" Elapsed: {ts}  Queued: {pending_count} "
+
+        # If right side would overflow, shorten left
+        avail = max_x - len(right) - 2
+        if len(left) > avail:
+            left = left[:avail]
+
+        try:
+            self.stdscr.addstr(row, 1, "─" * (max_x - 2), self._color(6))
+            self.stdscr.addstr(row, 0, left[:avail], self._bold(1))
+            self.stdscr.addstr(row, max_x - len(right) - 1, right, self._bold(6))
+        except curses.error:
+            pass
+        return row
+
+    # ── Current file progress ───────────────────────────────────────
+
+    def _render_current_file(self, row: int, max_x: int) -> int:
+        with self.state.lock:
+            pct = self.state.percentage
+            fps = self.state.fps
+            ous = self.state.out_time_us
+            status = self.state.status
+            file_start = self.state.file_start
+            file_paused = self.state.file_paused_accum
+
+        now = time.time()
+        active_elapsed = max(0, now - file_start - file_paused)
+        if status == "paused" and self.pause_start > 0:
+            active_elapsed -= (now - self.pause_start)
+
+        # Compute instantaneous encoding speed from deltas between progress
+        # updates, smoothed with exponential moving average.  Using ous
+        # (microsecond-precise) avoids the sawtooth that rounded pct causes.
+        if ous != self._prev_ous and ous > 0 and self._prev_ous > 0:
+            delta_content = (ous - self._prev_ous) / 1_000_000.0
+            delta_active = active_elapsed - self._prev_active
+            if delta_active > 0.1:
+                inst = delta_content / delta_active
+                if inst > 0:
+                    alpha = 0.3
+                    if self._smooth_speed <= 0:
+                        self._smooth_speed = inst
+                    else:
+                        self._smooth_speed = alpha * inst + (1 - alpha) * self._smooth_speed
+
+        if ous != self._prev_ous:
+            self._prev_ous = ous
+            self._prev_active = active_elapsed
+
+        # Find the currently encoding/paused job
+        current = None
+        idx = 0
+        for i, job in enumerate(self.queue.jobs):
+            if job.status in ("encoding", "paused"):
+                current = job
+                idx = i + 1
+                break
+
+        total = len(self.queue.jobs)
+
+        # File label
+        if current:
+            name = current.basename
+            label = f" [{idx}/{total}] {name} "
+        elif self.queue.pending:
+            pending = self.queue.pending[0]
+            label = f" Next: {pending.basename} "
+        else:
+            label = " Queue empty "
+
+        max_label = max_x - 2
+        if len(label) > max_label:
+            label = label[:max_label - 1] + "…"
+
+        try:
+            self.stdscr.addstr(row, 1, "─" * (max_x - 2), self._color(6))
+            self.stdscr.addstr(row, 2, label, self._bold(5))
+        except curses.error:
+            pass
+        row += 1
+
+        # Progress bar
+        bar_width = max_x - 4
+        filled = int(bar_width * pct / 100) if pct >= 0 else 0
+        filled = max(0, min(bar_width, filled))
+        empty = bar_width - filled
+
+        try:
+            if filled > 0:
+                self.stdscr.addstr(row, 2, _BAR_FILL * filled, self._bold(1))
+            if empty > 0:
+                self.stdscr.addstr(row, 2 + filled, _BAR_EMPTY * empty, self._color(6))
+        except curses.error:
+            pass
+        row += 1
+
+        # Stats line — our own speed (not ffmpeg's, which counts pause time).
+        if status == "paused":
+            label_str = f"  {pct:3d}%    PAUSED"
+        elif status == "encoding":
+            label_str = f"  {pct:3d}%"
+            if fps > 0:
+                label_str += f"    {fps:5.1f} fps"
+
+            if self._smooth_speed > 0:
+                label_str += f"    {self._smooth_speed:.1f}x"
+                if current and current.duration > 0:
+                    content_sec = ous / 1_000_000.0 if ous > 0 else pct / 100.0 * current.duration
+                    rem_sec = max(0, current.duration - content_sec)
+                    eta = rem_sec / self._smooth_speed
+                    label_str += f"    ETA {eta // 3600:02.0f}:{(eta % 3600) // 60:02.0f}:{eta % 60:02.0f}"
+            elif ous > 0 and active_elapsed > 1 and current and current.duration > 0:
+                # fallback average speed before smooth-sampling has enough data
+                cs = ous / 1_000_000.0
+                avg = cs / active_elapsed if active_elapsed > 0 else 0
+                if avg > 0:
+                    label_str += f"    {avg:.1f}x"
+                    rem_sec = max(0, current.duration - cs)
+                    eta = rem_sec / avg
+                    label_str += f"    ETA {eta // 3600:02.0f}:{(eta % 3600) // 60:02.0f}:{eta % 60:02.0f}"
+            elif active_elapsed <= 3:
+                label_str += f"    starting…"
+        elif status == "idle":
+            label_str = "  idle"
+        else:
+            label_str = f"  {pct:3d}%"
+
+        try:
+            self.stdscr.addstr(row, 2, label_str, self._bold(6))
+        except curses.error:
+            pass
+        return row
+
+    # ── Queue ────────────────────────────────────────────────────────
+
+    def _render_queue(self, row: int, max_y: int, max_x: int) -> int:
+        row += 1
+        try:
+            self.stdscr.addstr(row, 1, "─" * (max_x - 2), self._color(6))
+            self.stdscr.addstr(row, 2, " Queue ", self._bold(6))
+        except curses.error:
+            pass
+        row += 1
+
+        jobs = self.queue.jobs
+        if not jobs:
+            try:
+                self.stdscr.addstr(row, 4, "(empty — press 'a' to add files)", self._color(6))
+            except curses.error:
+                pass
+            return row + 1
+
+        # fixed: header(1) + label(1) + bar(1) + stats(1) + gap(1) + qheader(1) = 6
+        #        + bottom(2) = 8 fixed rows total
+        fixed_rows = 8
+        visible = max_y - fixed_rows
+        if visible < 1:
+            return row
+
+        # Try to show all, or scroll
+        total_jobs = len(jobs)
+        if total_jobs <= visible:
+            start = 0
+            end = total_jobs
+        else:
+            # Keep the currently encoding job visible
+            current_i = next((i for i, j in enumerate(jobs)
+                              if j.status in ("encoding", "paused")), 0)
+            start = max(0, min(current_i - visible // 2, total_jobs - visible))
+            end = start + visible
+
+        for i in range(start, end):
+            job = jobs[i]
+            icon, color = self._job_icon(job)
+            idx_str = f"{i + 1:>{len(str(total_jobs))}}"
+            prefix = f" {icon} {idx_str}. "
+
+            if job.status == "done":
+                suffix = f"{human_bytes(job.input_size)} → {human_bytes(job.output_size)}"
+            elif job.status in ("encoding", "paused"):
+                suffix = "(encoding…)" if job.status == "encoding" else "(paused)"
+            elif job.status == "failed":
+                suffix = job.error[:20] if job.error else "FAILED"
+            elif job.status == "skipped":
+                suffix = "SKIPPED"
+            else:
+                suffix = human_bytes(job.input_size) if job.input_size else ""
+
+            name = job.basename
+            suffix_width = len(suffix) + 1 if suffix else 0
+            name_max = max_x - 2 - len(prefix) - suffix_width
+            if name_max < 4:
+                name_max = 4
+            if len(name) > name_max:
+                name = name[:name_max - 1] + "…"
+
+            spacer = max(1, max_x - 2 - len(prefix) - len(name) - len(suffix))
+            line = prefix + name + " " * spacer + suffix
+
+            try:
+                self.stdscr.addstr(row, 2, line[:max_x - 2], color)
+            except curses.error:
+                pass
+            row += 1
+
+        return row
+
+    def _job_icon(self, job: Job):
+        if job.status == "done":
+            return "✓", self._bold(2)
+        elif job.status == "encoding":
+            return "▶", self._bold(3)
+        elif job.status == "paused":
+            return "⏸", self._bold(3)
+        elif job.status == "failed":
+            return "✗", self._bold(4)
+        elif job.status == "skipped":
+            return "→", self._color(6)
+        else:
+            return "·", self._color(6)
+
+    # ── Bottom bar ──────────────────────────────────────────────────
+
+    def _render_bottom(self, row: int, max_x: int):
+        """row = first of two rows available (separator row, then key/add row)"""
+        try:
+            self.stdscr.addstr(row, 0, "─" * max_x, self._color(6))
+        except curses.error:
+            pass
+
+        if self.add_mode:
+            prompt = " Add file: "
+            self.stdscr.addstr(row + 1, 0, prompt, self._bold(1))
+
+            input_x = len(prompt)
+            field_w = max_x - input_x - 1
+            if field_w < 10:
+                field_w = 10
+
+            visible = self.add_input
+            if len(visible) > field_w:
+                cursor_pos = self.add_cursor
+                half = field_w // 2
+                if cursor_pos < half:
+                    visible = self.add_input[:field_w]
+                elif cursor_pos > len(self.add_input) - half:
+                    visible = self.add_input[-field_w:]
+                else:
+                    visible = self.add_input[cursor_pos - half:cursor_pos + field_w - half]
+
+            self.stdscr.addstr(row + 1, input_x, visible.ljust(field_w)[:field_w],
+                               self._bold(6))
+
+            cursor_x = input_x + min(self.add_cursor, field_w - 1)
+            self.stdscr.move(row + 1, cursor_x)
+        else:
+            keys = " [p]ause  [r]esume  [a]dd file  [A] re-scan  [s]kip  [q]uit "
+            try:
+                x = max(0, (max_x - len(keys)) // 2)
+                self.stdscr.addstr(row + 1, x, keys, self._bold(1))
+            except curses.error:
+                pass
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Batch HEVC VAAPI encoder with curses TUI.",
+    )
+    p.add_argument("-i", default=DEFAULT_INPUT_DIR,
+                   help="Input directory (batch mode)")
+    p.add_argument("-o", default=DEFAULT_OUTPUT_DIR,
+                   help="Output directory (batch mode)")
+    p.add_argument("--input",
+                   help="Single input file")
+    p.add_argument("--output",
+                   help="Single output file")
+    p.add_argument("-p", dest="preset", default=DEFAULT_PRESET,
+                   choices=["speed", "balanced", "quality"],
+                   help="Encoding preset (default: balanced)")
+    p.add_argument("-q", dest="quality", type=int, default=DEFAULT_QUALITY,
+                   help="QP value — lower = better quality (default: 28)")
+    p.add_argument("-n", dest="dry_run", action="store_true",
+                   help="Dry run: list files and exit")
+    p.add_argument("-k", "--keep", dest="keep", action="store_true",
+                   help="Keep original files (default: delete after encode)")
+    p.add_argument("-D", dest="flag_D", action="store_true",
+                   help=argparse.SUPPRESS)  # legacy compat, delete is already default
+    return p.parse_args()
+
+def main_curses(stdscr, queue: Queue, state: SharedState, args):
+    tui = TUI(stdscr, queue, state, args)
+    tui.run()
+
+def main():
+    args = parse_args()
+    args.delete = not args.keep  # delete is default; -k keeps, -D is legacy no-op
+
+    # ── Dry run ─────────────────────────────────────────────────────
+    if args.dry_run:
+        if args.input:
+            files = [args.input]
+        else:
+            files = collect_files(args.i)
+        print(f"Would encode {len(files)} file(s):")
+        for f in files:
+            print(f"  {f}")
+        return
+
+    # ── VAAPI check ─────────────────────────────────────────────────
+    if not check_vaapi():
+        print("Error: VAAPI hwaccel not available in ffmpeg.", file=sys.stderr)
+        print("  Is libva-utils / intel-media-driver installed?", file=sys.stderr)
+        sys.exit(1)
+
+    queue = Queue(args.i, args.o)
+
+    # ── Single-file mode ────────────────────────────────────────────
+    if args.input:
+        job = queue.add_file(args.input)
+        if job is None:
+            print(f"Error: file not found — {args.input}", file=sys.stderr)
+            sys.exit(1)
+        if args.output:
+            job.output_path = str(pathlib.Path(args.output).with_suffix(".mkv"))
+    else:
+        files = collect_files(args.i)
+        if not files:
+            print(f"No video files found in: {args.i}", file=sys.stderr)
+            print(f"Searched extensions: {', '.join(EXTENSIONS)}", file=sys.stderr)
+            print("Launching with empty queue — press 'a' to add files.", file=sys.stderr)
+        for f in files:
+            queue.add_file(f)
+
+    state = SharedState()
+    curses.wrapper(main_curses, queue, state, args)
+
+    # ── Summary after TUI exit ──────────────────────────────────────
+    done, failed, skipped, total_in, total_out = queue.stats
+    print()
+    print("═" * 44)
+    print(f" Done: {done}  |  Failed: {failed}  |  Skipped: {skipped}")
+    if done + failed + skipped > 0:
+        saved = total_in - total_out
+        if saved >= 0:
+            pct = saved / total_in * 100 if total_in else 0
+            print(f" Saved: {human_bytes(saved)} ({pct:.1f}%)")
+        else:
+            print(f" Grew:   +{human_bytes(-saved)}")
+        print(f" In:     {human_bytes(total_in)}")
+        print(f" Out:    {human_bytes(total_out)}")
+    print("═" * 44)
+
+if __name__ == "__main__":
+    main()

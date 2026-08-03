@@ -5,6 +5,8 @@ set -uo pipefail
 ROOT="${1:-.}"
 declare -a FAILED=()
 
+exec 3<&0
+
 extract_archive() {
   local archive="$1"
   local dir ext target
@@ -47,7 +49,7 @@ extract_archive() {
   local check_ok=0
   case "$fmt" in
   zip)
-    unzip -qt "$archive" &>/dev/null && check_ok=1
+    unzip -qt "$archive" <&3 &>/dev/null && check_ok=1
     ;;
   tar | tar.gz | tar.bz2 | tar.xz)
     tar --test-label -f "$archive" &>/dev/null || true
@@ -72,7 +74,7 @@ extract_archive() {
 
   case "$fmt" in
   zip)
-    unzip -q "$archive" -d "$target" && extract_ok=1
+    unzip -o -q "$archive" -d "$target" <&3 && extract_ok=1
     ;;
   tar | tar.gz | tar.bz2 | tar.xz)
     tar -xf "$archive" -C "$target" && extract_ok=1

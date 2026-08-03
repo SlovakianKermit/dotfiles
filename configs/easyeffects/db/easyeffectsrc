@@ -11,6 +11,7 @@ visiblePlugin=equalizer#1
 signalType=pinkNoise
 
 [Window]
+autostartOnLogin=true
 height=1380
 visiblePipeWirePage=testSignalsPage
 width=2560

@@ -1,3 +1,8 @@
+[ExtractDialog]
+2560x1440 screen: Height=720
+2560x1440 screen: Width=1645
+DirHistory[$e]=$HOME/Games/TEMP/
+
 [General]
 ConfirmClosingTerminalRunningProgram=false
 DynamicView=true

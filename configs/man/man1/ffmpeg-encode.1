@@ -1,0 +1,194 @@
+.TH FFMPEG-ENCODE 1 "July 2026" "ffmpeg-encode" "User Commands"
+.SH NAME
+ffmpeg-encode \- VAAPI HEVC batch video encoder
+.SH SYNOPSIS
+.B ffmpeg-encode
+[\fIOPTIONS\fR]
+.P
+.B ffmpeg-encode
+.B \-i
+\fIDIR\fR
+.B \-o
+\fIDIR\fR
+[\fIOPTIONS\fR]
+.P
+.B ffmpeg-encode
+.B \-\-input
+\fIFILE\fR
+[\fB\-\-output\fR \fIFILE\fR]
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B ffmpeg-encode
+is a thin wrapper around
+.BR ffmpeg (1)
+that encodes video with hardware-accelerated
+.B hevc_vaapi
+(VAAPI).
+It can process a whole directory tree (batch mode) or a single file.
+.P
+By default it reads from
+.I /mnt/shared/Compressing
+and writes to
+.IR /mnt/shared/Handbraked ,
+preserving relative paths under the output directory.
+.P
+While encoding, a single coloured status line is shown (when stdout is a TTY):
+.IP \(bu 2
+percentage of the
+.B current video
+completed
+.IP \(bu 2
+percentage of the
+.B queue
+completed (weighted by finished files plus current progress)
+.IP \(bu 2
+encode
+.B speed
+in frames per second (fps)
+.P
+When the run finishes successfully, a size summary reports original size,
+encoded size, and space saved (human-readable and as a percentage).
+.SH OPTIONS
+.TP
+.BI \-i " DIR"
+Input directory for batch mode. Default:
+.IR /mnt/shared/Compressing .
+.TP
+.BI \-o " DIR"
+Output directory for batch mode. Default:
+.IR /mnt/shared/Handbraked .
+Relative paths under the input directory are preserved under this root.
+.TP
+.BI \-\-input " FILE"
+Encode a single input file instead of scanning a directory.
+.TP
+.BI \-\-output " FILE"
+Output path for single-file mode. If omitted, the name is derived as
+.IR basename-hevc.mkv
+next to the input. The extension is always forced to
+.BR .mkv
+even if another extension is given.
+.TP
+.BI \-p " PRESET"
+Speed / quality trade-off:
+.RS
+.TP
+.B speed
+Faster encode (\fB\-preset fast\fR).
+.TP
+.B balanced
+Default. No extra preset flag.
+.TP
+.B quality
+Slower, better quality (\fB\-preset slow\fR).
+.RE
+.TP
+.BI \-q " QP"
+Constant QP quality value for the VAAPI encoder. Default:
+.BR 28 .
+Lower values mean higher quality and larger files.
+.TP
+.B \-n
+Dry run. Print the
+.B ffmpeg
+command that would be run; do not encode or delete anything.
+.TP
+.B \-D
+Delete the original file after a successful encode.
+This is
+.B on by default
+(the flag exists for explicit use; there is currently no opt-out flag).
+.TP
+.B \-h
+Show a short help message and exit.
+.SH BEHAVIOUR
+.SS Encoding
+.IP \(bu 2
+Video codec:
+.B hevc_vaapi
+via
+.B \-hwaccel vaapi
+.IP \(bu 2
+Audio streams are
+.B copied
+(not re-encoded)
+.IP \(bu 2
+Only video and audio are mapped (\fB\-map 0:v? \-map 0:a?\fR); subtitles
+are skipped to avoid failures on some broadcast sources (e.g. DVB/teletext on
+.BR .ts )
+.IP \(bu 2
+Existing output files are overwritten (\fB\-y\fR)
+.IP \(bu 2
+All outputs use the
+.B .mkv
+(Matroska) container, regardless of the input extension
+.SS Batch discovery
+In batch mode, files are found recursively under the input directory with
+extensions (case-insensitive):
+.BR mkv ", " mp4 ", " avi ", " mov ", " webm ", " ts ", " mts .
+.SS Requirements
+.IP \(bu 2
+.B ffmpeg
+built with VAAPI support
+.IP \(bu 2
+.B vainfo
+available (from
+.BR libva-utils )
+.IP \(bu 2
+.B ffprobe
+(for duration / progress)
+.SH EXAMPLES
+Encode everything under the default directories:
+.IP
+.EX
+ffmpeg-encode
+.EE
+.P
+Custom directories and quality preset:
+.IP
+.EX
+ffmpeg-encode \-i ~/Videos/raw \-o ~/Videos/encoded \-p quality
+.EE
+.P
+Single file, faster preset:
+.IP
+.EX
+ffmpeg-encode \-\-input video.mkv \-\-output video\-hevc.mkv \-p speed
+.EE
+.P
+Show the command without running it:
+.IP
+.EX
+ffmpeg-encode \-n \-i ~/Videos/raw \-o ~/Videos/encoded
+.EE
+.P
+Tighter quality (lower QP):
+.IP
+.EX
+ffmpeg-encode \-q 24
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+All encodes succeeded (or dry run completed).
+.TP
+.B 1
+One or more encodes failed, invalid options, missing input, or VAAPI
+unavailable.
+.SH FILES
+.TP
+.I /mnt/shared/Compressing
+Default input directory (batch mode).
+.TP
+.I /mnt/shared/Handbraked
+Default output directory (batch mode).
+.SH SEE ALSO
+.BR ffmpeg (1),
+.BR ffprobe (1),
+.BR vainfo (1)
+.SH BUGS
+Deleting the original after a successful encode is enabled by default and
+cannot currently be turned off with a flag (only via editing the script
+defaults).
+.SH AUTHOR
+Written for local use with VAAPI on AMD RDNA4 (RX 9070 class).

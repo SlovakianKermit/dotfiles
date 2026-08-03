@@ -11,7 +11,7 @@
         "download_path": false,
         "inactive_seeding_time_limit": -2,
         "ratio_limit": -2,
-        "save_path": "/mnt/shared/Media/Movies",
+        "save_path": "/mnt/data_storage/Movies",
         "seeding_time_limit": -2,
         "share_limit_action": "Default"
     },

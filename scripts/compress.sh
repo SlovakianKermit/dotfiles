@@ -1,6 +1,20 @@
 #!/bin/bash
 cd /tmp || exit 1
 BASE_ROOT="$HOME/Pictures/img"
+METADATA_MODE=0
+COMPARE_MODE=0
+NEW_ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "-metadata" ]; then
+    METADATA_MODE=1
+  elif [ "$arg" = "-c" ] || [ "$arg" = "--compare" ]; then
+    COMPARE_MODE=1
+  else
+    NEW_ARGS+=("$arg")
+  fi
+done
+set -- "${NEW_ARGS[@]}"
+
 if [[ "$1" =~ ^[0-9]+$ ]]; then
   BASE="$BASE_ROOT"
   QUALITY="${1:-85}"
@@ -10,15 +24,30 @@ else
   QUALITY="${2:-85}"
   METHOD="${3:-4}"
 fi
+
 TARGET_W=2560
 TARGET_H=1440
 THREADS=12
+
+if [ "$METADATA_MODE" = "1" ] && ! command -v exiftool &>/dev/null; then
+  echo -e "\033[0;31mError: -metadata flag requires exiftool, which is not installed.\033[0m"
+  exit 1
+fi
+
+# Compare-mode setup
+CMP_DIR="/tmp/webp_compare_src"
+if [ "$COMPARE_MODE" = "1" ]; then
+  mkdir -p "$CMP_DIR"
+  echo -e "\033[0;36mCompare mode on: pre-encode sources → $CMP_DIR\033[0m"
+fi
+
 PURPLE='\033[0;35m'
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 CYAN='\033[0;36m'
 YELLOW='\033[0;33m'
 RESET='\033[0m'
+
 echo "Scanning for images in: $BASE"
 TEMP_LIST="/tmp/webp_filelist.$$"
 COUNT_FILE="/tmp/webp_count.$$"
@@ -26,22 +55,27 @@ SKIPPED_FILE="/tmp/webp_skipped.$$"
 SAVED_FILE="/tmp/webp_saved.$$"
 TOTAL_IN_FILE="/tmp/webp_totalin.$$"
 LOCK_FILE="/tmp/webp_lock.$$"
+
 find "$BASE" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) >"$TEMP_LIST"
 TOTAL=$(wc -l <"$TEMP_LIST")
 echo "Found $TOTAL files to convert"
 echo "Using cwebp with quality $QUALITY, method $METHOD, max ${TARGET_W}x${TARGET_H}, and $THREADS threads"
 echo ""
+
 if [ "$TOTAL" -eq 0 ]; then
   rm -f "$TEMP_LIST"
   echo "Nothing to do."
   exit 0
 fi
+
 echo "0" >"$COUNT_FILE"
 echo "0" >"$SKIPPED_FILE"
 echo "0" >"$SAVED_FILE"
 echo "0" >"$TOTAL_IN_FILE"
 touch "$LOCK_FILE"
-export TOTAL QUALITY METHOD TARGET_W TARGET_H COUNT_FILE SKIPPED_FILE SAVED_FILE TOTAL_IN_FILE LOCK_FILE PURPLE GREEN RED CYAN YELLOW RESET
+
+export TOTAL QUALITY METHOD TARGET_W TARGET_H COUNT_FILE SKIPPED_FILE SAVED_FILE TOTAL_IN_FILE LOCK_FILE METADATA_MODE COMPARE_MODE CMP_DIR PURPLE GREEN RED CYAN YELLOW RESET
+
 process_file() {
   local f="$1"
   local dir file name output n in_size out_size saved
@@ -71,8 +105,16 @@ process_file() {
     fi
   fi
 
+  # --- Compare mode: save pre-encode source as PNG ---
+  if [ "$COMPARE_MODE" = "1" ]; then
+    convert "$src" "${CMP_DIR}/${name}.png" 2>/dev/null || true
+  fi
+
   if cwebp -q "$QUALITY" -m "$METHOD" "$src" -o "$output" -quiet 2>/dev/null; then
     [ -n "$tmp_resized" ] && rm -f "$tmp_resized"
+    if [ "$METADATA_MODE" = "1" ]; then
+      exiftool -TagsFromFile "$f" -all:all "$output" -overwrite_original -quiet 2>/dev/null
+    fi
     out_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
     out_kb=$((out_size / 1024))
     if [ -f "$output" ] && [ "$out_size" -gt 1024 ] && [ "$out_size" -lt "$in_size" ]; then
@@ -99,7 +141,9 @@ process_file() {
   fi
 }
 export -f process_file
+
 cat "$TEMP_LIST" | xargs -d '\n' -P "$THREADS" -I {} bash -c 'process_file "$@"' _ {}
+
 FINAL_COUNT=$(<"$COUNT_FILE")
 FINAL_SKIPPED=$(<"$SKIPPED_FILE")
 TOTAL_SAVED=$(<"$SAVED_FILE")
@@ -111,3 +155,8 @@ PERCENT=$((TOTAL_IN > 0 ? TOTAL_SAVED * 100 / TOTAL_IN : 0))
 rm -f "$COUNT_FILE" "$SKIPPED_FILE" "$SAVED_FILE" "$TOTAL_IN_FILE" "$LOCK_FILE" "$TEMP_LIST"
 echo ""
 echo -e "${GREEN}Done! Converted $FINAL_COUNT/$TOTAL files. Skipped $FINAL_SKIPPED. Saved ${SAVED_MB}MB (${PERCENT}%) total.${RESET}"
+
+if [ "$COMPARE_MODE" = "1" ]; then
+  echo -e "${CYAN}Pre-encode sources saved to $CMP_DIR/${RESET}"
+  echo -e "${CYAN}  → compare with: ssimulacra2 $CMP_DIR/name.png output/name.webp${RESET}"
+fi

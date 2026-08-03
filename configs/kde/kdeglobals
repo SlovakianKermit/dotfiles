@@ -1,7 +1,7 @@
 [ColorEffects:Disabled]
 ChangeSelectionColor=
-Color=30, 30, 46
-ColorAmount=0.30000000000000004
+Color=30,30,46
+ColorAmount=0.125
 ColorEffect=2
 ContrastAmount=0.1
 ContrastEffect=0
@@ -120,8 +120,9 @@ ForegroundVisited=203, 166, 247
 
 [General]
 AccentColor=146,110,228
+BrowserApplication=helium.desktop
 ColorScheme=CatppuccinMochaSaphhire
-ColorSchemeHash=2021d731820f04cb13746719f44a0e6d43da181c
+ColorSchemeHash=85ca5a6cded8383d46ab1f80852a73cc36931a97
 LastUsedCustomAccentColor=146,110,228
 UseSystemBell=true
 XftAntialias=true
@@ -132,6 +133,9 @@ font=JetBrainsMono Nerd Font Mono,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
 menuFont=JetBrainsMono Nerd Font Mono,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
 smallestReadableFont=JetBrainsMono Nerd Font Mono,8,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
 toolBarFont=JetBrainsMono Nerd Font Mono,10,-1,5,400,0,0,0,0,0,0,0,0,0,0,1
+
+[Icons]
+Theme=char-white
 
 [KDE]
 AnimationDurationFactor=0.25
@@ -147,7 +151,7 @@ Automatically select filename extension=true
 Breadcrumb Navigation=false
 Decoration position=2
 Show Full Path=false
-Show Inline Previews=true
+Show Inline Previews=false
 Show Preview=false
 Show Speedbar=true
 Show hidden files=true
@@ -156,7 +160,7 @@ Sort directories first=true
 Sort hidden files last=false
 Sort reversed=false
 Speedbar Width=210
-View Style=Simple
+View Style=DetailTree
 
 [PreviewSettings]
 EnableRemoteFolderThumbnail=true

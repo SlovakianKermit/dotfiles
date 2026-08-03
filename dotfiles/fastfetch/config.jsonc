@@ -123,7 +123,7 @@
       "type": "command",
       "key": " Updated",
       "keyColor": "magenta",
-      "text": "checkupdates 2>/dev/null | wc -l | xargs -I{} echo '{} packages available'"
+      "text": "wc -l < ~/.local/state/arch-update/last_updates_check_packages 2>/dev/null | xargs -I{} echo '{} packages available'"
     },
     {
       "type": "custom",

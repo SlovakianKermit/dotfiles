@@ -1,0 +1,264 @@
+.TH DOTFILES-SYNC 1 "August 2026" "dotfiles-sync" "User Commands"
+.SH NAME
+dotfiles-sync \- push and pull dotfiles, configs, scripts, and packages via Git
+.SH SYNOPSIS
+.B dotfiles-sync.sh setup
+.P
+.B dotfiles-sync.sh push
+[\fIcommit-message\fR]
+[\fB\-\-dry\-run\fR]
+.P
+.B dotfiles-sync.sh pull
+[\fB\-\-dry\-run\fR]
+[\fB\-\-skip\-cachyos\fR]
+.SH DESCRIPTION
+.B dotfiles-sync.sh
+mirrors your configuration between machines through a Git repository.
+It handles dotfiles (symlinked), copy-only configs (e.g. Electron apps),
+custom scripts from
+.IR ~/.local/bin ,
+man pages,
+and package lists split by source (Arch official, CachyOS, and AUR).
+.P
+The script is designed to set up a new Arch-based system in one command.
+On pull it auto-detects whether the CachyOS repositories are available
+and adds them if missing, then installs every package one at a time,
+logging failures for review instead of silently dropping them.
+.SH OPTIONS
+.TP
+.B \-\-dry\-run
+Print what would happen without changing anything on disk.
+Also skips Git commit/push on
+.BR push .
+.TP
+.B \-\-skip\-cachyos
+(Only meaningful for
+.BR pull .)
+Do not attempt to add the CachyOS repositories.
+Packages in
+.I pkglist-cachyos.txt
+are skipped and logged to
+.IR skipped-cachyos.txt .
+.SH SUBCOMMANDS
+.TP
+.B setup
+Clone the dotfiles repository from GitHub into
+.IR ~/dotfiles
+and create the expected directory layout
+.RI ( dotfiles/ ", " configs/kde/ ", " scripts/ ", " packages/ ).
+Safe to run more than once \(en exits early if the repo already exists.
+.TP
+.B push " [\fImsg\fR]"
+Save the current system state to the repo and push it to GitHub.
+.RS
+.IP \(bu 2
+Dumps package lists:
+.B pkglist-arch.txt
+(Arch official),
+.B pkglist-cachyos.txt
+(CachyOS repo),
+.B pkglist-aur.txt
+(AUR/foreign).
+.IP \(bu 2
+Copies every file under
+.B ~/.local/bin
+into
+.IR scripts/ .
+.IP \(bu 2
+Syncs symlink targets (e.g.
+.BR ~/.config/fish )
+into
+.I dotfiles/
+with
+.B rsync
+\fB\-\-delete\fR.
+Some noisy subdirectories are excluded (see
+.BR FILES ).
+.IP \(bu 2
+Copies copy-only configs (Electron apps, KDE globals) into
+.IR configs/ .
+.IP \(bu 2
+Commits with the supplied message (default:
+"chore: sync dotfiles YYYY-MM-DD HH:MM") and pushes to the remote.
+.RE
+.TP
+.B pull " [\fIflags\fR]"
+Restore everything from the repo onto the current machine.
+.RS
+.IP \(bu 2
+Runs
+.B git pull
+in
+.IR ~/dotfiles .
+.IP \(bu 2
+If on Arch Linux and CachyOS repos are absent, downloads and installs
+.B cachyos-keyring
+and
+.BR cachyos-mirrorlist ,
+appends
+.B [cachyos]
+to
+.IR /etc/pacman.conf ,
+and refreshes the database.
+.IP \(bu 2
+Installs each package list one-by-one:
+.B pkglist-arch.txt
+and
+.B pkglist-cachyos.txt
+with
+.BR pacman ,
+.B pkglist-aur.txt
+with
+.BR paru .
+Failures are written to
+.IR failed.txt .
+.IP \(bu 2
+Hardware-specific packages (GPU drivers, microcode, vendor kernels)
+are skipped automatically and logged to
+.IR skipped-hardware.txt .
+.IP \(bu 2
+Restores scripts to
+.IR ~/.local/bin .
+.IP \(bu 2
+Creates symlinks for all dotfile targets, backing up any existing
+real file or directory to a timestamped
+.IB name .bak.YYYYMMDD-HHMMSS .
+.IP \(bu 2
+Copies copy-only configs back to their original locations (same backup
+behaviour as symlinks).
+.IP \(bu 2
+Runs
+.B mandb \-u ~/.local/share/man
+to index restored man pages.
+.RE
+.SH HARDWARE EXCLUSIONS
+To avoid installing GPU drivers and CPU microcode meant for a different
+machine, the following package names are skipped on
+.BR pull :
+.IP \(bu 2
+AMD GPU:
+.BR vulkan-radeon ", " lib32-vulkan-radeon ", " amdvlk ", "
+.BR xv86-video-amdgpu ", " radeontop ", " rocm-* ", " libva-mesa-driver ", "
+.BR mesa-vdpau
+.IP \(bu 2
+AMD CPU:
+.B amd-ucode
+.IP \(bu 2
+NVIDIA:
+.BR nvidia-dkms ", " nvidia-utils ", " lib32-nvidia-utils ", "
+.BR libva-nvidia-driver ", " nvidia-settings ", " nvtop
+.IP \(bu 2
+Intel GPU:
+.BR vulkan-intel ", " intel-media-driver ", " libva-intel-driver ", "
+.B intel-ucode
+.IP \(bu 2
+CachyOS kernels:
+.BR linux-cachyos ", " linux-cachyos-headers ", " linux-cachyos-nvidia
+.SH ENVIRONMENT
+.TP
+.I REPO_DIR
+Repository location (default:
+.BR ~/dotfiles ).
+.TP
+.I GITHUB_REPO
+Remote URL (default:
+.BR https://github.com/SlovakianKermit/dotfiles.git ).
+.SH FILES
+.TP
+.I ~/dotfiles/
+Git working tree with the following layout:
+.RS
+.TP
+.I dotfiles/
+Symlink targets (Alacritty, fish, Ghostty, Neovim, qBittorrent, etc.)
+.TP
+.I configs/
+Copied configs (Brave, Discord, Dolphin, easyeffects, KDE, Obsidian, Sunshine)
+.TP
+.I configs/kde/
+Individual KDE config files
+.TP
+.I configs/man/
+Custom man pages from
+.IR ~/.local/share/man
+.TP
+.I scripts/
+Every script and binary from
+.IR ~/.local/bin
+.TP
+.I packages/
+.IR pkglist-arch.txt ,
+.IR pkglist-cachyos.txt ,
+.IR pkglist-aur.txt ,
+.IR failed.txt ,
+.IR skipped-hardware.txt ,
+.I skipped-cachyos.txt
+.RE
+.TP
+.I ~/dotfiles/packages/failed.txt
+Packages that failed to install on pull (one per line).
+.TP
+.I ~/dotfiles/packages/skipped-hardware.txt
+Hardware-specific packages skipped on pull (requires manual install).
+.TP
+.I ~/dotfiles/packages/skipped-cachyos.txt
+CachyOS packages skipped when
+.B \-\-skip\-cachyos
+is used.
+.TP
+.I ~/.config/qBittorrent/
+On push, the following are excluded:
+.BR BT_backup/ ", " logs/ ", " rss/ ", " search/ ", " GeoIP/ ", "
+.BR qBittorrent.conf ", " qBittorrent-data.conf .
+Config files that survive are
+.B qBittorrent.conf
+(without download paths, as the file is excluded outright) and
+.BR qBittorrent-data.conf .
+.SH EXAMPLES
+.TP
+dotfiles-sync.sh setup
+First run on any machine. Clones the dotfiles repo.
+.TP
+dotfiles-sync.sh push
+Save current state. Equivalent to
+.BR "dotfiles-sync.sh push 'chore: sync dotfiles ...'" .
+.TP
+dotfiles-sync.sh push "add nvim config"
+Save with a custom commit message.
+.TP
+dotfiles-sync.sh push --dry-run
+Preview what would be pushed without making changes.
+.TP
+dotfiles-sync.sh pull
+Full restore.
+.TP
+dotfiles-sync.sh pull --dry-run
+Preview everything that would be installed and linked.
+.TP
+dotfiles-sync.sh pull --skip-cachyos
+Restore without touching CachyOS repositories or its packages.
+.TP
+cat ~/dotfiles/packages/failed.txt
+Review packages that failed to install after a pull.
+.TP
+cat ~/dotfiles/packages/skipped-hardware.txt
+See which GPU/CPU packages were skipped \(en install equivalents
+for your hardware.
+.SH EXIT STATUS
+.TP
+.B 0
+Success (or nothing to commit, or dry run completed).
+.TP
+.B 1
+Fatal error (missing required command, repo not found, etc.).
+Individual package install failures do
+.I not
+cause a non-zero exit; they are logged instead.
+.SH SEE ALSO
+.BR pacman (8),
+.BR paru (1),
+.BR rsync (1),
+.BR git (1),
+.BR mandb (8)
+.SH AUTHOR
+Written by Killian for local use on Arch-based systems.
