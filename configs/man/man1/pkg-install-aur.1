@@ -1,0 +1,84 @@
+.TH PKG-INSTALL-AUR 1 "2026-08-07" "pkg-install-aur" "User Commands"
+.SH NAME
+pkg-install-aur \- interactive AUR package installer (fzf TUI)
+.SH SYNOPSIS
+.B pkg-install-aur
+.SH DESCRIPTION
+.B pkg-install-aur
+is an interactive
+.BR fzf (1)
+front end for installing packages from the Arch User Repository (AUR).
+It takes no command\-line arguments; the whole workflow happens inside the
+fzf list and its preview pane.
+.P
+On start, the script lists every AUR package (\fByay \-Slqa\fR, bare
+package names) and feeds it to
+.BR fzf (1).
+Unlike
+.BR pkg-install (1),
+no installed state marker is added, because the AUR source list contains
+names only. Filter by typing, toggle entries into the selection with
+.B Tab
+and press Enter. The chosen package names are collected and installed in
+a single call to
+.BR paru (1)
+(\fBparu \-S \-\-noconfirm\fR), which builds the AUR packages and their
+dependencies, so no further confirmation is asked. If the selection is
+empty (the list is dismissed), the script exits silently without making
+any change.
+.P
+A wrap\-enabled preview pane at the bottom (65% of the screen) shows
+detailed information for the highlighted package via
+.BR yay (1)
+(\fByay \-Siia\fR, using field \fB{1}\fR, the package name). The pointer
+and multi\-select marker are shown in green, and the preview label reads:
+.IP
+\fBalt\-p: toggle preview | alt\-j/k: scroll preview | tab: multi\-select\fR
+.SS Key bindings
+.IP \(bu 2
+.B Tab
+toggle multi\-selection of the current entry
+.IP \(bu 2
+.B Ctrl-J
+move the cursor down the list
+.IP \(bu 2
+.B Ctrl-K
+move the cursor up the list
+.IP \(bu 2
+.B Alt-P
+toggle the preview pane
+.IP \(bu 2
+.B Alt-D
+scroll the preview half a page down
+.IP \(bu 2
+.B Alt-U
+scroll the preview half a page up
+.IP \(bu 2
+.B Alt-J
+scroll the preview one line down
+.IP \(bu 2
+.B Alt-K
+scroll the preview one line up
+.P
+The script requires
+.BR fzf (1),
+.BR yay (1)
+and
+.BR paru (1).
+.SH EXAMPLES
+Install one or more AUR packages:
+.IP
+.EX
+pkg-install-aur
+.EE
+.P
+Type a search term to filter, press
+.B Tab
+on each package of interest, then press Enter to build and install all of
+them.
+.SH SEE ALSO
+.BR paru (1),
+.BR yay (1),
+.BR fzf (1),
+.BR pkg-install (1),
+.BR pkg-remove.sh (1)

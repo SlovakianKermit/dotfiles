@@ -1,0 +1,113 @@
+.TH TRIM-CORRUPT 1 "2026-08-07" "trim_corrupt.sh" "User Commands"
+.SH NAME
+trim_corrupt.sh \- trim .ts files whose audio runs past the video end
+.SH SYNOPSIS
+.B trim_corrupt.sh
+[\fIINPUT\fP]
+[\fIOUTPUT_DIR\fP]
+.SH DESCRIPTION
+.B trim_corrupt.sh
+fixes MPEG transport stream (
+.B .ts
+) recordings where the audio track extends more than
+.B 5 seconds
+past the end of the video, by trimming the file to the end of the video
+without re-encoding.
+.P
+For each
+.B .ts
+file, the end timestamp of the last video packet and the last audio packet
+are read with
+.BR ffprobe (1):
+.IP \(bu 2
+video end:
+.B last pts_time
+of stream
+.B v:0
+.IP \(bu 2
+audio end:
+.B last pts_time
+of stream
+.B a:0
+.P
+If both timestamps can be read and the audio end is more than 5 seconds after
+the video end, the file is trimmed to the video end and the original is
+deleted. Files whose audio and video are aligned within 5 seconds are left
+untouched. If the timestamps cannot be read, the file is skipped.
+.SH OPTIONS
+.TP
+.I INPUT
+A single
+.B .ts
+file, or a directory of
+.B .ts
+files. Defaults to the current directory.
+.RS
+.IP \(bu 2
+If a
+.B file
+is given, only that file is processed.
+.IP \(bu 2
+If a
+.B directory
+is given, all
+.B *.ts
+files in it are processed (top level only, not recursive).
+.IP \(bu 2
+Anything else prints an error and the script exits with status 1.
+.RE
+.TP
+.I OUTPUT_DIR
+Directory where trimmed copies are written. Defaults to
+.BR ./trimmed .
+Created if it does not exist.
+.SH BEHAVIOUR
+.IP \(bu 2
+Trimming is performed with
+.BR ffmpeg (1)
+as
+.BR "ffmpeg \-v error \-i FILE \-t VID_END \-c copy OUT" ,
+a stream copy (no re-encode), cut at the video end timestamp.
+.IP \(bu 2
+The original file is deleted
+.B only
+if the trimmed output exists and is non-empty; otherwise a warning is
+printed and the original is kept.
+.IP \(bu 2
+The 5-second threshold and the trim length are computed with floating point,
+so sub-second differences are handled.
+.IP \(bu 2
+Per-file messages report the trim point, the audio end, and the difference;
+aligned files report
+.B OK: streams roughly aligned.
+.SH EXAMPLES
+Process all
+.B .ts
+files in the current directory into
+.BR ./trimmed :
+.IP
+.EX
+trim_corrupt.sh
+.EE
+.P
+Process a specific recording:
+.IP
+.EX
+trim_corrupt.sh ~/Videos/news.ts
+.EE
+.P
+Process a directory, writing into a named output folder:
+.IP
+.EX
+trim_corrupt.sh ~/Videos/recordings ~/Videos/fixed
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Completed normally.
+.TP
+.B 1
+INPUT is neither a file nor a directory.
+.SH SEE ALSO
+.BR ffmpeg (1),
+.BR ffprobe (1)

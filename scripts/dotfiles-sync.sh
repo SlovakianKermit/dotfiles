@@ -91,7 +91,8 @@ declare -a HARDWARE_EXCLUDES=(
   # Intel GPU
   "vulkan-intel" "intel-media-driver" "libva-intel-driver" "intel-ucode"
   # CachyOS vendor kernels
-  "linux-cachyos" "linux-cachyos-headers" "linux-cachyos-nvidia"
+  "linux-cachyos" "linux-cachyos-headers" "linux-cachyos-lts"
+  "linux-cachyos-lts-headers" "linux-cachyos-nvidia"
 )
 
 # ============================================================
@@ -525,18 +526,25 @@ cmd_setup() {
 
 DRY_RUN=false
 SKIP_CACHYOS=false
+subcommand=""
+commit_msg=""
 
-# Parse flags
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --dry-run)       DRY_RUN=true;       shift ;;
-    --skip-cachyos)  SKIP_CACHYOS=true;  shift ;;
-    *) break ;;
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)       DRY_RUN=true ;;
+    --skip-cachyos)  SKIP_CACHYOS=true ;;
+    *)
+      if [[ -z "$subcommand" ]]; then
+        subcommand="$arg"
+      elif [[ -z "$commit_msg" ]]; then
+        commit_msg="$arg"
+      fi
+      ;;
   esac
 done
 
-case "${1:-}" in
-  push) cmd_push "${2:-}" ;;
+case "${subcommand}" in
+  push) cmd_push "${commit_msg}" ;;
   pull) cmd_pull ;;
   setup) cmd_setup ;;
   *)

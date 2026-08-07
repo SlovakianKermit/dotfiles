@@ -23,7 +23,7 @@ HWACCEL = "vaapi"
 ENCODER = "hevc_vaapi"
 DEFAULT_INPUT_DIR = "/mnt/shared/Compressing"
 DEFAULT_OUTPUT_DIR = "/mnt/shared/Handbraked"
-DEFAULT_QUALITY = 28
+DEFAULT_QUALITY = 27
 DEFAULT_PRESET = "balanced"
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -148,9 +148,10 @@ class Queue:
         done = sum(1 for j in self.jobs if j.status == "done")
         failed = sum(1 for j in self.jobs if j.status == "failed")
         skipped = sum(1 for j in self.jobs if j.status == "skipped")
+        kept = sum(1 for j in self.jobs if j.status == "kept")
         total_in = sum(j.input_size for j in self.jobs if j.status in ("done", "failed"))
         total_out = sum(j.output_size for j in self.jobs if j.status == "done")
-        return done, failed, skipped, total_in, total_out
+        return done, failed, skipped, kept, total_in, total_out
 
 # ═══════════════════════════════════════════════════════════════════════
 # Worker thread
@@ -229,16 +230,32 @@ def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
             if state.skip:
                 job.status = "skipped"
             elif proc.returncode == 0 and os.path.getsize(job.output_path) > 0:
-                job.status = "done"
-                job.output_size = os.path.getsize(job.output_path)
-                state.percentage = 100
-                state.total_in_bytes += job.input_size
-                state.total_out_bytes += job.output_size
-                if delete_original:
+                out_size = os.path.getsize(job.output_path)
+                if out_size < job.input_size:
+                    job.status = "done"
+                    job.output_size = out_size
+                    state.percentage = 100
+                    state.total_in_bytes += job.input_size
+                    state.total_out_bytes += out_size
+                    if delete_original:
+                        try:
+                            os.remove(job.input_path)
+                        except OSError:
+                            pass
+                elif delete_original:
+                    # Encode is not smaller — discard it, keep the original
+                    job.status = "kept"
                     try:
-                        os.remove(job.input_path)
+                        os.remove(job.output_path)
                     except OSError:
                         pass
+                else:
+                    # -k mode: keep both, record as done
+                    job.status = "done"
+                    job.output_size = out_size
+                    state.percentage = 100
+                    state.total_in_bytes += job.input_size
+                    state.total_out_bytes += out_size
             else:
                 job.status = "failed"
                 if proc.returncode != 0:
@@ -361,6 +378,8 @@ class TUI:
         with self.state.lock:
             pid = self.state.ffmpeg_pid
             self.state.quit = True
+            if pid:
+                self.state.skip = True
 
         if pid:
             try:
@@ -742,6 +761,8 @@ class TUI:
                 suffix = job.error[:20] if job.error else "FAILED"
             elif job.status == "skipped":
                 suffix = "SKIPPED"
+            elif job.status == "kept":
+                suffix = "kept original (output larger)"
             else:
                 suffix = human_bytes(job.input_size) if job.input_size else ""
 
@@ -775,6 +796,8 @@ class TUI:
             return "✗", self._bold(4)
         elif job.status == "skipped":
             return "→", self._color(6)
+        elif job.status == "kept":
+            return "○", self._color(6)
         else:
             return "·", self._color(6)
 
@@ -844,7 +867,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-n", dest="dry_run", action="store_true",
                    help="Dry run: list files and exit")
     p.add_argument("-k", "--keep", dest="keep", action="store_true",
-                   help="Keep original files (default: delete after encode)")
+                   help="Keep original files (default: delete originals only when encode is smaller)")
     p.add_argument("-D", dest="flag_D", action="store_true",
                    help=argparse.SUPPRESS)  # legacy compat, delete is already default
     return p.parse_args()
@@ -897,11 +920,11 @@ def main():
     curses.wrapper(main_curses, queue, state, args)
 
     # ── Summary after TUI exit ──────────────────────────────────────
-    done, failed, skipped, total_in, total_out = queue.stats
+    done, failed, skipped, kept, total_in, total_out = queue.stats
     print()
     print("═" * 44)
-    print(f" Done: {done}  |  Failed: {failed}  |  Skipped: {skipped}")
-    if done + failed + skipped > 0:
+    print(f" Done: {done}  |  Failed: {failed}  |  Skipped: {skipped}  |  Kept: {kept}")
+    if done + failed + skipped + kept > 0:
         saved = total_in - total_out
         if saved >= 0:
             pct = saved / total_in * 100 if total_in else 0

@@ -38,6 +38,8 @@ discover
 dmidecode
 dmraid
 dnsmasq
+docker
+docker-compose
 dolphin
 dosfstools
 dotnet-runtime-8.0

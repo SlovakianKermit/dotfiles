@@ -1,0 +1,146 @@
+.TH EXTRACT_ARCHIVES 1 "2026-08-07" "extract_archives.sh" "User Commands"
+.SH NAME
+extract_archives.sh \- recursively extract archives and remove the originals
+.SH SYNOPSIS
+.B extract_archives.sh
+[\fIDIRECTORY\fR]
+.SH DESCRIPTION
+.B extract_archives.sh
+recursively finds archives under the target directory, verifies their
+integrity, extracts each one into a new subdirectory named after the archive
+(without its extension), and deletes the original archive only after a fully
+successful extraction.
+.P
+Archives that fail their integrity check or fail to extract are left in
+place and reported at the end; the partially extracted target directory of a
+failed extraction is removed.
+.P
+The first positional argument sets the search root and defaults to the
+current directory (\fB.\fR). Supported formats are detected from the
+extension, which is lowercased before matching, so uppercase extensions such
+as
+.BR .ZIP ", " .TAR.GZ ", and " .7Z
+are handled.
+.P
+Supported formats:
+.IP \(bu 2
+\fB.tar.gz\fR and \fB.tgz\fR
+.IP \(bu 2
+\fB.tar.bz2\fR and \fB.tbz2\fR
+.IP \(bu 2
+\fB.tar.xz\fR and \fB.txz\fR
+.IP \(bu 2
+\fB.tar\fR
+.IP \(bu 2
+\fB.zip\fR
+.IP \(bu 2
+\fB.7z\fR
+.P
+Each archive is extracted with the matching tool:
+.BR tar (1)
+for all
+.B tar
+variants,
+.BR unzip (1)
+for
+.BR .zip ,
+and
+.BR 7z (1)
+for
+.BR .7z .
+.SH ARGUMENTS
+.TP
+.I DIRECTORY
+Directory to search recursively. Default:
+.BR . .
+.SH OPTIONS
+None. There are no command-line flags; the script takes a single optional
+positional argument (the search root).
+.SH BEHAVIOUR
+.SS Integrity check
+Before extraction, every archive is tested:
+.IP \(bu 2
+.B zip:
+.B unzip \-qt
+.IP \(bu 2
+.B tar
+(and compressed variants):
+.B tar \-tf
+(after a
+.BR tar \ \-\-test-label
+probe)
+.IP \(bu 2
+.B 7z:
+.B 7z t
+.P
+If the check fails, the archive is reported as failed and kept untouched.
+.SS Extraction
+.P
+The archive is extracted into
+.IR dir/name ,
+where
+.I name
+is the archive filename with its known extension removed (e.g.
+.I foo.tar.gz
+is extracted to
+.IR foo/ ).
+For
+.BR .zip
+archives the tool is
+.BR unzip\ \-o\ \-q ,
+for
+.B tar
+variants
+.BR tar\ \-xf\ \-C ,
+and for
+.BR .7z
+.BR 7z\ x\ \-o .
+.P
+If extraction fails, the partial target directory is removed with
+.BR rm\ \-rf
+and the archive is reported as failed and kept.
+.P
+On success the original archive is deleted with
+.BR rm\ \-f .
+.SH EXAMPLES
+Extract archives in the current directory:
+.IP
+.EX
+extract_archives.sh
+.EE
+.P
+Process a specific directory tree:
+.IP
+.EX
+extract_archives.sh ~/Downloads
+.EE
+.P
+Typical output for a clean run:
+.IP
+.EX
+Processing: ~/Downloads/backup.tar.gz
+  [OK] Integrity verified
+  [DONE] Extracted and removed: ~/Downloads/backup.tar.gz
+
+All archives processed successfully.
+.EE
+.P
+Typical output when an archive cannot be read:
+.IP
+.EX
+Processing: ~/Downloads/corrupt.zip
+  [FAIL] Integrity check failed, keeping archive: ~/Downloads/corrupt.zip
+
+===== FAILED ARCHIVES (1) =====
+  \- ~/Downloads/corrupt.zip
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+The script always exits 0 when the scan completes; individual failures are
+reported on stdout in the failed-archives summary, not via the exit status.
+.SH SEE ALSO
+.BR tar (1),
+.BR unzip (1),
+.BR 7z (1),
+.BR find (1)

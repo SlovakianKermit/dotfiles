@@ -1,0 +1,38 @@
+.TH LAUNCH-CONVERGENCE 1 "2026-08-07" "launch-convergence" "User Commands"
+.SH NAME
+launch-convergence \- launch the Convergence Mass Effect 3 mod under MangoHud
+.SH SYNOPSIS
+.B launch-convergence.sh
+.SH DESCRIPTION
+.B launch-convergence.sh
+is a small bash wrapper that launches the Convergence mod for Mass Effect 3
+under
+.BR mangohud (1).
+.P
+It changes to the game directory
+.IR ~/Games/ConvergenceER\ 3.0.1/me3
+and runs:
+.IP
+.EX
+mangohud me3 launch -p ./convergence.me3
+.EE
+.P
+The
+.B me3
+binary in that directory is the game executable; the
+.B launch
+subcommand with the
+.B \-p
+flag starts it using the
+.B convergence.me3
+profile file.
+.SH OPTIONS
+No options are accepted. The script takes no arguments.
+.SH EXAMPLES
+Launch the game with MangoHud:
+.IP
+.EX
+launch-convergence.sh
+.EE
+.SH SEE ALSO
+.BR mangohud (1)

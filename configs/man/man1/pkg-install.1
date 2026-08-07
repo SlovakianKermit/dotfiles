@@ -1,0 +1,89 @@
+.TH PKG-INSTALL 1 "2026-08-07" "pkg-install" "User Commands"
+.SH NAME
+pkg-install \- interactive package installer (fzf TUI)
+.SH SYNOPSIS
+.B pkg-install
+.SH DESCRIPTION
+.B pkg-install
+is an interactive
+.BR fzf (1)
+front end for installing packages from the enabled sync repositories.
+It takes no command\-line arguments; the whole workflow happens inside the
+fzf list and its preview pane.
+.P
+On start, the script snapshots the set of installed packages
+(\fBpacman \-Qq\fR) into a temporary lookup table and lists every package
+available in the configured repositories (\fBpacman \-Slq\fR). Each entry
+is prefixed with a state marker:
+.IP \(bu 2
+\fB★\fR
+the package is already installed
+.IP \(bu 2
+\fB○\fR
+the package is available but not installed
+.P
+Filter by typing, toggle entries into the selection with
+.B Tab
+and press Enter. The chosen package names are collected and installed in
+a single call to
+.BR paru (1)
+(\fBparu \-S \-\-noconfirm\fR), so no further confirmation is asked. If the
+selection is empty (the list is dismissed), the script exits silently
+without making any change.
+.P
+A wrap\-enabled preview pane at the bottom (65% of the screen) shows
+detailed information for the highlighted package via
+.BR pacman (8)
+(\fBpacman \-Sii\fR, using field \fB{2}\fR, the package name after the
+state marker). The pointer and multi\-select marker are shown in green,
+and the preview label reads:
+.IP
+\fBalt\-p: toggle preview | alt\-j/k: scroll preview | tab: multi\-select\fR
+.SS Key bindings
+.IP \(bu 2
+.B Tab
+toggle multi\-selection of the current entry
+.IP \(bu 2
+.B Ctrl-J
+move the cursor down the list
+.IP \(bu 2
+.B Ctrl-K
+move the cursor up the list
+.IP \(bu 2
+.B Alt-P
+toggle the preview pane
+.IP \(bu 2
+.B Alt-D
+scroll the preview half a page down
+.IP \(bu 2
+.B Alt-U
+scroll the preview half a page up
+.IP \(bu 2
+.B Alt-J
+scroll the preview one line down
+.IP \(bu 2
+.B Alt-K
+scroll the preview one line up
+.P
+The script requires
+.BR fzf (1)
+and
+.BR paru (1);
+package listing and installed\-state detection use
+.BR pacman (8).
+.SH EXAMPLES
+Install one or more packages:
+.IP
+.EX
+pkg-install
+.EE
+.P
+Type a search term to filter, press
+.B Tab
+on each package of interest, then press Enter to install all of them.
+.SH SEE ALSO
+.BR paru (1),
+.BR pacman (8),
+.BR fzf (1),
+.BR pkg-install-aur (1),
+.BR pkg-remove.sh (1)

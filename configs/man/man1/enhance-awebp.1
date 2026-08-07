@@ -1,0 +1,106 @@
+.TH ENHANCE-AWEBP 1 "2026-08-07" "enhance-awebp.sh" "User Commands"
+.SH NAME
+enhance-awebp.sh \- AI upscale animated WebP images with waifu2x
+.SH SYNOPSIS
+.B enhance-awebp.sh
+.P
+Takes no arguments. Operates on every
+.B .webp
+file in the current working directory.
+.SH DESCRIPTION
+.B enhance-awebp.sh
+upscales animated WebP images by dumping their frames, running each frame
+through the
+.B waifu2x-ncnn-vulkan
+neural upscaler, and reassembling the result.
+.P
+For each
+.B .webp
+in the current directory:
+.IP \(bu 2
+The file is checked for animation with
+.BR webpinfo (1)
+(Chunk VP8X, Animation: 1). Non-animated files are skipped with the message
+.B Skipping FILE (not animated).
+.IP \(bu 2
+The framerate is read with
+.BR ffprobe (1)
+from the stream's
+.B avg_frame_rate
+value.
+.IP \(bu 2
+Frames are extracted with
+.BR anim_dump (1)
+into a temporary directory.
+.IP \(bu 2
+Each frame is upscaled with
+.B waifu2x-ncnn-vulkan
+(
+.B \-n 3 \-s 2
+).
+.IP \(bu 2
+The frames are reassembled into
+.I basename_enhanced.webp
+with
+.BR ffmpeg (1)
+using
+.B \-loop 0
+(infinitely looping animation) and the WebP quality below. The temporary
+directory is then removed.
+.P
+Processing messages, including the detected framerate and the output
+filename, are printed to standard output.
+.SH OPTIONS
+None. The script accepts no command line options or arguments; any given
+arguments are ignored.
+.SH DEFAULTS
+Behaviour is controlled by hardcoded defaults at the top of the script:
+.TP
+.B QUALITY=80
+Lossy WebP quality passed to
+.B ffmpeg
+as
+.B \-quality 80
+when reassembling the animation.
+.TP
+.B NOISE=3
+Denoise level passed to
+.B waifu2x-ncnn-vulkan
+as
+.B \-n 3
+(noise reduction strength).
+.TP
+.B SCALE=2
+Upscaling factor passed to
+.B waifu2x-ncnn-vulkan
+as
+.B \-s 2
+(2\(mu magnification).
+.P
+Changing these values requires editing the script.
+.SH EXAMPLES
+Run from a directory of animated WebP files:
+.IP
+.EX
+cd ~/Pictures/webp && enhance-awebp.sh
+.EE
+.P
+Resulting files are written next to their source:
+.IP
+.EX
+loop.webp \-> loop_enhanced.webp
+.EE
+.SH REQUIREMENTS
+.IP \(bu 2
+.BR webpinfo (1)
+.IP \(bu 2
+.BR anim_dump (1)
+.IP \(bu 2
+.BR waifu2x-ncnn-vulkan (1)
+.IP \(bu 2
+.BR ffmpeg (1)
+.IP \(bu 2
+.BR ffprobe (1)
+.SH SEE ALSO
+.BR ffmpeg (1),
+.BR ffprobe (1)

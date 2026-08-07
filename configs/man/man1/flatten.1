@@ -1,0 +1,91 @@
+.TH FLATTEN 1 "2026-08-07" "flatten.sh" "User Commands"
+.SH NAME
+flatten.sh \- move files up N directory levels out of deep nesting
+.SH SYNOPSIS
+.B flatten.sh
+[\fILEVELS\fR]
+[\fIDIRECTORY\fR]
+.SH DESCRIPTION
+.B flatten.sh
+pulls all files up by the given number of directory levels, undoing deep
+nesting such as
+.IR dir/sub/sub/file
+becoming
+.IR dir/file .
+It operates on files only; directories themselves are not moved.
+.P
+The work is done in
+.I LEVELS
+passes. In each pass every file at depth two or deeper is moved up exactly
+one level (from its parent directory into its grandparent), and then any
+directories left empty are deleted. Files therefore climb one level per
+pass, so a
+.I LEVELS
+of 3 moves a file up three levels.
+.P
+When a move would collide with an existing file at the destination, the
+moved file is renamed by appending an underscore and a counter to its base
+name (\fB_\fR\fI1\fR, \fB_\fR\fI2\fR, ...) before the extension, e.g.
+.I photo.png
+becomes
+.IR photo_1.png .
+.P
+The first positional argument is the number of levels and defaults to
+.BR 1 .
+The second positional argument is the target directory and defaults to the
+current directory
+.BR . .
+.SH ARGUMENTS
+.TP
+.I LEVELS
+Number of levels to pull files up. Must be a positive integer. Default:
+.BR 1 .
+.TP
+.I DIRECTORY
+Root directory to flatten. Must be an existing directory. Default:
+.BR . .
+.SH OPTIONS
+None. There are no command-line flags; both parameters are positional.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+\fITARGET\fR is not a directory, or
+\fILEVELS\fR is missing, non-numeric, or less than 1. An error message is
+printed before exiting.
+.SH EXAMPLES
+Flatten one level in the current directory:
+.IP
+.EX
+flatten.sh
+.EE
+.P
+Pull files up three levels:
+.IP
+.EX
+flatten.sh 3
+.EE
+.P
+Flatten a specific directory two levels:
+.IP
+.EX
+flatten.sh 2 ~/Downloads/nested
+.EE
+.P
+Conflict handling \-\- both
+.I parent/a/photo.png
+and
+.I parent/photo.png
+exist: the deeper file is moved as
+.IR photo_1.png .
+.SH NOTES
+Empty directories below the target are removed by the script as files are
+moved out. A
+.B 0
+or negative level count is rejected even though a single 0-value pass would
+otherwise be a no-op.
+.SH SEE ALSO
+.BR mv (1),
+.BR find (1)

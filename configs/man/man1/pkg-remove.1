@@ -1,0 +1,86 @@
+.TH PKG-REMOVE 1 "2026-08-07" "pkg-remove.sh" "User Commands"
+.SH NAME
+pkg-remove.sh \- interactive package remover (fzf TUI)
+.SH SYNOPSIS
+.B pkg-remove.sh
+.SH DESCRIPTION
+.B pkg-remove.sh
+is an interactive
+.BR fzf (1)
+front end for removing installed packages. It takes no command\-line
+arguments; the whole workflow happens inside the fzf list and its preview
+pane.
+.P
+On start, the script lists every installed package (\fBpacman \-Qq\fR,
+bare package names) and feeds it to
+.BR fzf (1).
+Filter by typing, toggle entries into the selection with
+.B Tab
+and press Enter. The chosen package names are collected and removed in a
+single call to
+.BR paru (1)
+(\fBparu \-Rns \-\-noconfirm\fR), which removes each package together with
+its unneeded dependencies and configuration files, without asking for
+confirmation. If the selection is empty (the list is dismissed), the
+script exits silently without removing anything.
+.P
+A wrap\-enabled preview pane at the bottom (65% of the screen) shows
+detailed information for the highlighted package via
+.BR pacman (8)
+(\fBpacman \-Qii\fR), falling back to
+.BR yay (1)
+(\fByay \-Qii\fR) for packages unknown to pacman; the preview command uses
+field \fB{1}\fR, the package name. Because the action is destructive, the
+pointer and multi\-select marker are shown in red, and the preview label
+reads:
+.IP
+\fBalt\-p: toggle preview | alt\-j/k: scroll preview | tab: multi\-select\fR
+.SS Key bindings
+.IP \(bu 2
+.B Tab
+toggle multi\-selection of the current entry
+.IP \(bu 2
+.B Ctrl-J
+move the cursor down the list
+.IP \(bu 2
+.B Ctrl-K
+move the cursor up the list
+.IP \(bu 2
+.B Alt-P
+toggle the preview pane
+.IP \(bu 2
+.B Alt-D
+scroll the preview half a page down
+.IP \(bu 2
+.B Alt-U
+scroll the preview half a page up
+.IP \(bu 2
+.B Alt-J
+scroll the preview one line down
+.IP \(bu 2
+.B Alt-K
+scroll the preview one line up
+.P
+The script requires
+.BR fzf (1)
+and
+.BR paru (1);
+the installed\-package list and preview use
+.BR pacman (8).
+.SH EXAMPLES
+Remove one or more installed packages:
+.IP
+.EX
+pkg-remove.sh
+.EE
+.P
+Type a search term to filter, press
+.B Tab
+on each package to remove, then press Enter to uninstall all of them with
+their unneeded dependencies.
+.SH SEE ALSO
+.BR paru (1),
+.BR pacman (8),
+.BR fzf (1),
+.BR pkg-install (1),
+.BR pkg-install-aur (1)

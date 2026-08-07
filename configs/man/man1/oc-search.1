@@ -1,0 +1,116 @@
+.TH OC-SEARCH 1 "2026-08-07" "oc-search" "User Commands"
+.SH NAME
+oc-search \- search opencode conversation history with ripgrep and fzf
+.SH SYNOPSIS
+.B oc-search
+[\fIquery\fP]
+.SH DESCRIPTION
+.B oc-search
+is a fish script that searches opencode conversation history. It dumps
+session messages from the opencode SQLite database into per-session
+markdown files under
+.IR ~/.cache/oc-search/ ,
+then lets you filter and open the cached sessions with
+.BR fzf (1).
+.P
+The database is read from
+.IR ~/.local/share/opencode/opencode.db .
+Only non-archived sessions are indexed, ordered by most recently updated
+first. If the database does not exist, or either
+.B rg
+or
+.B fzf
+is not installed, the script prints an error to stderr and exits with
+status 1.
+.P
+The optional first argument is used as the initial
+.B fzf
+query. Since
+.B fzf
+starts in
+.B \-\-disabled
+mode, typing after launch re-runs
+.B rg
+and live-refilters the session list.
+.SS Cache
+Each session is cached as a file named
+.RI ID __TITLE.md
+in
+.IR ~/.cache/oc-search/ .
+The title has path-hostile characters replaced with underscores and is
+truncated to 80 characters. Each file begins with a header of the title,
+session ID, and local creation time, followed by the conversation with
+.B USER
+and
+.B ASSISTANT
+role markers, per-message timestamps, and message text prefixed with
+.BR "> " .
+.P
+A session is re-dumped when its cached file is older than the session's
+update time. User messages that begin with
+.B [SUPERMEMORY]
+or
+.B <supermemory-recall>
+are skipped. A
+.B .version
+marker inside the cache directory tracks the cache format version; when
+it differs from the script's version, all cached
+.B .md
+files are deleted and rebuilt.
+.SS Preview
+The fzf preview window (right 60%, wrapped) runs
+.B rg
+with case-insensitive context (3 lines around the query) over the
+selected file, falling back to
+.BR bat (1)
+with plain style, then
+.BR cat (1).
+.SH OPTIONS
+.TP
+.B query
+Optional positional argument. Sets the initial
+.B fzf
+query. There are no command-line flags.
+.SH KEYBINDINGS
+.TP
+.B ENTER
+Open the selected session file in
+.BR nvim (1).
+.TP
+.B CTRL-O
+Start the supermemory user service and open the conversation in
+.B opencode
+with
+.IR opencode\ \-s ,
+using the session ID embedded in the filename.
+.TP
+.B CTRL-C
+Exit without selecting.
+.SH EXAMPLES
+Search with an initial query, then refine by typing:
+.IP
+.EX
+oc-search vaapi
+.EE
+.P
+Search interactively:
+.IP
+.EX
+oc-search
+.EE
+.SH FILES
+.TP
+.I ~/.local/share/opencode/opencode.db
+The opencode conversation database.
+.TP
+.I ~/.cache/oc-search/
+Cache directory holding the
+.B .md
+session files and the
+.B .version
+marker.
+.SH SEE ALSO
+.BR rg (1),
+.BR fzf (1),
+.BR sqlite3 (1),
+.BR bat (1)
