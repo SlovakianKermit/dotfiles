@@ -14,13 +14,14 @@ TARGET_H=1440
 # ── Usage ─────────────────────────────────────────────────
 usage() {
   cat <<EOF
-Usage: compress-jxl.sh [-q <quality>] [-e <effort>] [-t <threads>] [-c]
+Usage: compress-jxl.sh [-q <quality>] [-e <effort>] [-s <WxH>] [-t <threads>] [-c] [-l]
                         [directory | quality [effort]]
 
 Recursively convert images to JPEG XL. Replaces originals only when smaller.
 
   -q, --quality N    Quality 0-100 (default: $QUALITY)
-  -e, --effort N     Encoder effort 1-9 (default: $EFFORT)
+  -e, --effort N     Encoder effort 1-10 (default: $EFFORT)
+  -s, --size WxH     Max dimensions e.g. 2560x1440 (default: ${TARGET_W}x${TARGET_H})
   -t, --threads N    Parallel jobs (default: $THREADS)
   -c, --compare      Save pre-encode PNGs to /tmp/jxl_compare_src/
   -l, --log          Save a log file in the images directory
@@ -33,6 +34,7 @@ Examples:
   compress-jxl.sh ~/Pics 80 5            # custom dir, q80, e5
   compress-jxl.sh -q 75 -e 3 -c          # named flags + compare mode
   compress-jxl.sh -l -e 1                 # log timing + results
+  compress-jxl.sh -s 1920x1080 ~/Pics    # cap at 1080p instead of the default
 EOF
 }
 
@@ -55,6 +57,16 @@ while [[ $# -gt 0 ]]; do
   -t | --threads)
     THREADS="$2"
     shift 2
+    ;;
+  -s | --size)
+    if [[ "$2" =~ ^[0-9]+x[0-9]+$ ]]; then
+      TARGET_W="${2%%x*}"
+      TARGET_H="${2##*x}"
+      shift 2
+    else
+      echo "Invalid size: $2 (expected WxH, e.g. 2560x1440)" >&2
+      exit 1
+    fi
     ;;
   -c | --compare)
     COMPARE_MODE=1
@@ -117,6 +129,11 @@ if ! command -v exiftool &>/dev/null; then
   exit 1
 fi
 
+if ! command -v identify &>/dev/null; then
+  echo "identify (ImageMagick) not found. Install imagemagick first." >&2
+  exit 1
+fi
+
 # ── Resize engine ─────────────────────────────────────────
 # vipsthumbnail (libvips) is 4-10× faster; falls back to ImageMagick
 if command -v vipsthumbnail &>/dev/null; then
@@ -133,6 +150,8 @@ fi
 export -f resize_image
 
 cd /tmp || exit 1
+
+MAIN_PID=$$
 
 # ── Compare-mode setup ────────────────────────────────────
 CMP_DIR="/tmp/jxl_compare_src"
@@ -182,6 +201,7 @@ START_TIME=$(date +%s)
 export TOTAL QUALITY EFFORT TARGET_W TARGET_H \
   COUNT_FILE SKIPPED_FILE SAVED_FILE TOTAL_IN_FILE LOCK_FILE \
   COMPARE_MODE CMP_DIR \
+  MAIN_PID \
   PURPLE GREEN RED CYAN YELLOW RESET
 
 # ── Per-file worker ───────────────────────────────────────
@@ -193,13 +213,10 @@ process_file() {
 
   dir="$(dirname "$f")"
   file="$(basename "$f")"
-  name="${file%.*}"
-  name="${name%.png}"
-  name="${name%.PNG}"
-  name="${name%.jpg}"
-  name="${name%.JPG}"
-  name="${name%.jpeg}"
-  name="${name%.JPEG}"
+  name="$file"
+  while [[ "${name,,}" =~ \.(png|jpg|jpeg)$ ]]; do
+    name="${name%.*}"
+  done
 
   output="$dir/$name.jxl"
   in_size=$(stat -c%s "$f" 2>/dev/null || echo 0)
@@ -211,9 +228,14 @@ process_file() {
   src="$f"
   if [ -n "$img_w" ] && [ -n "$img_h" ]; then
     if [ "$img_w" -gt "$TARGET_W" ] || [ "$img_h" -gt "$TARGET_H" ]; then
-      tmp_resized="/tmp/jxl_resized_$$_${RANDOM}.${f##*.}"
+      tmp_resized="/tmp/jxl_resized_${MAIN_PID}_${RANDOM}.${f##*.}"
       resize_image "$f" "$tmp_resized"
-      src="$tmp_resized"
+      if [ -s "$tmp_resized" ]; then
+        src="$tmp_resized"
+      else
+        rm -f "$tmp_resized"
+        tmp_resized=""
+      fi
     fi
   fi
 
@@ -227,13 +249,17 @@ process_file() {
   # reliable across libjxl versions, they were silently doing nothing
   # on test systems, so metadata is handled entirely by exiftool
   # after a successful encode instead.
-  if cjxl "$src" "$output" -q "$QUALITY" -e "$EFFORT" --lossless_jpeg=0 2>/dev/null; then
-    [ -n "$tmp_resized" ] && rm -f "$tmp_resized"
-
-    out_size=$(stat -c%s "$output" 2>/dev/null || echo 0)
+  # Encode to a temp file first so an interrupted run never leaves a
+  # partial .jxl sitting under its final name.
+  tmp_out="${output}.tmp.${MAIN_PID}_${RANDOM}"
+  if cjxl "$src" "$tmp_out" -q "$QUALITY" -e "$EFFORT" --lossless_jpeg=0 2>/dev/null; then
+    out_size=$(stat -c%s "$tmp_out" 2>/dev/null || echo 0)
     out_kb=$((out_size / 1024))
 
-    if [ -f "$output" ] && [ "$out_size" -gt 0 ] && [ "$out_size" -lt "$in_size" ]; then
+    if [ -f "$tmp_out" ] && [ "$out_size" -gt 0 ] && [ "$out_size" -lt "$in_size" ]; then
+      mv "$tmp_out" "$output"
+      [ -n "$tmp_resized" ] && rm -f "$tmp_resized"
+
       # --- Preserve metadata on the surviving output ---
       # PNG tEXt/iTXt AI-generation keys (Parameters from
       # Automatic1111/Forge, Prompt/Workflow from ComfyUI, Comment/
@@ -243,14 +269,28 @@ process_file() {
       # "TagName: Value" output) to avoid per-file stutter from
       # spawning five separate Perl interpreters.
       AI_META=""
+      RESIZED_META=0
       while IFS= read -r line; do
         [ -z "$line" ] && continue
-        AI_META="${AI_META}${line}"$'\n\n'
-      done < <(exiftool -s -s -Parameters -Prompt -Workflow -Comment -Description "$f" 2>/dev/null || true)
+        case "$line" in
+          PixelXDimension:*|PixelYDimension:*) RESIZED_META=1 ;;
+          *) AI_META="${AI_META}${line}"$'\n\n' ;;
+        esac
+      done < <(exiftool -s -s -Parameters -Prompt -Workflow -Comment -Description -PixelXDimension -PixelYDimension "$f" 2>/dev/null || true)
 
       META_ARGS=(-tagsfromfile "$f" -exif:all -iptc:all -xmp:all)
-      [ -n "$AI_META" ] && META_ARGS+=(-EXIF:UserComment="$AI_META" -XMP-dc:Description="$AI_META")
-      exiftool -q -m -overwrite_original "${META_ARGS[@]}" "$output" >/dev/null 2>&1 || true
+      if [ -n "$AI_META" ]; then
+        if [ "${#AI_META}" -le 60000 ]; then
+          META_ARGS+=(-EXIF:UserComment="$AI_META" -XMP-dc:Description="$AI_META")
+        else
+          META_ARGS+=(-XMP-dc:Description="$AI_META")
+        fi
+      fi
+      if [ -n "$tmp_resized" ] && [ "$RESIZED_META" = "1" ]; then
+        META_ARGS+=(-EXIF:PixelXDimension= -EXIF:PixelYDimension=)
+      fi
+      META_ERR=$(exiftool -q -m -overwrite_original "${META_ARGS[@]}" "$output" 2>&1 | grep -v 'IO::Uncompress::Brotli' | grep -v 'No writable tags set')
+      [ -z "$META_ERR" ] || echo -e "${YELLOW}⚠ Metadata: $name.jxl → ${META_ERR}${RESET}" >&2
 
       saved=$((in_size - out_size))
       rm -f "$f"
@@ -262,7 +302,7 @@ process_file() {
       ')
       echo -e "${PURPLE}[$n/$TOTAL]${RESET} ${GREEN}✔ $name.jxl${RESET} ${CYAN}(${in_kb}KB → ${out_kb}KB)${RESET}"
     else
-      rm -f "$output"
+      rm -f "$tmp_out"
       [ -n "$tmp_resized" ] && rm -f "$tmp_resized"
       flock "$LOCK_FILE" bash -c '
         skipped=$(< "$SKIPPED_FILE"); skipped=$((skipped + 1)); echo "$skipped" > "$SKIPPED_FILE"
@@ -270,6 +310,7 @@ process_file() {
       echo -e "${YELLOW}⊘ Skipped: $file (compressed output was not smaller)${RESET}"
     fi
   else
+    rm -f "$tmp_out"
     [ -n "$tmp_resized" ] && rm -f "$tmp_resized"
     echo -e "${RED}✗ Failed: $file${RESET}" >&2
   fi
@@ -277,6 +318,8 @@ process_file() {
 export -f process_file
 
 # ── Run ───────────────────────────────────────────────────
+trap 'rm -f "$TEMP_LIST" "$COUNT_FILE" "$SKIPPED_FILE" "$SAVED_FILE" "$TOTAL_IN_FILE" "$LOCK_FILE" /tmp/jxl_resized_${MAIN_PID}_* 2>/dev/null; find "$BASE" -name "*.jxl.tmp.${MAIN_PID}_*" -delete 2>/dev/null; exit 130' INT TERM
+
 cat "$TEMP_LIST" | xargs -d '\n' -P "$THREADS" -I {} bash -c 'process_file "$@"' _ {}
 
 # ── Summary ───────────────────────────────────────────────

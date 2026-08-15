@@ -5,11 +5,9 @@ set -uo pipefail
 ROOT="${1:-.}"
 declare -a FAILED=()
 
-exec 3<&0
-
 extract_archive() {
   local archive="$1"
-  local dir ext target
+  local dir ext target fmt base
 
   dir="$(dirname "$archive")"
   ext="${archive,,}" # lowercase copy for matching
@@ -49,14 +47,26 @@ extract_archive() {
   local check_ok=0
   case "$fmt" in
   zip)
-    unzip -qt "$archive" <&3 &>/dev/null && check_ok=1
+    unzip -qt "$archive" </dev/null &>/dev/null && check_ok=1
     ;;
   tar | tar.gz | tar.bz2 | tar.xz)
-    tar --test-label -f "$archive" &>/dev/null || true
-    tar -tf "$archive" &>/dev/null && check_ok=1
+    case "$fmt" in
+    tar.gz)
+      gzip -t "$archive" &>/dev/null && check_ok=1
+      ;;
+    tar.bz2)
+      bzip2 -t "$archive" &>/dev/null && check_ok=1
+      ;;
+    tar.xz)
+      xz -t "$archive" &>/dev/null && check_ok=1
+      ;;
+    tar)
+      tar -tf "$archive" &>/dev/null && check_ok=1
+      ;;
+    esac
     ;;
   7z)
-    7z t "$archive" &>/dev/null && check_ok=1
+    7z t -y "$archive" </dev/null &>/dev/null && check_ok=1
     ;;
   esac
 
@@ -69,24 +79,33 @@ extract_archive() {
   echo "  [OK] Integrity verified"
 
   # --- Extract ---
-  mkdir -p "$target"
-  local extract_ok=0
+  local extract_ok=0 created=0
+  if [[ ! -e "$target" ]]; then
+    created=1
+  fi
+  mkdir -p "$target" || {
+    echo "  [FAIL] Could not create target dir, keeping archive: $archive"
+    FAILED+=("$archive")
+    return 0
+  }
 
   case "$fmt" in
   zip)
-    unzip -o -q "$archive" -d "$target" <&3 && extract_ok=1
+    unzip -o -q "$archive" -d "$target" </dev/null && extract_ok=1
     ;;
   tar | tar.gz | tar.bz2 | tar.xz)
     tar -xf "$archive" -C "$target" && extract_ok=1
     ;;
   7z)
-    7z x "$archive" -o"$target" &>/dev/null && extract_ok=1
+    7z x -y "$archive" -o"$target" </dev/null &>/dev/null && extract_ok=1
     ;;
   esac
 
   if [[ $extract_ok -eq 0 ]]; then
-    echo "  [FAIL] Extraction failed, cleaning up and keeping archive: $archive"
-    rm -rf "$target"
+    echo "  [FAIL] Extraction failed, keeping archive: $archive"
+    if [[ $created -eq 1 ]]; then
+      rm -rf "$target"
+    fi
     FAILED+=("$archive")
     return 0
   fi

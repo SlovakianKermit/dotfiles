@@ -1,12 +1,14 @@
-.TH COMPRESS-JXL 1 "2026-07-01" "1.0" "User Commands"
+.TH COMPRESS-JXL 1 "2026-08-10" "1.1" "User Commands"
 .SH NAME
 compress-jxl \- batch compress images to JPEG XL
 .SH SYNOPSIS
 .B compress-jxl.sh
 [\fB\-q\fR \fIquality\fP]
 [\fB\-e\fR \fIeffort\fP]
+[\fB\-s\fR \fIWxH\fP]
 [\fB\-t\fR \fIthreads\fP]
 [\fB\-c\fP]
+[\fB\-l\fP]
 [\fIdirectory\fP | \fIquality\fP [\fIeffort\fP]]
 .br
 .B compress-jxl.sh
@@ -15,7 +17,8 @@ compress-jxl \- batch compress images to JPEG XL
 Recursively finds all \fB.jpg\fP, \fB.jpeg\fP, and \fB.png\fP files under
 the target directory and converts them to JPEG XL (\fB.jxl\fP) using
 .BR cjxl (1).
-Images larger than 2560\(mu1440 are downscaled before encoding.
+Images larger than the target size (2560\(mu1440 by default, see
+\fB\-s\fP) are downscaled before encoding.
 The original file is replaced only if the compressed output is smaller.
 .SH OPTIONS
 .TP
@@ -24,7 +27,7 @@ Quality target (0\(en100, default: 85).
 Higher = larger file, better fidelity.
 .TP
 .BR \-e ", " \-\-effort " \fIeffort\fP"
-Encoder effort (1\(en9, default: 4).
+Encoder effort (1\(en10, default: 3).
 Higher = slower encode, smaller/better file.
 .RS
 .PD 0
@@ -37,12 +40,17 @@ Higher = slower encode, smaller/better file.
 .TP
 7     default cjxl speed, very good compression
 .TP
-8\(en9  exhaustive, noticeably slower
+8\(en10  exhaustive, noticeably slower
 .PD
 .RE
 .TP
+.BR \-s ", " \-\-size " \fIWxH\fP"
+Maximum output dimensions for downscaling (default: 2560\(mu1440).
+Larger images are scaled to fit within \fIW\(muH\fP while keeping their
+aspect ratio.
+.TP
 .BR \-t ", " \-\-threads " \fIthreads\fP"
-Parallel encode jobs (default: 4).
+Parallel encode jobs (default: 12).
 Each cjxl process auto-detects its own core count.
 .TP
 .BR \-c ", " \-\-compare
@@ -52,6 +60,10 @@ with tools like
 .BR ssimulacra2 (1)
 or
 .BR dssim (1).
+.TP
+.BR \-l ", " \-\-log
+Append a per-run summary line to \fB.compress-jxl.log\fP in the target
+directory.
 .TP
 .BR \-h ", " \-\-help
 Print usage summary and exit.
@@ -67,15 +79,15 @@ Numeric quality (0\(en100). If the first positional argument is a
 number, it is treated as quality, not a directory.
 .TP
 .I effort
-Numeric effort (1\(en9). Must follow a numeric quality.
+Numeric effort (1\(en10). Must follow a numeric quality.
 .PD
 .SH EXAMPLES
 .TP
 compress-jxl.sh
-Run with defaults: quality 85, effort 4, ~/Pictures/img.
+Run with defaults: quality 85, effort 3, ~/Pictures/img.
 .TP
 compress-jxl.sh 80
-Quality 80, effort 4, default directory.
+Quality 80, effort 3, default directory.
 .TP
 compress-jxl.sh 90 7
 Quality 90, effort 7, default directory.
@@ -85,10 +97,13 @@ Custom directory, quality 80, effort 5.
 .TP
 compress-jxl.sh -q 75 -e 3 -t 6 -c ~/ai_art
 Quality 75, effort 3, 6 parallel jobs, save comparison sources.
+.TP
+compress-jxl.sh -s 1920x1080 ~/Pictures/wallpapers
+Cap downscaling at 1080p instead of the default 2560\(mu1440.
 .SH FILES
 .TP
 .I ~/Pictures/img/.compress-jxl.log
-Per-run summary appended after each successful batch.
+Per-run summary appended after each batch when \fB-l\fP is used.
 .TP
 .I /tmp/jxl_compare_src/
 Directory holding pre-encode PNGs when \fB-c\fP is used.

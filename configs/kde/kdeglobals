@@ -139,7 +139,7 @@ Theme=char-white
 
 [KDE]
 AnimationDurationFactor=0.25
-DoubleClickInterval=300
+DoubleClickInterval=800
 LookAndFeelPackage=CachyOS-Nord
 ShowDeleteCommand=true
 contrast=4

@@ -79,9 +79,7 @@ main() {
                     found_ai=1
                     found_img="$img"
                     found_reason="$label"
-                    return 0
                 fi
-                return 1
             }
 
             check_pattern "Midjourney"              -e 'Midjourney'
@@ -125,7 +123,7 @@ main() {
 
             if [[ $found_ai -eq 0 ]]; then
                 local param_match=0
-                echo "$value_only" | grep -qi -e '"Parameters"' -e '"parameters"' && param_match=1
+                echo "$meta" | grep -qi '"Parameters"' && param_match=1
                 if [[ $param_match -eq 1 ]]; then
                     if echo "$value_only" | grep -qi 'negative prompt\|Negative prompt\|Steps:\|Sampler:\|CFG scale\|Seed:\|Model hash'; then
                         found_ai=1

@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # ═══════════════════════════════════════════════════════════════════════
 # Constants
@@ -157,10 +157,25 @@ class Queue:
 # Worker thread
 # ═══════════════════════════════════════════════════════════════════════
 
-def _build_ffmpeg_cmd(job: Job, preset: str, quality: int) -> List[str]:
+def find_vaapi_device() -> str:
+    for p in sorted(pathlib.Path("/dev/dri").glob("renderD*")):
+        return str(p)
+    for p in sorted(pathlib.Path("/dev/dri").glob("card*")):
+        return str(p)
+    return "/dev/dri/renderD128"
+
+def _hw_decode_failed(stderr_text: str) -> bool:
+    markers = ("Failed setup for format vaapi",
+               "No support for codec",
+               "hwaccel initialisation returned error",
+               "Impossible to convert")
+    return any(m in stderr_text for m in markers)
+
+def _build_ffmpeg_cmd(job: Job, preset: str, quality: int, device: str) -> List[str]:
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
+        "-vaapi_device", device,
         "-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL,
         "-i", job.input_path,
         "-c:v", ENCODER,
@@ -173,63 +188,108 @@ def _build_ffmpeg_cmd(job: Job, preset: str, quality: int) -> List[str]:
     cmd.extend(["-y", job.output_path])
     return cmd
 
-def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
-                  delete_original: bool):
-    cmd = _build_ffmpeg_cmd(job, preset, quality)
+def _build_fallback_ffmpeg_cmd(job: Job, preset: str, quality: int, device: str) -> List[str]:
+    # Software decode + hwupload: for streams the VAAPI h264 decoder can't
+    # initialise on (e.g. malformed 4K SPS), decode on CPU and still let the
+    # GPU do the HEVC encode.
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-progress", "pipe:1", "-nostats",
+        "-vaapi_device", device,
+        "-i", job.input_path,
+        "-vf", "format=nv12,hwupload",
+        "-c:v", ENCODER,
+    ]
+    if PRESET_FLAGS[preset]:
+        cmd.extend(PRESET_FLAGS[preset])
+    cmd.extend(["-b:v", "0", "-qp", str(quality)])
+    cmd.extend(["-c:a", "copy"])
+    cmd.extend(["-map", "0:v?", "-map", "0:a?"])
+    cmd.extend(["-y", job.output_path])
+    return cmd
+
+def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]:
+    """Run one ffmpeg encode to completion. Returns (returncode, stderr_text)."""
     os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
 
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+
+    with state.lock:
+        state.ffmpeg_pid = proc.pid
+        state.status = "encoding"
+        state.percentage = 0
+        state.fps = 0.0
+        state.file_start = time.time()
+        state.worker_done.clear()
+        state.skip = False
+        job.status = "encoding"
+
+    stderr_lines: List[str] = []
+    def _drain_stderr():
+        for line in proc.stderr:
+            stderr_lines.append(line)
+    drain = threading.Thread(target=_drain_stderr, daemon=True)
+    drain.start()
+
+    out_time_us = 0
+    duration = job.duration or get_duration(job.input_path)
+
+    for line in proc.stdout:
+        if "=" not in line:
+            continue
+        key, _, value = line.strip().partition("=")
+
+        if key == "out_time_us":
+            try:
+                out_time_us = int(value)
+                with state.lock:
+                    state.out_time_us = out_time_us
+            except ValueError:
+                pass
+        elif key == "fps":
+            try:
+                with state.lock:
+                    state.fps = float(value)
+            except ValueError:
+                pass
+        elif key == "progress":
+            if duration > 0:
+                pct = min(100, max(0,
+                    int((out_time_us / 1_000_000) / duration * 100 + 0.5)))
+                with state.lock:
+                    state.percentage = pct
+            if value == "end":
+                break
+
+    proc.wait()
+    drain.join()
+    return proc.returncode, "".join(stderr_lines)
+
+def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
+                  delete_original: bool):
+    device = find_vaapi_device()
+    cmd = _build_ffmpeg_cmd(job, preset, quality, device)
+
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
-        )
+        returncode, stderr_text = _run_ffmpeg(cmd, job, state)
 
-        with state.lock:
-            state.ffmpeg_pid = proc.pid
-            state.status = "encoding"
-            state.percentage = 0
-            state.fps = 0.0
-            state.file_start = time.time()
-            state.worker_done.clear()
-            state.skip = False
+        # VAAPI decode failed (e.g. malformed 4K H.264 SPS the hw decoder
+        # refuses): retry once with software decode + hwupload so the GPU
+        # still does the HEVC encode.
+        if returncode != 0 and _hw_decode_failed(stderr_text):
+            with state.lock:
+                state.skip = False
             job.status = "encoding"
-
-        out_time_us = 0
-        duration = job.duration or get_duration(job.input_path)
-
-        for line in proc.stdout:
-            if "=" not in line:
-                continue
-            key, _, value = line.strip().partition("=")
-
-            if key == "out_time_us":
-                try:
-                    out_time_us = int(value)
-                    with state.lock:
-                        state.out_time_us = out_time_us
-                except ValueError:
-                    pass
-            elif key == "fps":
-                try:
-                    with state.lock:
-                        state.fps = float(value)
-                except ValueError:
-                    pass
-            elif key == "progress":
-                if duration > 0:
-                    pct = min(100, max(0,
-                        int((out_time_us / 1_000_000) / duration * 100 + 0.5)))
-                    with state.lock:
-                        state.percentage = pct
-                if value == "end":
-                    break
-
-        proc.wait()
+            fallback = _build_fallback_ffmpeg_cmd(job, preset, quality, device)
+            returncode, stderr_text = _run_ffmpeg(fallback, job, state)
 
         with state.lock:
             if state.skip:
                 job.status = "skipped"
-            elif proc.returncode == 0 and os.path.getsize(job.output_path) > 0:
+            elif returncode == 0 and os.path.getsize(job.output_path) > 0:
                 out_size = os.path.getsize(job.output_path)
                 if out_size < job.input_size:
                     job.status = "done"
@@ -258,9 +318,8 @@ def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
                     state.total_out_bytes += out_size
             else:
                 job.status = "failed"
-                if proc.returncode != 0:
-                    stderr_text = proc.stderr.read()
-                    job.error = stderr_text[:300] if stderr_text else f"exit {proc.returncode}"
+                if returncode != 0:
+                    job.error = stderr_text[:300] if stderr_text else f"exit {returncode}"
                 else:
                     job.error = "output file empty"
                 if os.path.exists(job.output_path) and os.path.getsize(job.output_path) == 0:

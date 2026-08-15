@@ -10,10 +10,13 @@ handbrake-full-cli
 linux-wallpaperengine-gui-git
 losslesscut-bin
 ludusavi-bin
+motrix-next-bin
 mpv-uosc
+onlinefix-linux-launcher-bin
 pkgbrowser
 qimgv
 r2modman-bin
+sober-bin
 typing_test
 wthrr-bin
 xnviewmp

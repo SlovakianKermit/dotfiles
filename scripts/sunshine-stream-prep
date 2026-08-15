@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTPUT="DP-2"
+NATIVE_W=2560
+NATIVE_H=1440
+NATIVE_R=240
+
+W="${SUNSHINE_CLIENT_WIDTH:-$NATIVE_W}"
+H="${SUNSHINE_CLIENT_HEIGHT:-$NATIVE_H}"
+R="${SUNSHINE_CLIENT_FPS:-$NATIVE_R}"
+
+pick_mode() {
+python3 - "$OUTPUT" "$W" "$H" "$R" <<'PY'
+import json, subprocess, sys
+
+out, w, h, r = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+data = json.loads(subprocess.check_output(['kscreen-doctor', '-j']))
+for o in data['outputs']:
+    if o['name'] != out:
+        continue
+    modes = o['modes']
+
+    def hz(m):
+        return m.get('refresh', m.get('refreshRate', 0))
+
+    exact = [m for m in modes if m['size']['width'] == w and m['size']['height'] == h]
+    if exact:
+        cands = exact
+    else:
+        target = w / h
+        cands = [m for m in modes if abs(m['size']['width'] / m['size']['height'] - target) < 0.02]
+        if not cands:
+            cands = modes
+    le = [m for m in cands if hz(m) <= r]
+    pick = max(le, key=hz) if le else min(cands, key=hz)
+    print(f"{pick['size']['width']}x{pick['size']['height']}@{round(hz(pick))}")
+    sys.exit(0)
+sys.exit(f"output {out} not found")
+PY
+}
+
+TARGET_MODE="$(pick_mode)"
+kscreen-doctor "output.${OUTPUT}.mode.${TARGET_MODE}"
+
+current_mode() {
+python3 - "$OUTPUT" <<'PY'
+import json, subprocess, sys
+out = sys.argv[1]
+data = json.loads(subprocess.check_output(['kscreen-doctor', '-j']))
+for o in data['outputs']:
+    if o['name'] == out:
+        for m in o['modes']:
+            if m['id'] == o['currentModeId']:
+                print(f"{m['size']['width']}x{m['size']['height']}@{round(m.get('refresh', m.get('refreshRate', 0)))}")
+                sys.exit(0)
+sys.exit(f"output {out} not found")
+PY
+}
+
+for _ in $(seq 1 30); do
+    if [ "$(current_mode)" = "$TARGET_MODE" ]; then
+        exit 0
+    fi
+    sleep 1
+done
+exit 1

@@ -1,0 +1,17 @@
+#!/bin/bash
+# Sunshine gamescope wrapper: renders a game at the client resolution inside
+# gamescope, scaled to fill the physical display (captured via KMS).
+# Usage: sunshine-gamescope-run [gamescope flags] -- <command>
+# When launched from Sunshine, SUNSHINE_CLIENT_* env vars are provided.
+
+WIDTH="${SUNSHINE_CLIENT_WIDTH:-2560}"
+HEIGHT="${SUNSHINE_CLIENT_HEIGHT:-1440}"
+FPS="${SUNSHINE_CLIENT_FPS:-240}"
+
+exec gamescope \
+  --backend=wayland \
+  -W "$WIDTH" \
+  -H "$HEIGHT" \
+  -r "$FPS" \
+  -f \
+  "$@"

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTPUT="DP-2"
+TARGET_MODE="2560x1440@240"
+
+kscreen-doctor "output.${OUTPUT}.mode.${TARGET_MODE}"
+
+current_mode() {
+python3 - "$OUTPUT" <<'PY'
+import json, subprocess, sys
+out = sys.argv[1]
+data = json.loads(subprocess.check_output(['kscreen-doctor', '-j']))
+for o in data['outputs']:
+    if o['name'] == out:
+        for m in o['modes']:
+            if m['id'] == o['currentModeId']:
+                print(f"{m['size']['width']}x{m['size']['height']}@{round(m.get('refresh', m.get('refreshRate', 0)))}")
+                sys.exit(0)
+sys.exit(f"output {out} not found")
+PY
+}
+
+for _ in $(seq 1 30); do
+    if [ "$(current_mode)" = "$TARGET_MODE" ]; then
+        exit 0
+    fi
+    sleep 1
+done
+exit 1

@@ -152,6 +152,7 @@ os-prober
 partitionmanager
 pavucontrol
 perl
+perl-io-compress-brotli
 persepolis
 phonon-qt6-vlc
 pipewire-alsa
