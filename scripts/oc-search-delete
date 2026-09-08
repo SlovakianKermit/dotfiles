@@ -1,0 +1,24 @@
+#!/usr/bin/env fish
+# Toggle deletion of an oc-search conversation. Called from oc-search via fzf ctrl-x.
+# First press with the same conversation selected arms the delete;
+# a second press on the same conversation removes it from the database and cache.
+# Usage: oc-search-delete <cache-file-basename>
+
+set -q OC_SEARCH_DB; and set db "$OC_SEARCH_DB"; or set db ~/.local/share/opencode/opencode.db
+set -q OC_SEARCH_CACHE; and set cache_dir "$OC_SEARCH_CACHE"; or set cache_dir ~/.cache/oc-search
+
+set file $argv[1]
+set id (basename "$file" | cut -d: -f3)
+set pending "$cache_dir/.pending"
+
+if test -f "$pending"; and test (cat "$pending") = "$file"
+    rm -f "$pending"
+    if sqlite3 -cmd '.timeout 5000' "$db" "
+            DELETE FROM part WHERE session_id='$id';
+            DELETE FROM message WHERE session_id='$id';
+            DELETE FROM session WHERE id='$id';"
+        rm -f "$cache_dir/$file"
+    end
+else
+    echo "$file" > "$pending"
+end

@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 # Constants
 # ═══════════════════════════════════════════════════════════════════════
 
-EXTENSIONS = ("mkv", "mp4", "avi", "mov", "webm", "ts", "mts")
+EXTENSIONS = ("mkv", "mp4", "avi", "mov", "webm", "ts", "mts", "webp")
 PRESET_FLAGS = {"speed": ["-preset", "fast"], "balanced": [], "quality": ["-preset", "slow"]}
 HWACCEL = "vaapi"
 ENCODER = "hevc_vaapi"
@@ -39,6 +39,11 @@ class Job:
     output_size: int = 0
     duration: float = 0.0
     error: str = ""
+    progress: int = 0
+    fps: float = 0.0
+    ous: int = 0
+    start: float = 0.0
+    paused_accum: float = 0.0
 
     @property
     def basename(self) -> str:
@@ -47,14 +52,9 @@ class Job:
 @dataclass
 class SharedState:
     lock: threading.Lock = field(default_factory=threading.Lock)
-    percentage: int = 0
-    fps: float = 0.0
-    out_time_us: int = 0
     status: str = "idle"
-    ffmpeg_pid: Optional[int] = None
-    file_start: float = 0.0
-    file_paused_accum: float = 0.0
-    worker_done: threading.Event = field(default_factory=threading.Event)
+    ffmpeg_pids: set = field(default_factory=set)
+    active: int = 0
     quit: bool = False
     skip: bool = False
     total_in_bytes: int = 0
@@ -218,14 +218,13 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
     )
 
     with state.lock:
-        state.ffmpeg_pid = proc.pid
+        state.ffmpeg_pids.add(proc.pid)
         state.status = "encoding"
-        state.percentage = 0
-        state.fps = 0.0
-        state.file_start = time.time()
-        state.worker_done.clear()
         state.skip = False
         job.status = "encoding"
+        job.progress = 0
+        job.fps = 0.0
+        job.ous = 0
 
     stderr_lines: List[str] = []
     def _drain_stderr():
@@ -237,36 +236,40 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
     out_time_us = 0
     duration = job.duration or get_duration(job.input_path)
 
-    for line in proc.stdout:
-        if "=" not in line:
-            continue
-        key, _, value = line.strip().partition("=")
+    try:
+        for line in proc.stdout:
+            if "=" not in line:
+                continue
+            key, _, value = line.strip().partition("=")
 
-        if key == "out_time_us":
-            try:
-                out_time_us = int(value)
-                with state.lock:
-                    state.out_time_us = out_time_us
-            except ValueError:
-                pass
-        elif key == "fps":
-            try:
-                with state.lock:
-                    state.fps = float(value)
-            except ValueError:
-                pass
-        elif key == "progress":
-            if duration > 0:
-                pct = min(100, max(0,
-                    int((out_time_us / 1_000_000) / duration * 100 + 0.5)))
-                with state.lock:
-                    state.percentage = pct
-            if value == "end":
-                break
+            if key == "out_time_us":
+                try:
+                    out_time_us = int(value)
+                    with state.lock:
+                        job.ous = out_time_us
+                except ValueError:
+                    pass
+            elif key == "fps":
+                try:
+                    with state.lock:
+                        job.fps = float(value)
+                except ValueError:
+                    pass
+            elif key == "progress":
+                if duration > 0:
+                    pct = min(100, max(0,
+                        int((out_time_us / 1_000_000) / duration * 100 + 0.5)))
+                    with state.lock:
+                        job.progress = pct
+                if value == "end":
+                    break
 
-    proc.wait()
-    drain.join()
-    return proc.returncode, "".join(stderr_lines)
+        proc.wait()
+        drain.join()
+        return proc.returncode, "".join(stderr_lines)
+    finally:
+        with state.lock:
+            state.ffmpeg_pids.discard(proc.pid)
 
 def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
                   delete_original: bool):
@@ -294,7 +297,7 @@ def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
                 if out_size < job.input_size:
                     job.status = "done"
                     job.output_size = out_size
-                    state.percentage = 100
+                    job.progress = 100
                     state.total_in_bytes += job.input_size
                     state.total_out_bytes += out_size
                     if delete_original:
@@ -313,7 +316,7 @@ def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
                     # -k mode: keep both, record as done
                     job.status = "done"
                     job.output_size = out_size
-                    state.percentage = 100
+                    job.progress = 100
                     state.total_in_bytes += job.input_size
                     state.total_out_bytes += out_size
             else:
@@ -328,17 +331,14 @@ def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
                     except OSError:
                         pass
 
-            state.ffmpeg_pid = None
-            state.status = "idle"
-
     except Exception as exc:
         job.status = "failed"
         job.error = str(exc)
-        with state.lock:
-            state.status = "idle"
-            state.ffmpeg_pid = None
     finally:
-        state.worker_done.set()
+        with state.lock:
+            state.active = max(0, state.active - 1)
+            if state.active == 0:
+                state.status = "idle"
 
 # ═══════════════════════════════════════════════════════════════════════
 # Curses TUI
@@ -361,10 +361,14 @@ class TUI:
         self._prev_ous = 0
         self._prev_active = 0.0
         self._smooth_speed = 0.0
+        self._cur_path = None
 
         self.add_mode = False
         self.add_input = ""
         self.add_cursor = 0
+
+        self.q_follow = True   # auto-keep the active job visible
+        self.q_scroll = 0      # manual view offset when not following
 
         self._init_colors()
 
@@ -410,16 +414,22 @@ class TUI:
 
     def _maybe_start_job(self):
         with self.state.lock:
-            if self.state.status not in ("idle",):
+            if self.state.quit or self.state.status == "paused":
                 return
+            slots = self.args.jobs - self.state.active
+        if slots <= 0:
+            return
 
         for job in self.queue.jobs:
-            if job.status == "pending":
+            if job.status == "pending" and slots > 0:
                 with self.state.lock:
-                    self.state.file_paused_accum = 0.0
-                self._prev_ous = 0
-                self._prev_active = 0.0
-                self._smooth_speed = 0.0
+                    if self.state.quit or self.state.status == "paused":
+                        return
+                    self.state.active += 1
+                    self.state.status = "encoding"
+                    job.status = "encoding"
+                    job.start = time.time()
+                    job.paused_accum = 0.0
                 t = threading.Thread(
                     target=ffmpeg_worker,
                     args=(job, self.state, self.args.preset, self.args.quality,
@@ -427,20 +437,19 @@ class TUI:
                     daemon=True,
                 )
                 t.start()
-                return
+                slots -= 1
 
     def _check_worker(self):
-        if self.state.worker_done.is_set():
+        if not self.state.quit:
             self._maybe_start_job()
 
     def _shutdown(self):
         with self.state.lock:
-            pid = self.state.ffmpeg_pid
             self.state.quit = True
-            if pid:
-                self.state.skip = True
+            pids = list(self.state.ffmpeg_pids)
+            self.state.skip = True
 
-        if pid:
+        for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)
                 time.sleep(0.5)
@@ -478,6 +487,22 @@ class TUI:
                 self._maybe_start_job()
         elif ch == ord('s'):
             self._skip()
+        elif ch in (curses.KEY_UP, ord('k')):
+            self._scroll_queue(-1)
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            self._scroll_queue(1)
+        elif ch == curses.KEY_PPAGE:
+            self._scroll_queue(-self._queue_visible() // 2)
+        elif ch == curses.KEY_NPAGE:
+            self._scroll_queue(self._queue_visible() // 2)
+        elif ch == curses.KEY_HOME:
+            self.q_follow = False
+            self.q_scroll = 0
+        elif ch == curses.KEY_END:
+            self.q_follow = False
+            self.q_scroll = max(0, len(self.queue.jobs) - self._queue_visible())
+        elif ch == ord('f'):
+            self.q_follow = True
         elif ch == ord('q'):
             self.state.quit = True
         elif ch == 3:  # Ctrl+C
@@ -487,19 +512,21 @@ class TUI:
 
     def _toggle_pause(self):
         with self.state.lock:
+            now = time.time()
             if self.state.status == "encoding":
-                if self.state.ffmpeg_pid:
-                    os.kill(self.state.ffmpeg_pid, signal.SIGSTOP)
+                for pid in self.state.ffmpeg_pids:
+                    os.kill(pid, signal.SIGSTOP)
                 self.state.status = "paused"
-                self.pause_start = time.time()
+                self.pause_start = now
             elif self.state.status == "paused":
-                now = time.time()
                 elapsed = now - self.pause_start
                 self.total_paused += elapsed
-                self.state.file_paused_accum += elapsed
                 self.pause_start = 0.0
-                if self.state.ffmpeg_pid:
-                    os.kill(self.state.ffmpeg_pid, signal.SIGCONT)
+                for job in self.queue.jobs:
+                    if job.status == "encoding":
+                        job.paused_accum += elapsed
+                for pid in self.state.ffmpeg_pids:
+                    os.kill(pid, signal.SIGCONT)
                 self.state.status = "encoding"
 
     def _resume(self):
@@ -508,19 +535,44 @@ class TUI:
                 now = time.time()
                 elapsed = now - self.pause_start
                 self.total_paused += elapsed
-                self.state.file_paused_accum += elapsed
                 self.pause_start = 0.0
-                if self.state.ffmpeg_pid:
-                    os.kill(self.state.ffmpeg_pid, signal.SIGCONT)
+                for job in self.queue.jobs:
+                    if job.status == "encoding":
+                        job.paused_accum += elapsed
+                for pid in self.state.ffmpeg_pids:
+                    os.kill(pid, signal.SIGCONT)
                 self.state.status = "encoding"
 
     def _skip(self):
         with self.state.lock:
-            if self.state.ffmpeg_pid and self.state.status in ("encoding", "paused"):
+            if self.state.status in ("encoding", "paused"):
                 self.state.skip = True
                 if self.state.status == "paused":
-                    os.kill(self.state.ffmpeg_pid, signal.SIGCONT)
-                os.kill(self.state.ffmpeg_pid, signal.SIGTERM)
+                    for pid in self.state.ffmpeg_pids:
+                        os.kill(pid, signal.SIGCONT)
+                for pid in self.state.ffmpeg_pids:
+                    os.kill(pid, signal.SIGTERM)
+
+    # ── Queue scrolling ─────────────────────────────────────────────
+
+    def _queue_visible(self) -> int:
+        max_y, _ = self.stdscr.getmaxyx()
+        return max(1, max_y - 8)
+
+    def _scroll_queue(self, delta: int):
+        jobs = self.queue.jobs
+        visible = self._queue_visible()
+        total = len(jobs)
+        if total <= visible:
+            return
+        if self.q_follow:
+            current_i = next((i for i, j in enumerate(jobs)
+                              if j.status in ("encoding", "paused")), 0)
+            cur_start = max(0, min(current_i - visible // 2, total - visible))
+        else:
+            cur_start = self.q_scroll
+        self.q_follow = False
+        self.q_scroll = max(0, min(cur_start + delta, total - visible))
 
     # ── Add-file input ──────────────────────────────────────────────
 
@@ -653,36 +705,9 @@ class TUI:
 
     def _render_current_file(self, row: int, max_x: int) -> int:
         with self.state.lock:
-            pct = self.state.percentage
-            fps = self.state.fps
-            ous = self.state.out_time_us
             status = self.state.status
-            file_start = self.state.file_start
-            file_paused = self.state.file_paused_accum
-
-        now = time.time()
-        active_elapsed = max(0, now - file_start - file_paused)
-        if status == "paused" and self.pause_start > 0:
-            active_elapsed -= (now - self.pause_start)
-
-        # Compute instantaneous encoding speed from deltas between progress
-        # updates, smoothed with exponential moving average.  Using ous
-        # (microsecond-precise) avoids the sawtooth that rounded pct causes.
-        if ous != self._prev_ous and ous > 0 and self._prev_ous > 0:
-            delta_content = (ous - self._prev_ous) / 1_000_000.0
-            delta_active = active_elapsed - self._prev_active
-            if delta_active > 0.1:
-                inst = delta_content / delta_active
-                if inst > 0:
-                    alpha = 0.3
-                    if self._smooth_speed <= 0:
-                        self._smooth_speed = inst
-                    else:
-                        self._smooth_speed = alpha * inst + (1 - alpha) * self._smooth_speed
-
-        if ous != self._prev_ous:
-            self._prev_ous = ous
-            self._prev_active = active_elapsed
+            active_count = self.state.active
+            total = len(self.queue.jobs)
 
         # Find the currently encoding/paused job
         current = None
@@ -693,12 +718,52 @@ class TUI:
                 idx = i + 1
                 break
 
-        total = len(self.queue.jobs)
+        now = time.time()
+        if current:
+            pct = current.progress
+            fps = current.fps
+            ous = current.ous
+            active_elapsed = max(0, now - current.start - current.paused_accum)
+            if status == "paused" and self.pause_start > 0:
+                active_elapsed -= (now - self.pause_start)
+
+            # Reset speed sampling when the displayed job changes.
+            if current.input_path != self._cur_path:
+                self._cur_path = current.input_path
+                self._prev_ous = 0
+                self._prev_active = 0.0
+                self._smooth_speed = 0.0
+
+            # Compute instantaneous encoding speed from deltas between progress
+            # updates, smoothed with exponential moving average.  Using ous
+            # (microsecond-precise) avoids the sawtooth that rounded pct causes.
+            if ous != self._prev_ous and ous > 0 and self._prev_ous > 0:
+                delta_content = (ous - self._prev_ous) / 1_000_000.0
+                delta_active = active_elapsed - self._prev_active
+                if delta_active > 0.1:
+                    inst = delta_content / delta_active
+                    if inst > 0:
+                        alpha = 0.3
+                        if self._smooth_speed <= 0:
+                            self._smooth_speed = inst
+                        else:
+                            self._smooth_speed = alpha * inst + (1 - alpha) * self._smooth_speed
+
+            if ous != self._prev_ous:
+                self._prev_ous = ous
+                self._prev_active = active_elapsed
+        else:
+            pct = 0
+            fps = 0.0
+            ous = 0
+            active_elapsed = 0.0
 
         # File label
         if current:
             name = current.basename
             label = f" [{idx}/{total}] {name} "
+            if active_count > 1:
+                label += f"(+{active_count - 1} active) "
         elif self.queue.pending:
             pending = self.queue.pending[0]
             label = f" Next: {pending.basename} "
@@ -755,7 +820,7 @@ class TUI:
                     rem_sec = max(0, current.duration - cs)
                     eta = rem_sec / avg
                     label_str += f"    ETA {eta // 3600:02.0f}:{(eta % 3600) // 60:02.0f}:{eta % 60:02.0f}"
-            elif active_elapsed <= 3:
+            elif ous == 0 and current:
                 label_str += f"    starting…"
         elif status == "idle":
             label_str = "  idle"
@@ -799,11 +864,15 @@ class TUI:
         if total_jobs <= visible:
             start = 0
             end = total_jobs
-        else:
+        elif self.q_follow:
             # Keep the currently encoding job visible
             current_i = next((i for i, j in enumerate(jobs)
                               if j.status in ("encoding", "paused")), 0)
             start = max(0, min(current_i - visible // 2, total_jobs - visible))
+            end = start + visible
+        else:
+            # Manual scroll — keep the user's position, don't yank it around
+            start = max(0, min(self.q_scroll, total_jobs - visible))
             end = start + visible
 
         for i in range(start, end):
@@ -922,7 +991,9 @@ def parse_args() -> argparse.Namespace:
                    choices=["speed", "balanced", "quality"],
                    help="Encoding preset (default: balanced)")
     p.add_argument("-q", dest="quality", type=int, default=DEFAULT_QUALITY,
-                   help="QP value — lower = better quality (default: 28)")
+                   help=f"QP value — lower = better quality (default: {DEFAULT_QUALITY})")
+    p.add_argument("-j", "--jobs", dest="jobs", type=int, default=1,
+                   help="Number of files to encode in parallel (default: 1)")
     p.add_argument("-n", dest="dry_run", action="store_true",
                    help="Dry run: list files and exit")
     p.add_argument("-k", "--keep", dest="keep", action="store_true",
@@ -938,6 +1009,9 @@ def main_curses(stdscr, queue: Queue, state: SharedState, args):
 def main():
     args = parse_args()
     args.delete = not args.keep  # delete is default; -k keeps, -D is legacy no-op
+    if args.jobs < 1:
+        print("Error: --jobs must be >= 1", file=sys.stderr)
+        sys.exit(1)
 
     # ── Dry run ─────────────────────────────────────────────────────
     if args.dry_run:

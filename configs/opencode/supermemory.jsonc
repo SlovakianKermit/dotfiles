@@ -1,0 +1,12 @@
+{
+  "apiKey": "sm_BqnimhhmSLb6DwHCdYWRHo_ossQQLlOr4imdh9W73U0KST5LvvEOuixFT6LcHLuZuhcKJ6xjdebTlbefdT9fUVB",
+  "baseUrl": "http://localhost:6767",
+  "similarityThreshold": 0.6,
+  "maxMemories": 5,
+  "maxProjectMemories": 0,
+  "maxProfileItems": 5,
+  "injectProfile": true,
+  "captureEveryNTurns": 3,
+  "compactionThreshold": 0.8,
+  "projectContainerTag": "sm_project_default"
+}

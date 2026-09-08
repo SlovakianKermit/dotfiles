@@ -29,7 +29,6 @@ cantarell-fonts
 copyparty
 cpupower
 cryptsetup
-cuda
 device-mapper
 diffutils
 digikam
@@ -116,14 +115,12 @@ lsscsi
 lvm2
 man-db
 man-pages
-mariadb
 mdadm
 mda.lv2
 meld
 mesa-utils
 micro
 modemmanager
-mono
 moonlight-qt
 mtools
 mtr
@@ -188,8 +185,7 @@ rebuild-detector
 reflector
 ripgrep
 rnote
-rocm-hip-sdk
-rocm-opencl-runtime
+rocm-smi-lib
 rsync
 scrcpy
 sg3_utils
@@ -207,6 +203,7 @@ s-tui
 sudo
 sysfsutils
 tailscale
+telegram-desktop
 tesseract
 tesseract-data-eng
 texinfo

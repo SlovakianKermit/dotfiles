@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+FILENAME_RE = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_(\d{3})\.ts$')
+FLAT_RE = re.compile(r'^(.+)_Chaturbate_(\d{8})-(\d{6})\.mts$')
+
+VKEY = ("codec_name", "width", "height", "r_frame_rate")
+AKEY = ("codec_name", "sample_rate", "channels")
+
+CURRENT_PART = None
+DELETED_SO_FAR = 0
+KEPT_SO_FAR = 0
+
+
+def parse_filename(name):
+    m = FILENAME_RE.match(name)
+    if m:
+        start = datetime.strptime(
+            f"{m.group(2)} {m.group(3)}:{m.group(4)}:{m.group(5)}.{m.group(6)}",
+            "%Y-%m-%d %H:%M:%S.%f",
+        )
+        return m.group(1), start.timestamp()
+    m = FLAT_RE.match(name)
+    if m:
+        start = datetime.strptime(f"{m.group(2)}-{m.group(3)}", "%Y%m%d-%H%M%S")
+        return m.group(1), start.timestamp()
+    return None
+
+
+def probe(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+        "-of", "json", path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+        dur = float(data["format"]["duration"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    v = a = None
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video" and v is None:
+            v = s
+        elif s.get("codec_type") == "audio" and a is None:
+            a = s
+    vsig = tuple(v.get(k) for k in VKEY) if v else None
+    asig = tuple(a.get(k) for k in AKEY) if a else None
+    return dur, vsig, asig
+
+
+def find_chain_groups(rows, threshold):
+    groups = []
+    cur = [rows[0]]
+    for r in rows[1:]:
+        gap = r["start"] - (cur[-1]["start"] + cur[-1]["dur"])
+        if -threshold <= gap <= threshold:
+            cur.append(r)
+        else:
+            if len(cur) >= 2:
+                groups.append(cur)
+            cur = [r]
+    if len(cur) >= 2:
+        groups.append(cur)
+    return groups
+
+
+def collect_entries(cpath, now, age):
+    entries = []
+    active = 0
+    for name in sorted(os.listdir(cpath)):
+        if not (name.endswith(".ts") or name.endswith(".mts")):
+            continue
+        parsed = parse_filename(name)
+        if not parsed:
+            continue
+        path = os.path.join(cpath, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if now - st.st_mtime <= age:
+            active += 1
+            continue
+        entries.append({
+            "name": name, "path": path,
+            "model": parsed[0], "start": parsed[1],
+            "size": st.st_size, "mtime": st.st_mtime,
+            "dir": cpath,
+        })
+    return entries, active
+
+
+def process_group(model, entries, args):
+    entries = sorted(entries, key=lambda e: e["start"])
+    candidates = []
+    for prev, cur in zip(entries, entries[1:]):
+        gap_mtime = cur["start"] - prev["mtime"]
+        if gap_mtime <= args.gap + args.slack:
+            if not candidates or candidates[-1] is not prev:
+                candidates.append(prev)
+            if not candidates or candidates[-1] is not cur:
+                candidates.append(cur)
+    if len(candidates) < 2:
+        return (0, 0, 0, 0, 0, [])
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        results = list(ex.map(lambda e: (e, probe(e["path"])), candidates))
+    by_path = {}
+    for e, p in results:
+        if p is None:
+            print(f"  warn: could not probe {e['name']}", file=sys.stderr)
+            continue
+        e["dur"], e["vsig"], e["asig"] = p
+        by_path[e["path"]] = e
+    candidates = [e for e in candidates if e["path"] in by_path]
+    candidates.sort(key=lambda e: e["start"])
+
+    groups = find_chain_groups(candidates, args.gap)
+
+    merged = bytes_out = n_del = n_keep = skipped = 0
+    summary = []
+    for group in groups:
+        parts = [group[0]]
+        for e in group[1:]:
+            if e["vsig"] == parts[-1]["vsig"] and e["asig"] == parts[-1]["asig"]:
+                parts.append(e)
+            else:
+                if len(parts) >= 2:
+                    res = merge_run(parts, args)
+                    if res["merged"]:
+                        merged += 1
+                        bytes_out += res["size"]
+                        n_del += res["n_del"]
+                        n_keep += res["n_keep"]
+                        summary.append(res)
+                else:
+                    skipped += len(parts)
+                parts = [e]
+        if len(parts) >= 2:
+            res = merge_run(parts, args)
+            if res["merged"]:
+                merged += 1
+                bytes_out += res["size"]
+                n_del += res["n_del"]
+                n_keep += res["n_keep"]
+                summary.append(res)
+        else:
+            skipped += len(parts)
+    return (merged, bytes_out, n_del, n_keep, skipped, summary)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ctbrec-merge",
+        description="Losslessly merge ctbrec recordings of the same model that were split by a restart (small gaps).",
+    )
+    ap.add_argument("--dir", default="/mnt/shared/Ctbrec/Recording",
+                    help="base directory (one folder per model, or flat .mts files)")
+    ap.add_argument("--gap", type=int, default=300,
+                    help="max gap in seconds between recordings to merge (default 300)")
+    ap.add_argument("--slack", type=int, default=30,
+                    help="extra seconds of slack when finding candidates via mtime (default 30)")
+    ap.add_argument("--age", type=int, default=300,
+                    help="skip files modified in the last N seconds (default 300)")
+    ap.add_argument("--keep", action="store_true",
+                    help="move merged originals to .merged_originals/ instead of deleting")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the merge plan without changing anything")
+    ap.add_argument("--top-level", action="store_true",
+                    help="only process files directly in --dir, never enter subdirectories")
+    ap.add_argument("--verify", action="store_true",
+                    help="verify merged output duration with ffprobe (extra full read)")
+    ap.add_argument("-j", "--jobs", type=int, default=8,
+                    help="parallel ffprobe workers (default 8)")
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.dir):
+        print(f"error: {args.dir} is not a directory", file=sys.stderr)
+        return 1
+
+    now = datetime.now().timestamp()
+    files = sorted(os.listdir(args.dir))
+    total_merged = 0
+    total_bytes = 0
+    deleted = 0
+    kept = 0
+    skipped_params = 0
+    active = 0
+    summary = []
+
+    subdirs = [d for d in files if os.path.isdir(os.path.join(args.dir, d))]
+    top_files = [f for f in files if os.path.isfile(os.path.join(args.dir, f))]
+    has_top_recordings = any(parse_filename(f) for f in top_files)
+    model_groups = []
+    if args.top_level or has_top_recordings:
+        entries, act = collect_entries(args.dir, now, args.age)
+        active += act
+        by_model = {}
+        for e in entries:
+            by_model.setdefault(e["model"], []).append(e)
+        model_groups = [(m, es) for m, es in by_model.items() if len(es) >= 2]
+    elif subdirs:
+        for d in subdirs:
+            cpath = os.path.join(args.dir, d)
+            entries, act = collect_entries(cpath, now, args.age)
+            active += act
+            if len(entries) >= 2:
+                model_groups.append((d, entries))
+
+    for model, entries in model_groups:
+        merged, bytes_out, n_del, n_keep, skipped, res_summary = process_group(model, entries, args)
+        total_merged += merged
+        total_bytes += bytes_out
+        deleted += n_del
+        kept += n_keep
+        skipped_params += skipped
+        summary.extend(res_summary)
+
+    if summary:
+        print("\nSummary:")
+        for s in summary:
+            print(f"  {s['model']}: {s['parts']} parts -> {s['name']} ({s['size']/1e6:.0f} MB, gaps {s['gaps']})")
+    print(f"\ndone: {total_merged} files merged ({total_bytes/1e6:.0f} MB output)")
+    if deleted:
+        print(f"      {deleted} originals deleted")
+    if kept:
+        print(f"      {kept} originals moved to .merged_originals/")
+    if skipped_params:
+        print(f"      {skipped_params} files not merged (codec/params differ)")
+    if active:
+        print(f"      {active} files skipped (modified within --age)")
+    return 0
+
+
+def merge_run(group, args):
+    gap_txt = ""
+    gaps = []
+    for prev, cur in zip(group, group[1:]):
+        gaps.append(round(cur["start"] - (prev["start"] + prev["dur"])))
+    gap_txt = ", ".join(f"{g}s" for g in gaps)
+
+    model = group[0]["model"]
+    out_name = group[0]["name"]
+    out_path = os.path.join(group[0]["dir"], out_name)
+    in_sizes = sum(e["size"] for e in group)
+    in_durs = sum(e["dur"] for e in group)
+
+    print(f"merge [{model}]")
+    for e in group:
+        print(f"  + {e['name']}  ({e['dur']:.0f}s)")
+    print(f"  -> {out_name}  gaps: {gap_txt}")
+
+    base = {"model": model, "name": out_name, "parts": len(group), "gaps": gap_txt}
+
+    if args.dry_run:
+        base.update({"merged": False, "size": 0, "n_del": 0, "n_keep": 0})
+        return base
+
+    part_path = out_path + ".part"
+    global CURRENT_PART
+    CURRENT_PART = part_path
+    try:
+        os.remove(part_path)
+    except OSError:
+        pass
+    list_txt = "".join(f"file '{e['path']}'\n" for e in group)
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+        tf.write(list_txt)
+        list_path = tf.name
+    try:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "concat", "-safe", "0", "-i", list_path,
+               "-map", "0", "-c", "copy", "-f", "mpegts", part_path]
+        r = subprocess.run(cmd, input=None, capture_output=True, text=True)
+    finally:
+        os.remove(list_path)
+    if r.returncode != 0:
+        print(f"  error: ffmpeg failed, kept originals\n{r.stderr}", file=sys.stderr)
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+        return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+
+    out_size = os.path.getsize(part_path)
+    if abs(out_size - in_sizes) > max(2 * 1024 * 1024, 0.03 * in_sizes):
+        print(f"  error: output size {out_size} vs input sum {in_sizes}, kept originals", file=sys.stderr)
+        try:
+            os.remove(part_path)
+        except OSError:
+            pass
+        return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+
+    if args.verify:
+        p = probe(part_path)
+        if p is None or abs(p[0] - in_durs) > 2:
+            print(f"  error: verify failed, kept originals", file=sys.stderr)
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+            return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+
+    n_del = n_keep = 0
+    global DELETED_SO_FAR, KEPT_SO_FAR
+    for e in group:
+        if args.keep:
+            bak = os.path.join(e["dir"], ".merged_originals")
+            os.makedirs(bak, exist_ok=True)
+            dest = os.path.join(bak, e["name"])
+            i = 1
+            while os.path.exists(dest):
+                dest = os.path.join(bak, f"{e['name']}.{i}")
+                i += 1
+            os.rename(e["path"], dest)
+            n_keep += 1
+            KEPT_SO_FAR += 1
+        else:
+            os.remove(e["path"])
+            n_del += 1
+            DELETED_SO_FAR += 1
+
+    os.rename(part_path, out_path)
+
+    print(f"  ok: {out_name} ({out_size/1e6:.0f} MB), originals {'kept' if args.keep else 'deleted'}")
+    return {"merged": True, **base, "size": out_size, "n_del": n_del, "n_keep": n_keep}
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        if CURRENT_PART:
+            try:
+                os.remove(CURRENT_PART)
+            except OSError:
+                pass
+        print("\ninterrupted: partial output cleaned up", file=sys.stderr)
+        if DELETED_SO_FAR or KEPT_SO_FAR:
+            print(f"  note: {DELETED_SO_FAR} originals deleted, {KEPT_SO_FAR} moved to .merged_originals/ before interrupt", file=sys.stderr)
+        sys.exit(130)

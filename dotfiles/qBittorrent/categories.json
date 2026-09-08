@@ -4,8 +4,8 @@
         "inactive_seeding_time_limit": -2,
         "ratio_limit": -2,
         "save_path": "/home/killian/Pictures/img/Downloads",
-        "seeding_time_limit": -2,
-        "share_limit_action": "Default"
+        "seeding_time_limit": 0,
+        "share_limit_action": "Stop"
     },
     "Movies": {
         "download_path": false,
@@ -19,7 +19,7 @@
         "download_path": false,
         "inactive_seeding_time_limit": -2,
         "ratio_limit": -2,
-        "save_path": "",
+        "save_path": "/mnt/data_storage/Shows",
         "seeding_time_limit": -2,
         "share_limit_action": "Default"
     }

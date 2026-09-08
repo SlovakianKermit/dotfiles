@@ -6,3 +6,8 @@ source /usr/share/cachyos-fish-config/cachyos-config.fish
 #    # smth smth
 #end
 set -gx SHELL /bin/bash
+
+function update
+    paru -Syu
+    flatpak update
+end

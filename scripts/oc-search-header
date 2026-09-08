@@ -1,0 +1,15 @@
+#!/bin/sh
+# Print the oc-search fzf header, reflecting the pending-delete state.
+# Called from oc-search via fzf transform-header.
+# sh (not fish) on purpose: transform-header runs on every focus change while
+# scrolling, and fish startup (~20ms) made scrolling laggy.
+# Usage: oc-search-header <cache-file-basename>
+
+cache_dir="${OC_SEARCH_CACHE:-$HOME/.cache/oc-search}"
+
+file=$1
+if test -f "$cache_dir/.pending" && test "$(cat "$cache_dir/.pending")" = "$file"; then
+    echo '  CTRL-X: press again to confirm delete  |  ENTER: nvim  |  CTRL-O: open in opencode  |  CTRL-C: exit'
+else
+    echo '  ENTER: nvim  |  CTRL-O: open in opencode  |  CTRL-X: delete  |  CTRL-C: exit'
+fi

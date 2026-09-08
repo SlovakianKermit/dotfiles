@@ -15,8 +15,9 @@ then lets you filter and open the cached sessions with
 .P
 The database is read from
 .IR ~/.local/share/opencode/opencode.db .
-Only non-archived sessions are indexed, ordered by most recently updated
-first. If the database does not exist, or either
+Only non-archived sessions are indexed. The fzf list is sorted by last
+update time ascending, so the oldest conversation is at the top and the
+newest at the bottom. If the database does not exist, or either
 .B rg
 or
 .B fzf
@@ -34,17 +35,29 @@ mode, typing after launch re-runs
 and live-refilters the session list.
 .SS Cache
 Each session is cached as a file named
-.RI ID __TITLE.md
+.RI UPDATED::ID::TITLE
 in
-.IR ~/.cache/oc-search/ .
+.IR ~/.cache/oc-search/ ,
+where
+.B UPDATED
+is the session's last-update time in milliseconds since the epoch (used
+to sort the list oldest-to-newest) and
+.B ID
+is the opencode session ID.
 The title has path-hostile characters replaced with underscores and is
-truncated to 80 characters. Each file begins with a header of the title,
-session ID, and local creation time, followed by the conversation with
-.B USER
+truncated to 80 characters. Each file begins with a header of the title
+and the local creation time, followed by the conversation with
+.B "## USER"
 and
-.B ASSISTANT
-role markers, per-message timestamps, and message text prefixed with
-.BR "> " .
+.B "## ASSISTANT"
+role markers, per-message timestamps, and the raw message text (markdown
+bold markers are stripped).
+.P
+The fzf list shows only the title (the
+.B UPDATED
+and
+.B ID
+prefixes are hidden), with the oldest conversation at the top.
 .P
 A session is re-dumped when its cached file is older than the session's
 update time. User messages that begin with
@@ -54,16 +67,15 @@ or
 are skipped. A
 .B .version
 marker inside the cache directory tracks the cache format version; when
-it differs from the script's version, all cached
-.B .md
-files are deleted and rebuilt.
+it differs from the script's version, all cached files are deleted and
+rebuilt.
 .SS Preview
 The fzf preview window (right 60%, wrapped) runs
 .B rg
 with case-insensitive context (3 lines around the query) over the
 selected file, falling back to
 .BR bat (1)
-with plain style, then
+with plain style and markdown syntax, then
 .BR cat (1).
 .SH OPTIONS
 .TP
@@ -82,7 +94,20 @@ Start the supermemory user service and open the conversation in
 .B opencode
 with
 .IR opencode\ \-s ,
-using the session ID embedded in the filename.
+using the session ID embedded in the filename (the second
+.B ::
+field).
+.TP
+.B CTRL-X
+Delete the selected conversation. Pressing
+.B CTRL-X
+once arms the deletion for the selected conversation (the header shows
+a \*(lqpress again to confirm delete\*(rq hint); pressing it again on the
+same conversation removes the session, its messages and parts from the
+database and deletes its cache file, so the conversation disappears from
+the list. Pressing
+.B CTRL-X
+on a different conversation re-arms it to that one.
 .TP
 .B CTRL-C
 Exit without selecting.
@@ -104,11 +129,29 @@ oc-search
 The opencode conversation database.
 .TP
 .I ~/.cache/oc-search/
-Cache directory holding the
-.B .md
-session files and the
+Cache directory holding the session files and the
 .B .version
 marker.
+.TP
+.I ~/.cache/oc-search/.pending
+Temporary marker written by the
+.B CTRL-X
+deletion flow to record which conversation is armed for deletion.
+.TP
+.I ~/.local/bin/oc-search-delete
+Helper script that arms and performs conversation deletion. The default
+database and cache paths can be overridden with the
+.B OC_SEARCH_DB
+and
+.B OC_SEARCH_CACHE
+environment variables.
+.TP
+.I ~/.local/bin/oc-search-header
+Helper script that renders the dynamic
+.B fzf
+header showing the pending-delete state. The cache path can be
+overridden with
+.B OC_SEARCH_CACHE.
 .SH SEE ALSO
 .BR rg (1),
 .BR fzf (1),

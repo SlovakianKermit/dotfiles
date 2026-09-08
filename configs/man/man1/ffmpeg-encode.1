@@ -85,8 +85,18 @@ Slower, better quality (\fB\-preset slow\fR).
 .TP
 .BI \-q " QP"
 Constant QP quality value for the VAAPI encoder. Default:
-.BR 28 .
+.BR 27 .
 Lower values mean higher quality and larger files.
+.TP
+.BI \-j " N"
+.BI \-\-jobs " N"
+Encode up to
+.I N
+files in parallel (default:
+.BR 1 ).
+Useful for batches of many small files where per-process ffmpeg / VAAPI
+startup would otherwise dominate; a value of 2 or 3 is a good fit for a
+VCN-class GPU.
 .TP
 .B \-n
 Dry run. Print the
@@ -125,7 +135,7 @@ All outputs use the
 .SS Batch discovery
 In batch mode, files are found recursively under the input directory with
 extensions (case-insensitive):
-.BR mkv ", " mp4 ", " avi ", " mov ", " webm ", " ts ", " mts .
+.BR mkv ", " mp4 ", " avi ", " mov ", " webm ", " ts ", " mts ", " webp .
 .SS Requirements
 .IP \(bu 2
 .B ffmpeg
@@ -167,6 +177,41 @@ Tighter quality (lower QP):
 .EX
 ffmpeg-encode \-q 24
 .EE
+.P
+Encode a batch of small files with three parallel jobs:
+.IP
+.EX
+ffmpeg-encode \-i ~/Videos/raw \-o ~/Videos/encoded \-j 3
+.EE
+.SH INTERACTIVE KEYS
+.TP
+.B p
+Pause / resume encoding.
+.TP
+.B r
+Resume encoding.
+.TP
+.B s
+Skip the currently encoding file(s).
+.TP
+.B a
+Add a file to the queue.
+.TP
+.B Up / Down, j / k
+Scroll the queue list one line.
+.TP
+.B Page Up / Page Down
+Scroll the queue list by half a page.
+.TP
+.B Home / End
+Jump to the top / bottom of the queue.
+.TP
+.B f
+Re-enable auto-follow, keeping the currently encoding file centred.
+.P
+Scrolling with the arrow keys turns off auto-follow so the queue stops
+jumping around; note that a terminal only repaints the focused tab, so an
+unfocused tab may appear frozen until you switch back to it.
 .SH EXIT STATUS
 .TP
 .B 0

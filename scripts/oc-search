@@ -3,9 +3,9 @@
 # Caches session text to ~/.cache/oc-search/
 # Usage: oc-search [query]
 
-set -l cache_dir ~/.cache/oc-search
-set -l db ~/.local/share/opencode/opencode.db
-set -l cache_version 3
+set -q OC_SEARCH_DB; and set db "$OC_SEARCH_DB"; or set db ~/.local/share/opencode/opencode.db
+set -q OC_SEARCH_CACHE; and set cache_dir "$OC_SEARCH_CACHE"; or set cache_dir ~/.cache/oc-search
+set -l cache_version 4
 
 if not test -f "$db"
     echo "Error: No opencode database at $db" >&2
@@ -24,7 +24,7 @@ mkdir -p "$cache_dir"
 # -- force cache rebuild if script was updated --
 set -l version_file "$cache_dir/.version"
 if not test -f "$version_file"; or test (cat "$version_file") -ne $cache_version
-    rm -f "$cache_dir"/*.md 2>/dev/null
+    rm -f "$cache_dir"/* 2>/dev/null
     echo $cache_version >"$version_file"
 end
 
@@ -40,7 +40,7 @@ sqlite3 -separator '|' "$db" "
     set -l updated (echo "$line" | cut -d'|' -f3)
 
     set -l safe_title (echo "$title" | string replace -ar '[\/:*?"<>|]' '_' | string shorten -m 80)
-    set -l cache_file "$cache_dir"/"$id"__"$safe_title".md
+    set -l cache_file "$cache_dir"/"$updated"::"$id"::"$safe_title"
 
     set -l needs_update 1
     if test -f "$cache_file"
@@ -54,19 +54,19 @@ sqlite3 -separator '|' "$db" "
         set -l created (sqlite3 "$db" "SELECT datetime(time_created/1000, 'unixepoch', 'localtime') FROM session WHERE id='$id';")
 
         # Write header
-        printf '# %s\n# %s (%s)\n\n' "$title" "$id" "$created" > "$cache_file"
+        printf '# %s\n# %s\n\n' "$title" "$created" > "$cache_file"
 
         # Write messages — skip supermemory [SUPERMEMORY] injection messages
         sqlite3 "$db" "
             SELECT
-                '▸ ' ||
+                '## ' ||
                 CASE json_extract(m.data, '\$.role')
                     WHEN 'user' THEN 'USER'
                     WHEN 'assistant' THEN 'ASSISTANT'
                     ELSE json_extract(m.data, '\$.role')
                 END ||
-                ' (' || datetime(m.time_created/1000, 'unixepoch', 'localtime') || '):' || x'0a' || x'0a' ||
-                '> ' || replace(json_extract(p.data, '\$.text'), x'0a', x'0a' || '> ') || x'0a' || x'0a'
+                ' (' || datetime(m.time_created/1000, 'unixepoch', 'localtime') || ')' || x'0a' || x'0a' ||
+                replace(json_extract(p.data, '\$.text'), '**', '') || x'0a' || x'0a'
             FROM message m
             JOIN part p ON p.message_id = m.id
             WHERE m.session_id = '$id'
@@ -89,10 +89,14 @@ rg --files-with-matches --smart-case --no-ignore '' "$cache_dir" 2>/dev/null \
     --ansi \
     --query "$QUERY" \
     --prompt '  Search conversations > ' \
-    --preview "rg --color=always -i -C 3 {q} $cache_dir/{} 2>/dev/null || bat --style=plain --color=always $cache_dir/{} 2>/dev/null || cat $cache_dir/{}" \
+    --delimiter '::' \
+    --with-nth '3..' \
+    --preview "rg --color=always -i -C 3 {q} $cache_dir/{} 2>/dev/null || bat --language=markdown --style=plain --color=always $cache_dir/{} 2>/dev/null || cat $cache_dir/{}" \
     --preview-window 'right:60%:wrap' \
-    --header 'ENTER: nvim  |  CTRL-O: open in opencode  |  CTRL-C: exit' \
+    --header '  ENTER: nvim  |  CTRL-O: open in opencode  |  CTRL-X: delete  |  CTRL-C: exit' \
     --disabled \
     --bind "change:reload(rg --files-with-matches --smart-case --no-ignore {q} $cache_dir 2>/dev/null | sed 's|^$cache_dir/||' | sort || true)" \
     --bind "enter:execute(nvim $cache_dir/{})" \
-    --bind 'ctrl-o:become(fish,-c,systemctl --user start supermemory.service 2>/dev/null; opencode -s (basename {} .md | sed "s/__.*//"))'
+    --bind 'ctrl-o:become(fish,-c,systemctl --user start supermemory.service 2>/dev/null; opencode -s (basename {} | cut -d: -f3))' \
+    --bind "ctrl-x:execute-silent(oc-search-delete {})+reload(rg --files-with-matches --smart-case --no-ignore {q} $cache_dir 2>/dev/null | sed 's|^$cache_dir/||' | sort || true)+transform-header(oc-search-header {})" \
+    --bind "focus:transform-header(oc-search-header {})"

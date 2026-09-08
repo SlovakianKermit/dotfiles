@@ -1,0 +1,77 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "deepseek/deepseek-v4-flash",
+  "plugin": [
+    "opencode-pty",
+    "@tarquinen/opencode-dcp",
+    "opencode-supermemory@latest"
+  ],
+  "provider": {
+    "deepseek": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek",
+      "options": {
+        "baseURL": "https://api.deepseek.com/v1"
+      },
+      "models": {
+        "deepseek-v4-pro": {
+          "name": "DeepSeek V4 Pro"
+        },
+        "deepseek-v4-flash": {
+          "name": "DeepSeek V4 Flash"
+        }
+      }
+    }
+  },
+  "agent": {
+    "compaction": {
+      "model": "deepseek/deepseek-v4-flash"
+    },
+    "plan": {
+      "permission": {
+        "edit": "deny",
+        "external_directory": {
+          "*": "allow"
+        },
+        "bash": {
+          "*": "allow",
+          "rm -rf *": "deny",
+          "rm -fr *": "deny",
+          "shutdown *": "deny",
+          "reboot *": "deny",
+          "poweroff *": "deny",
+          "systemctl start *": "deny",
+          "systemctl stop *": "deny",
+          "systemctl restart *": "deny",
+          "pacman -S *": "deny",
+          "pacman -R *": "deny",
+          "pacman -U *": "deny",
+          "sudo *": "deny",
+          "ssh * sudo *": "deny"
+        }
+      }
+    }
+  },
+  "permission": {
+    "read": "allow",
+    "edit": {
+      "*": "ask",
+      ".local/bin/**": "allow",
+      "tmp/**": "allow"
+    },
+    "external_directory": {
+      "~/.local/bin/**": "allow",
+      "~/tmp/**": "allow"
+    },
+    "searxng": "allow"
+  },
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 10000
+  },
+  "instructions": [
+    "~/.config/opencode/instructions.md",
+    "~/.config/opencode/plugin/shell-strategy/shell_strategy.md"
+  ]
+}

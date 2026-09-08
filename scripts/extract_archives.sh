@@ -2,7 +2,41 @@
 
 set -uo pipefail
 
-ROOT="${1:-.}"
+ROOT="."
+DEPTH=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d | --depth)
+      DEPTH="${2:-}"
+      shift 2
+      ;;
+    -h | --help)
+      echo "Usage: $(basename "$0") [OPTIONS] [DIRECTORY]"
+      echo ""
+      echo "Extract archives. By default only archives directly inside DIRECTORY (or . ) are processed."
+      echo ""
+      echo "Options:"
+      echo "  -d, --depth N   Process archives up to N directories deep (default: 1)"
+      echo "  -h, --help      Show this help"
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      ROOT="$1"
+      shift
+      ;;
+  esac
+done
+
+if ! [[ "$DEPTH" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Invalid depth: '$DEPTH'" >&2
+  exit 1
+fi
+
 declare -a FAILED=()
 
 extract_archive() {
@@ -117,7 +151,7 @@ extract_archive() {
 # Find all supported archives and process them
 while IFS= read -r -d '' archive; do
   extract_archive "$archive"
-done < <(find "$ROOT" -type f \( \
+done < <(find "$ROOT" -maxdepth "$DEPTH" -type f \( \
   -iname "*.zip" \
   -o -iname "*.tar" \
   -o -iname "*.tar.gz" \

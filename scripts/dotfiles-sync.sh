@@ -26,6 +26,7 @@ GITHUB_REPO="https://github.com/SlovakianKermit/dotfiles.git"
 
 declare -A RSYNC_EXCLUDES=(
   ["dotfiles/qBittorrent"]="BT_backup/ logs/ rss/ search/ GeoIP/ qBittorrent.conf qBittorrent-data.conf"
+  ["configs/opencode"]="node_modules/ package.json package-lock.json bun.lock .gitignore"
 )
 
 SYMLINKS=(
@@ -63,6 +64,7 @@ COPIES=(
   "${HOME}/.config/kdeglobals:configs/kde/kdeglobals"
   "${HOME}/.config/kglobalshortcutsrc:configs/kde/kglobalshortcutsrc"
   "${HOME}/.local/share/man:configs/man"
+  "${HOME}/.config/opencode:configs/opencode"
 )
 
 ELECTRON_COPIES=(
@@ -347,8 +349,14 @@ cmd_push() {
         log "Would copy: ${src} -> ${dest}"
         continue
       fi
+      local rsync_excludes=""
+      if [[ -n "${RSYNC_EXCLUDES[${entry##*:}]:-}" ]]; then
+        for pat in ${RSYNC_EXCLUDES[${entry##*:}]}; do
+          rsync_excludes+=" --exclude=${pat}"
+        done
+      fi
       if [[ -d "${src}" ]]; then
-        rsync -a --delete "${src%/}/" "${dest}/" 2>/dev/null ||
+        rsync -a --delete ${rsync_excludes} "${src%/}/" "${dest}/" 2>/dev/null ||
           cp -r "${src}" "${dest}"
       else
         cp "${src}" "${dest}"

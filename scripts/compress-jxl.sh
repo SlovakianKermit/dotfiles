@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────
-BASE_ROOT="$HOME/Pictures/img"
+BASE_ROOT="$HOME/Pictures/img/Downloads"
+EXCLUDE_DIRS=("Cooking")
 QUALITY=85
 EFFORT=3
 THREADS=12
@@ -28,7 +29,7 @@ Recursively convert images to JPEG XL. Replaces originals only when smaller.
   -h, --help         Show this help
 
 Examples:
-  compress-jxl.sh                        # defaults on ~/Pictures/img
+  compress-jxl.sh                        # defaults on ~/Pictures/img/Downloads
   compress-jxl.sh 80                     # quality 80, default dir
   compress-jxl.sh 90 7                   # quality 90, effort 7
   compress-jxl.sh ~/Pics 80 5            # custom dir, q80, e5
@@ -169,7 +170,12 @@ YELLOW='\033[0;33m'
 RESET='\033[0m'
 
 # ── Find files ────────────────────────────────────────────
-echo "Scanning for images in: $BASE"
+PRUNE_ARGS=()
+for d in "${EXCLUDE_DIRS[@]}"; do
+  PRUNE_ARGS+=(\( -type d -name "$d" -prune \))
+  PRUNE_ARGS+=(-o)
+done
+echo "Scanning for images in: $BASE (excluding: ${EXCLUDE_DIRS[*]})"
 TEMP_LIST="/tmp/jxl_filelist.$$"
 COUNT_FILE="/tmp/jxl_count.$$"
 SKIPPED_FILE="/tmp/jxl_skipped.$$"
@@ -177,7 +183,7 @@ SAVED_FILE="/tmp/jxl_saved.$$"
 TOTAL_IN_FILE="/tmp/jxl_totalin.$$"
 LOCK_FILE="/tmp/jxl_lock.$$"
 
-find "$BASE" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) >"$TEMP_LIST"
+find "$BASE" "${PRUNE_ARGS[@]}" -type f \( -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" \) -print >"$TEMP_LIST"
 TOTAL=$(wc -l <"$TEMP_LIST")
 
 echo "Found $TOTAL files to convert"

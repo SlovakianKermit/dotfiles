@@ -2,37 +2,36 @@
 
 INPUT="${1:-.}"
 OUTPUT_DIR="${2:-./trimmed}"
+PARALLEL="${3:-$(nproc)}"
 mkdir -p "$OUTPUT_DIR"
 
-# Build file list depending on whether input is a file or directory
-if [[ -f "$INPUT" ]]; then
-  files=("$INPUT")
-elif [[ -d "$INPUT" ]]; then
-  files=("$INPUT"/*.ts)
-else
-  echo "Error: $INPUT is not a valid file or directory"
-  exit 1
-fi
-
-for f in "${files[@]}"; do
-  fname=$(basename "$f")
+process() {
+  local f="$1"
+  local fname=$(basename "$f")
   echo "Processing: $fname"
 
-  vid_end=$(ffprobe -v error -select_streams v:0 \
-    -show_entries packet=pts_time \
-    -of csv=p=0 "$f" 2>/dev/null | tail -1 | tr -d ',\n')
+  local vid_idx aud_idx vid_end aud_end diff needs_trim
 
-  aud_end=$(ffprobe -v error -select_streams a:0 \
-    -show_entries packet=pts_time \
-    -of csv=p=0 "$f" 2>/dev/null | tail -1 | tr -d ',\n')
+  vid_idx=$(ffprobe -v error -show_entries stream=index,codec_type -of csv=p=0 "$f" 2>/dev/null | awk -F, '$2=="video"{print $1; exit}')
+  aud_idx=$(ffprobe -v error -show_entries stream=index,codec_type -of csv=p=0 "$f" 2>/dev/null | awk -F, '$2=="audio"{print $1; exit}')
+
+  if [[ -z "$vid_idx" || -z "$aud_idx" ]]; then
+    echo "  SKIP: No video/audio stream found for $fname"
+    return
+  fi
+
+  read vid_end aud_end < <(
+    ffprobe -v error -show_entries packet=stream_index,pts_time -of csv=p=0 "$f" 2>/dev/null \
+    | awk -F, -v vi="$vid_idx" -v ai="$aud_idx" \
+        '{if($1==vi && $2>mv)mv=$2; else if($1==ai && $2>ma)ma=$2} END{print mv, ma}'
+  )
 
   if [[ -z "$vid_end" || -z "$aud_end" ]]; then
     echo "  SKIP: Could not read stream timestamps for $fname"
-    continue
+    return
   fi
 
-  diff=$(awk "BEGIN {print $aud_end - $vid_end}")
-  needs_trim=$(awk "BEGIN {print ($aud_end - $vid_end > 5) ? 1 : 0}")
+  read needs_trim diff < <(awk "BEGIN {d=$aud_end - $vid_end; print (d > 5) ? 1 : 0, d}")
 
   if [[ "$needs_trim" -eq 1 ]]; then
     echo "  Trimming at ${vid_end}s (audio ends at ${aud_end}s, diff=${diff}s)"
@@ -46,4 +45,18 @@ for f in "${files[@]}"; do
   else
     echo "  OK: streams roughly aligned (diff=${diff}s), skipping"
   fi
-done
+}
+
+if [[ -f "$INPUT" ]]; then
+  process "$INPUT"
+elif [[ -d "$INPUT" ]]; then
+  for f in "$INPUT"/*.ts; do
+    [[ -f "$f" ]] || continue
+    process "$f" &
+    while (( $(jobs -pr | wc -l) >= PARALLEL )); do wait -n; done
+  done
+  wait
+else
+  echo "Error: $INPUT is not a valid file or directory"
+  exit 1
+fi

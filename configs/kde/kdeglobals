@@ -159,7 +159,7 @@ Sort by=Date
 Sort directories first=true
 Sort hidden files last=false
 Sort reversed=false
-Speedbar Width=210
+Speedbar Width=211
 View Style=DetailTree
 
 [PreviewSettings]
