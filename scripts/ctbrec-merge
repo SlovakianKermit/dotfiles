@@ -61,6 +61,28 @@ def probe(path):
     return dur, vsig, asig
 
 
+def active_write_paths(root):
+    try:
+        r = subprocess.run(
+            ["lsof", "-w", "+D", root],
+            capture_output=True, text=True, timeout=600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  warn: lsof failed ({e}), relying on --age only", file=sys.stderr)
+        return None
+    active = set()
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 9 or parts[0] == "COMMAND":
+            continue
+        if not re.match(r'^\d+[uw]', parts[3]):
+            continue
+        path = parts[-1]
+        if path.startswith(root):
+            active.add(path)
+    return active
+
+
 def find_chain_groups(rows, threshold):
     groups = []
     cur = [rows[0]]
@@ -77,7 +99,7 @@ def find_chain_groups(rows, threshold):
     return groups
 
 
-def collect_entries(cpath, now, age):
+def collect_entries(cpath, now, age, active_paths=None):
     entries = []
     active = 0
     for name in sorted(os.listdir(cpath)):
@@ -90,6 +112,9 @@ def collect_entries(cpath, now, age):
         try:
             st = os.stat(path)
         except OSError:
+            continue
+        if active_paths and path in active_paths:
+            active += 1
             continue
         if now - st.st_mtime <= age:
             active += 1
@@ -167,7 +192,7 @@ def main():
         prog="ctbrec-merge",
         description="Losslessly merge ctbrec recordings of the same model that were split by a restart (small gaps).",
     )
-    ap.add_argument("--dir", default="/mnt/shared/Ctbrec/Recording",
+    ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
                     help="base directory (one folder per model, or flat .mts files)")
     ap.add_argument("--gap", type=int, default=300,
                     help="max gap in seconds between recordings to merge (default 300)")
@@ -175,6 +200,8 @@ def main():
                     help="extra seconds of slack when finding candidates via mtime (default 30)")
     ap.add_argument("--age", type=int, default=300,
                     help="skip files modified in the last N seconds (default 300)")
+    ap.add_argument("--no-lsof", action="store_true",
+                    help="skip the exact lsof open-for-write check (fall back to --age only)")
     ap.add_argument("--keep", action="store_true",
                     help="move merged originals to .merged_originals/ instead of deleting")
     ap.add_argument("--dry-run", action="store_true",
@@ -192,6 +219,11 @@ def main():
         return 1
 
     now = datetime.now().timestamp()
+    active_paths = None
+    if not args.no_lsof:
+        active_paths = active_write_paths(args.dir)
+        if active_paths is not None:
+            print(f"lsof: {len(active_paths)} file(s) currently open for writing")
     files = sorted(os.listdir(args.dir))
     total_merged = 0
     total_bytes = 0
@@ -206,7 +238,7 @@ def main():
     has_top_recordings = any(parse_filename(f) for f in top_files)
     model_groups = []
     if args.top_level or has_top_recordings:
-        entries, act = collect_entries(args.dir, now, args.age)
+        entries, act = collect_entries(args.dir, now, args.age, active_paths)
         active += act
         by_model = {}
         for e in entries:
@@ -215,7 +247,7 @@ def main():
     elif subdirs:
         for d in subdirs:
             cpath = os.path.join(args.dir, d)
-            entries, act = collect_entries(cpath, now, args.age)
+            entries, act = collect_entries(cpath, now, args.age, active_paths)
             active += act
             if len(entries) >= 2:
                 model_groups.append((d, entries))
@@ -241,7 +273,7 @@ def main():
     if skipped_params:
         print(f"      {skipped_params} files not merged (codec/params differ)")
     if active:
-        print(f"      {active} files skipped (modified within --age)")
+        print(f"      {active} files skipped (open for writing or modified within --age)")
     return 0
 
 

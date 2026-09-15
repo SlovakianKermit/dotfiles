@@ -1,0 +1,171 @@
+.TH CTBREC-MERGE 1 "2026-09-16" "ctbrec-merge" "User Commands"
+.SH NAME
+ctbrec-merge \- losslessly merge ctbrec recordings split by a restart
+.SH SYNOPSIS
+.B ctbrec-merge
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-merge
+merges MPEG transport stream recordings written by
+.BR ctbrec .
+When ctbrec is briefly stopped or restarted, a single model's stream is split
+into several
+.B .ts
+parts. This script finds parts belonging to the same model whose gap between
+the end of one part and the start of the next is small, and concatenates them
+losslessly (stream copy, no re-encode).
+.P
+Two layouts are supported:
+.IP \(bu 2
+One subdirectory per model under
+.BR \-\-dir
+(the default): each folder's recordings are compared against each other.
+.IP \(bu 2
+Flat
+.B .mts
+/.ts
+files directly in
+.BR \-\-dir ,
+in which case
+.B \-\-top\-level
+is implied and files are grouped by the model name in the filename.
+.P
+Two filename forms are recognised:
+.BI model _YYYY\-MM\-DD_HH\-MM\-SS_mmm.ts
+and
+.BI model _Chaturbate_YYYYMMDD\-HHMMSS.mts .
+.P
+A file that is currently open for writing is never merged: the script checks
+for open write file descriptors with
+.BR lsof (8)
+and additionally skips files modified within
+.B \-\-age
+seconds. Parts whose video or audio codec parameters differ are left alone.
+.P
+Requires
+.BR python3 (1),
+.BR ffmpeg (1),
+.BR ffprobe (1),
+and
+.BR lsof (8)
+(optional; see
+.BR \-\-no\-lsof ).
+.SH OPTIONS
+.TP
+.B \-\-dir \fIDIR\fR
+Base directory to scan. Defaults to
+.BR /mnt/pve/Data_Storage/ctbrec .
+.TP
+.B \-\-gap \fISECONDS\fR
+Maximum gap, in seconds, between the end of one part and the start of the next
+for the parts to be merged. Defaults to
+.BR 300
+(5 minutes).
+.TP
+.B \-\-slack \fISECONDS\fR
+Extra slack, in seconds, allowed when pre-selecting candidates by modification
+time. Defaults to
+.BR 30 .
+.TP
+.B \-\-age \fISECONDS\fR
+Skip files modified within the last
+.I SECONDS
+seconds, as a fallback active-file check. Defaults to
+.BR 300 .
+.TP
+.B \-\-no\-lsof
+Do not run the exact
+.B lsof
+open-for-write check; rely on
+.B \-\-age
+only.
+.TP
+.B \-\-keep
+Move the original parts to a
+.B .merged_originals/
+subdirectory instead of deleting them.
+.TP
+.B \-\-dry\-run
+Print the merge plan without changing anything.
+.TP
+.B \-\-top\-level
+Only process files directly in
+.BR \-\-dir ;
+never enter subdirectories.
+.TP
+.B \-\-verify
+Verify the merged output duration with
+.BR ffprobe (1)
+before deleting the originals (extra full read of the output).
+.TP
+.B \-j, \-\-jobs \fIN\fR
+Number of parallel
+.B ffprobe
+workers. Defaults to
+.BR 8 .
+.SH BEHAVIOUR
+.IP \(bu 2
+Each candidate part is probed with
+.B ffprobe
+for duration and video/audio codec parameters; adjacent parts with matching
+parameters and a gap within
+.B \-\-gap
+are merged.
+.IP \(bu 2
+Merging uses
+.B ffmpeg \-f concat \-c copy
+into a
+.BI name .part
+file, which is renamed into place only after it is complete, so a half-written
+file never looks final.
+.IP \(bu 2
+The output keeps the first part's filename, so the merged file stays in the
+same directory as its inputs.
+.IP \(bu 2
+Originals are deleted only after the output size is within tolerance of the
+input sum (and, with
+.BR \-\-verify ,
+the duration matches). If ffmpeg fails or the check fails, the originals are
+kept.
+.SH FILES
+.TP
+.B .merged_originals/
+Where originals are moved when
+.B \-\-keep
+is used.
+.SH EXAMPLES
+Preview the merge plan for the default server directory:
+.IP
+.EX
+ctbrec-merge \-\-dry\-run
+.EE
+.P
+Merge for real, keeping the originals:
+.IP
+.EX
+ctbrec-merge \-\-keep \-\-verify
+.EE
+.P
+Merge the old flat directory layout:
+.IP
+.EX
+ctbrec-merge \-\-dir /mnt/shared/Ctbrec/Recording \-\-top\-level
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Completed normally.
+.TP
+.B 1
+.B \-\-dir
+is not a directory.
+.TP
+.B 130
+Interrupted; a partial
+.B .part
+output is removed.
+.SH SEE ALSO
+.BR ctbrec-merge-remote (1),
+.BR ffmpeg (1),
+.BR ffprobe (1),
+.BR lsof (8)

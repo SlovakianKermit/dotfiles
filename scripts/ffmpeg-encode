@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Batch HEVC VAAPI encoder with curses TUI — pause, resume, and live queue."""
+"""Batch VAAPI encoder (HEVC or AV1) with curses TUI — pause, resume, live queue.
+
+Both codecs use constant-quality mode: HEVC via -qp (0-51), AV1 via VAAPI
+CQP -global_quality (0-255).  Select the codec with --codec hevc|av1 (the
+ffmpeg-encode-av1 wrapper passes --codec av1)."""
 
 import argparse
 import curses
@@ -18,13 +22,35 @@ from typing import List, Optional, Tuple
 # ═══════════════════════════════════════════════════════════════════════
 
 EXTENSIONS = ("mkv", "mp4", "avi", "mov", "webm", "ts", "mts", "webp")
-PRESET_FLAGS = {"speed": ["-preset", "fast"], "balanced": [], "quality": ["-preset", "slow"]}
 HWACCEL = "vaapi"
-ENCODER = "hevc_vaapi"
 DEFAULT_INPUT_DIR = "/mnt/shared/Compressing"
 DEFAULT_OUTPUT_DIR = "/mnt/shared/Handbraked"
-DEFAULT_QUALITY = 27
 DEFAULT_PRESET = "balanced"
+DEFAULT_CODEC = "hevc"
+
+# Per-codec settings.  Both encoders run in constant-quality mode: HEVC via
+# its native -qp (0-51), AV1 via VAAPI CQP -global_quality (0-255, roughly
+# 4x the HEVC QP).  The quality scale differs per codec, so the default and
+# the meaning of -q change with --codec.
+CODECS = {
+    "hevc": {
+        "encoder": "hevc_vaapi",
+        "quality_min": 0,
+        "quality_max": 51,
+        "default_quality": 27,
+    },
+    "av1": {
+        "encoder": "av1_vaapi",
+        "quality_min": 0,
+        "quality_max": 255,
+        "default_quality": 97,
+    },
+}
+
+# VAAPI exposes no quality preset; -async_depth only trades parallelism for
+# speed (higher = faster, no effect on quality).  Keep the old preset names
+# as a speed control.
+PRESET_ASYNC = {"speed": 8, "balanced": 4, "quality": 2}
 
 # ═══════════════════════════════════════════════════════════════════════
 # Data
@@ -171,39 +197,57 @@ def _hw_decode_failed(stderr_text: str) -> bool:
                "Impossible to convert")
     return any(m in stderr_text for m in markers)
 
-def _build_ffmpeg_cmd(job: Job, preset: str, quality: int, device: str) -> List[str]:
+def _audio_mux_failed(stderr_text: str) -> bool:
+    # Corrupt/unparseable ADTS AAC (common in MPEG-TS captures) makes the
+    # Matroska muxer abort when the audio is stream-copied.  Re-encode it.
+    markers = ("Error parsing AAC extradata",
+               "unable to determine samplerate")
+    return any(m in stderr_text for m in markers)
+
+def _rate_control_args(codec: str, preset: str, quality: int) -> List[str]:
+    cfg = CODECS[codec]
+    args = ["-c:v", cfg["encoder"]]
+    if codec == "hevc":
+        args += ["-b:v", "0", "-qp", str(quality)]
+    else:
+        args += ["-rc_mode", "CQP", "-global_quality", str(quality)]
+    args += ["-async_depth", str(PRESET_ASYNC[preset])]
+    return args
+
+def _audio_args(copy_audio: bool) -> List[str]:
+    if copy_audio:
+        return ["-c:a", "copy"]
+    return ["-c:a", "aac", "-b:a", "160k"]
+
+def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
+                      device: str, copy_audio: bool = True) -> List[str]:
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
         "-vaapi_device", device,
         "-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL,
         "-i", job.input_path,
-        "-c:v", ENCODER,
     ]
-    if PRESET_FLAGS[preset]:
-        cmd.extend(PRESET_FLAGS[preset])
-    cmd.extend(["-b:v", "0", "-qp", str(quality)])
-    cmd.extend(["-c:a", "copy"])
+    cmd.extend(_rate_control_args(codec, preset, quality))
+    cmd.extend(_audio_args(copy_audio))
     cmd.extend(["-map", "0:v?", "-map", "0:a?"])
     cmd.extend(["-y", job.output_path])
     return cmd
 
-def _build_fallback_ffmpeg_cmd(job: Job, preset: str, quality: int, device: str) -> List[str]:
+def _build_fallback_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
+                               device: str, copy_audio: bool = True) -> List[str]:
     # Software decode + hwupload: for streams the VAAPI h264 decoder can't
     # initialise on (e.g. malformed 4K SPS), decode on CPU and still let the
-    # GPU do the HEVC encode.
+    # GPU do the encode.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
         "-vaapi_device", device,
         "-i", job.input_path,
         "-vf", "format=nv12,hwupload",
-        "-c:v", ENCODER,
     ]
-    if PRESET_FLAGS[preset]:
-        cmd.extend(PRESET_FLAGS[preset])
-    cmd.extend(["-b:v", "0", "-qp", str(quality)])
-    cmd.extend(["-c:a", "copy"])
+    cmd.extend(_rate_control_args(codec, preset, quality))
+    cmd.extend(_audio_args(copy_audio))
     cmd.extend(["-map", "0:v?", "-map", "0:a?"])
     cmd.extend(["-y", job.output_path])
     return cmd
@@ -271,23 +315,38 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
         with state.lock:
             state.ffmpeg_pids.discard(proc.pid)
 
-def ffmpeg_worker(job: Job, state: SharedState, preset: str, quality: int,
-                  delete_original: bool):
+def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
+                  quality: int, delete_original: bool):
     device = find_vaapi_device()
-    cmd = _build_ffmpeg_cmd(job, preset, quality, device)
+    sw_decode = False
+    copy_audio = True
+
+    def attempt() -> Tuple[int, str]:
+        builder = _build_fallback_ffmpeg_cmd if sw_decode else _build_ffmpeg_cmd
+        return _run_ffmpeg(
+            builder(job, codec, preset, quality, device, copy_audio), job, state)
 
     try:
-        returncode, stderr_text = _run_ffmpeg(cmd, job, state)
+        returncode, stderr_text = attempt()
 
         # VAAPI decode failed (e.g. malformed 4K H.264 SPS the hw decoder
         # refuses): retry once with software decode + hwupload so the GPU
-        # still does the HEVC encode.
+        # still does the encode.
         if returncode != 0 and _hw_decode_failed(stderr_text):
             with state.lock:
                 state.skip = False
             job.status = "encoding"
-            fallback = _build_fallback_ffmpeg_cmd(job, preset, quality, device)
-            returncode, stderr_text = _run_ffmpeg(fallback, job, state)
+            sw_decode = True
+            returncode, stderr_text = attempt()
+
+        # Muxing a stream-copied ADTS AAC into Matroska can fail on corrupt
+        # captures: retry once with the audio re-encoded as AAC.
+        if returncode != 0 and _audio_mux_failed(stderr_text):
+            with state.lock:
+                state.skip = False
+            job.status = "encoding"
+            copy_audio = False
+            returncode, stderr_text = attempt()
 
         with state.lock:
             if state.skip:
@@ -432,8 +491,8 @@ class TUI:
                     job.paused_accum = 0.0
                 t = threading.Thread(
                     target=ffmpeg_worker,
-                    args=(job, self.state, self.args.preset, self.args.quality,
-                          self.args.delete),
+                    args=(job, self.state, self.args.codec, self.args.preset,
+                          self.args.quality, self.args.delete),
                     daemon=True,
                 )
                 t.start()
@@ -685,7 +744,7 @@ class TUI:
 
         pending_count = sum(1 for j in self.queue.jobs if j.status == "pending")
 
-        left = f" ffmpeg-encode "
+        left = f" ffmpeg-encode [{self.args.codec}] "
         right = f" Elapsed: {ts}  Queued: {pending_count} "
 
         # If right side would overflow, shorten left
@@ -977,7 +1036,7 @@ class TUI:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Batch HEVC VAAPI encoder with curses TUI.",
+        description="Batch VAAPI encoder (HEVC or AV1) with curses TUI.",
     )
     p.add_argument("-i", default=DEFAULT_INPUT_DIR,
                    help="Input directory (batch mode)")
@@ -987,19 +1046,22 @@ def parse_args() -> argparse.Namespace:
                    help="Single input file")
     p.add_argument("--output",
                    help="Single output file")
+    p.add_argument("--codec", default=DEFAULT_CODEC, choices=sorted(CODECS),
+                   help=f"Video codec (default: {DEFAULT_CODEC})")
     p.add_argument("-p", dest="preset", default=DEFAULT_PRESET,
                    choices=["speed", "balanced", "quality"],
-                   help="Encoding preset (default: balanced)")
-    p.add_argument("-q", dest="quality", type=int, default=DEFAULT_QUALITY,
-                   help=f"QP value — lower = better quality (default: {DEFAULT_QUALITY})")
+                   help="Speed preset — only affects parallelism (default: balanced)")
+    p.add_argument("-q", dest="quality", type=int, default=None,
+                   help="Quality target — lower = better "
+                        "(HEVC 0-51, AV1 0-255; default depends on --codec)")
     p.add_argument("-j", "--jobs", dest="jobs", type=int, default=1,
                    help="Number of files to encode in parallel (default: 1)")
     p.add_argument("-n", dest="dry_run", action="store_true",
                    help="Dry run: list files and exit")
     p.add_argument("-k", "--keep", dest="keep", action="store_true",
-                   help="Keep original files (default: delete originals only when encode is smaller)")
-    p.add_argument("-D", dest="flag_D", action="store_true",
-                   help=argparse.SUPPRESS)  # legacy compat, delete is already default
+                   help="Keep both the original and the encoded file "
+                        "(no deletion; default: delete the original only when "
+                        "the encode is smaller)")
     return p.parse_args()
 
 def main_curses(stdscr, queue: Queue, state: SharedState, args):
@@ -1008,10 +1070,16 @@ def main_curses(stdscr, queue: Queue, state: SharedState, args):
 
 def main():
     args = parse_args()
-    args.delete = not args.keep  # delete is default; -k keeps, -D is legacy no-op
+    args.delete = not args.keep  # delete is default; -k keeps both files
     if args.jobs < 1:
         print("Error: --jobs must be >= 1", file=sys.stderr)
         sys.exit(1)
+
+    # Resolve the codec-dependent quality default and clamp to its valid range.
+    cfg = CODECS[args.codec]
+    if args.quality is None:
+        args.quality = cfg["default_quality"]
+    args.quality = max(cfg["quality_min"], min(cfg["quality_max"], args.quality))
 
     # ── Dry run ─────────────────────────────────────────────────────
     if args.dry_run:

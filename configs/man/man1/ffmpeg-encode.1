@@ -1,4 +1,4 @@
-.TH FFMPEG-ENCODE 1 "July 2026" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-09-12" "ffmpeg-encode" "User Commands"
 .SH NAME
 ffmpeg-encode \- VAAPI HEVC batch video encoder
 .SH SYNOPSIS
@@ -103,11 +103,10 @@ Dry run. Print the
 .B ffmpeg
 command that would be run; do not encode or delete anything.
 .TP
-.B \-D
-Delete the original file after a successful encode.
-This is
-.B on by default
-(the flag exists for explicit use; there is currently no opt-out flag).
+.BI \-k ", " \-\-keep
+Keep both the original and the encoded file; nothing is deleted, even when
+the encode is larger than the original. This is the only opt-out from the
+default deletion behaviour.
 .TP
 .B \-h
 Show a short help message and exit.
@@ -122,6 +121,10 @@ via
 Audio streams are
 .B copied
 (not re-encoded)
+.IP \(bu 2
+If copying the audio makes the Matroska muxer fail (for example a corrupt
+ADTS AAC lead-in in an MPEG-TS capture that ffmpeg cannot parse), the file
+is retried once with the audio re-encoded as AAC at 160 kbit/s
 .IP \(bu 2
 Only video and audio are mapped (\fB\-map 0:v? \-map 0:a?\fR); subtitles
 are skipped to avoid failures on some broadcast sources (e.g. DVB/teletext on
@@ -183,6 +186,12 @@ Encode a batch of small files with three parallel jobs:
 .EX
 ffmpeg-encode \-i ~/Videos/raw \-o ~/Videos/encoded \-j 3
 .EE
+.P
+Keep both the original and the encoded file:
+.IP
+.EX
+ffmpeg-encode \-k
+.EE
 .SH INTERACTIVE KEYS
 .TP
 .B p
@@ -231,9 +240,5 @@ Default output directory (batch mode).
 .BR ffmpeg (1),
 .BR ffprobe (1),
 .BR vainfo (1)
-.SH BUGS
-Deleting the original after a successful encode is enabled by default and
-cannot currently be turned off with a flag (only via editing the script
-defaults).
 .SH AUTHOR
 Written for local use with VAAPI on AMD RDNA4 (RX 9070 class).

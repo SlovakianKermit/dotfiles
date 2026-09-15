@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER="${CTBREC_MERGE_SERVER:-proxmox}"
+REMOTE_BIN="${CTBREC_MERGE_BIN:-/usr/local/bin/ctbrec-merge}"
+REMOTE_DIR="${CTBREC_MERGE_DIR:-/mnt/pve/Data_Storage/ctbrec}"
+
+exec ssh -o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes \
+  "$SERVER" "$REMOTE_BIN" --dir "$REMOTE_DIR" "$@"

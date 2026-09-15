@@ -18,6 +18,7 @@ qimgv
 r2modman-bin
 sober-bin
 typing_test
+vesktop
 wthrr-bin
 xnviewmp
 y-cruncher

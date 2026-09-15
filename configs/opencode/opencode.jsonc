@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "deepseek/deepseek-v4-flash",
+  "model": "deepseek/deepseek-flash",
   "plugin": [
     "opencode-pty",
     "@tarquinen/opencode-dcp",
@@ -17,15 +17,15 @@
         "deepseek-v4-pro": {
           "name": "DeepSeek V4 Pro"
         },
-        "deepseek-v4-flash": {
-          "name": "DeepSeek V4 Flash"
+        "deepseek-flash": {
+          "name": "DeepSeek Flash"
         }
       }
     }
   },
   "agent": {
     "compaction": {
-      "model": "deepseek/deepseek-v4-flash"
+      "model": "deepseek/deepseek-flash"
     },
     "plan": {
       "permission": {
@@ -56,12 +56,25 @@
     "read": "allow",
     "edit": {
       "*": "ask",
-      ".local/bin/**": "allow",
+      "**/.local/bin/**": "allow",
       "tmp/**": "allow"
     },
     "external_directory": {
-      "~/.local/bin/**": "allow",
-      "~/tmp/**": "allow"
+      "**/.local/bin/**": "allow",
+      "**/tmp/**": "allow"
+    },
+    "bash": {
+      "*": "allow",
+      "*rm -rf*": "deny",
+      "*rm -fr*": "deny",
+      "*shred *": "deny",
+      "*wipefs*": "deny",
+      "*mkfs*": "deny",
+      "*dd if=*": "deny",
+      "*> /dev/sd*": "deny",
+      "*shutdown*": "deny",
+      "*reboot*": "deny",
+      "*poweroff*": "deny"
     },
     "searxng": "allow"
   },

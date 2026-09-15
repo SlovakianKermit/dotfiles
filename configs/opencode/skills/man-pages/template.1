@@ -1,0 +1,83 @@
+.TH NAME 1 "YYYY-MM-DD" "scriptname" "User Commands"
+.SH NAME
+name \- one-line lowercase summary
+.SH SYNOPSIS
+.B name
+[\fIOPTIONS\fR]
+.P
+.B name
+.B \-f
+\fIFILE\fR
+.SH DESCRIPTION
+.B name
+does one thing, described in a short paragraph. Mention defaults and any
+external commands it depends on, e.g.\&
+.BR ffmpeg (1)
+and
+.BR fzf (1).
+.P
+A second paragraph for details, edge cases, and side effects.
+.SH OPTIONS
+.TP
+.BI \-f " FILE"
+Operate on
+.IR FILE .
+.TP
+.BI \-o " DIR"
+Output directory. Default:
+.IR ~/output .
+.TP
+.B \-n
+Dry run. Print what would happen; change nothing.
+.TP
+.B \-h
+Show a short help message and exit.
+.SH BEHAVIOUR
+.SS What it does
+.IP \(bu 2
+First behaviour bullet.
+.IP \(bu 2
+Second behaviour bullet.
+.SS Requirements
+.IP \(bu 2
+.B ffmpeg
+and
+.B vainfo
+(from
+.BR libva-utils )
+.SH EXAMPLES
+Run with defaults:
+.IP
+.EX
+name
+.EE
+.P
+Custom input and output:
+.IP
+.EX
+name \-f input.mkv \-o ~/Videos/out
+.EE
+.P
+Show what would run without doing it:
+.IP
+.EX
+name \-n \-f input.mkv
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure: bad options, missing input, or a dependency is unavailable.
+.SH FILES
+.TP
+.I ~/output
+Default output directory.
+.SH SEE ALSO
+.BR related-tool (1),
+.BR other-script (1)
+.SH BUGS
+Known limitations go here; omit the section if there are none.
+.SH AUTHOR
+Written for local use.

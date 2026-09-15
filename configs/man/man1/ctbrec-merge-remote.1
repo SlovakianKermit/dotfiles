@@ -1,0 +1,67 @@
+.TH CTBREC-MERGE-REMOTE 1 "2026-09-16" "ctbrec-merge-remote" "User Commands"
+.SH NAME
+ctbrec-merge-remote \- run ctbrec-merge on the Proxmox server over ssh
+.SH SYNOPSIS
+.B ctbrec-merge-remote
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-merge-remote
+is a thin local wrapper that runs
+.BR ctbrec-merge (1)
+on the Proxmox server.
+.P
+It connects with
+.BR ssh (1)
+(non-interactive, no TTY, with the host's
+.B RemoteCommand
+disabled) and executes
+.B /usr/local/bin/ctbrec-merge
+with
+.B \-\-dir /mnt/pve/Data_Storage/ctbrec
+plus any arguments given to the wrapper. All scanning, probing, and merging
+happen on the server; nothing is copied to the local machine. Only standard
+output and standard error are streamed back, and the remote exit status is
+returned as the wrapper's exit status.
+.SH OPTIONS
+Every option is forwarded verbatim to
+.BR ctbrec-merge (1);
+see that page for the full list. The most useful are
+.BR \-\-dry\-run ,
+.BR \-\-keep ,
+and
+.BR \-\-verify .
+.SH ENVIRONMENT
+.TP
+.B CTBREC_MERGE_SERVER
+Ssh host (or alias from
+.BR ssh_config (5))
+to run on. Defaults to
+.BR proxmox .
+.TP
+.B CTBREC_MERGE_BIN
+Path to the remote executable. Defaults to
+.BR /usr/local/bin/ctbrec-merge .
+.TP
+.B CTBREC_MERGE_DIR
+Remote recordings root passed as
+.BR \-\-dir .
+Defaults to
+.BR /mnt/pve/Data_Storage/ctbrec .
+.SH EXAMPLES
+Preview the merge plan on the server:
+.IP
+.EX
+ctbrec-merge-remote \-\-dry\-run
+.EE
+.P
+Merge on the server, verifying each output:
+.IP
+.EX
+ctbrec-merge-remote \-\-verify
+.EE
+.SH EXIT STATUS
+The exit status of the remote
+.BR ctbrec-merge (1).
+.SH SEE ALSO
+.BR ctbrec-merge (1),
+.BR ssh (1)

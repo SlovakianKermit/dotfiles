@@ -63,7 +63,6 @@ shelly
 speedtest++
 sunshine
 ventoy-bin
-vesktop
 vulkan-radeon
 xpadneo-dkms
 yay-bin

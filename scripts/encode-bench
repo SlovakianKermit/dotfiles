@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""VMAF calibration bench for ffmpeg-encode.
+
+Encodes short samples of real files with a baseline (HEVC CQP) and a sweep of
+AV1 CQP qualities, scores each against the source with libvmaf, and reports
+size vs quality so you can pick the AV1 quality that matches your current HEVC
+output for the biggest size win.
+
+VMAF is run with n_subsample (default 5): scoring every frame of a 1080p clip
+makes libvmaf buffer the whole stream and peak at several GB of RAM.
+
+Reuses ffmpeg-encode's own command builder, so it measures the exact pipeline
+the TUI uses.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+MAIN = os.path.join(HERE, "ffmpeg-encode")
+
+
+def load_encoder():
+    loader = importlib.machinery.SourceFileLoader("ffmpeg_encode", MAIN)
+    spec = importlib.util.spec_from_loader("ffmpeg_encode", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def extract_sample(fe, src, dest, offset, seconds):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-ss", str(offset), "-i", src, "-t", str(seconds),
+           "-c", "copy", "-y", dest]
+    r = run(cmd)
+    if r.returncode != 0 or not os.path.exists(dest):
+        raise RuntimeError(f"sample extract failed for {src}:\n{r.stderr}")
+    return dest
+
+
+def old_hevc_cqp_cmd(fe, sample, quality, device, out):
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-vaapi_device", device,
+        "-hwaccel", fe.HWACCEL, "-hwaccel_output_format", fe.HWACCEL,
+        "-i", sample,
+        "-c:v", "hevc_vaapi", "-b:v", "0", "-qp", str(quality),
+        "-c:a", "copy", "-map", "0:v?", "-map", "0:a?",
+        "-y", out,
+    ]
+
+
+def new_cmd(fe, sample, codec, quality, device, out):
+    job = fe.Job(input_path=sample, output_path=out,
+                 input_size=os.path.getsize(sample),
+                 duration=fe.get_duration(sample))
+    return fe._build_ffmpeg_cmd(job, codec, "balanced", quality, device)
+
+
+def vmaf(encoded, reference, n_threads, n_subsample):
+    fd, log = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", encoded, "-i", reference,
+            "-lavfi",
+            f"[0:v][1:v]libvmaf=log_fmt=json:log_path={log}:"
+            f"n_threads={n_threads}:n_subsample={n_subsample}",
+            "-f", "null", "-",
+        ]
+        r = run(cmd)
+        if r.returncode != 0:
+            raise RuntimeError(f"vmaf failed:\n{r.stderr}")
+        with open(log) as fh:
+            data = json.load(fh)
+        return float(data["pooled_metrics"]["vmaf"]["mean"])
+    finally:
+        if os.path.exists(log):
+            os.remove(log)
+
+
+def fmt_size(n):
+    return f"{n/1e6:8.2f} MB"
+
+
+def bench_file(fe, src, args, device, tmp):
+    name = os.path.basename(src)
+    sample = os.path.join(tmp, f"sample_{os.getpid()}.mkv")
+    extract_sample(fe, src, sample, args.offset, args.seconds)
+    src_size = os.path.getsize(sample)
+
+    results = []  # (label, codec, quality, size, vmaf)
+
+    def measure(label, codec, quality, cmd, out):
+        r = run(cmd)
+        if r.returncode != 0 or not os.path.exists(out):
+            print(f"  !! {label} failed: {r.stderr.strip()[:300]}")
+            return
+        size = os.path.getsize(out)
+        score = vmaf(out, sample, args.threads, args.n_subsample)
+        results.append((label, codec, quality, size, score))
+        if not args.keep:
+            os.remove(out)
+        print(f"  {label:22s} {fmt_size(size)}  vmaf {score:6.2f}")
+
+    print(f"\n=== {name}  (sample {args.seconds}s @ {args.offset}s, "
+          f"{src_size/1e6:.1f} MB) ===")
+    print("  encoding baseline + candidates...")
+    out = os.path.join(tmp, "base.mkv")
+    measure(f"HEVC CQP q{args.hevc_quality}", "hevc-cqp", args.hevc_quality,
+            old_hevc_cqp_cmd(fe, sample, args.hevc_quality, device, out), out)
+    for q in args.hevc_values:
+        out = os.path.join(tmp, f"hq_{q}.mkv")
+        measure(f"HEVC CQP q{q}", "hevc", q,
+                new_cmd(fe, sample, "hevc", q, device, out), out)
+    for q in args.av1_values:
+        out = os.path.join(tmp, f"av1_{q}.mkv")
+        measure(f"AV1 CQP q{q}", "av1", q,
+                new_cmd(fe, sample, "av1", q, device, out), out)
+
+    if not results:
+        print("  no successful encodes")
+        return
+    baseline = next((r for r in results if r[1] == "hevc-cqp"), None)
+    print(f"\n  {'setting':22s} {'size':>10s} {'vs base':>8s} {'vmaf':>7s} {'vs base':>8s}")
+    for label, codec, q, size, score in results:
+        dsize = f"{size/baseline[3]*100:6.1f}%" if baseline else "   -  "
+        dvmaf = f"{score-baseline[4]:+6.2f}" if baseline else "   -  "
+        print(f"  {label:22s} {fmt_size(size)} {dsize:>8s} {score:7.2f} {dvmaf:>8s}")
+
+    if baseline:
+        tol = args.tolerance
+        av1 = [r for r in results if r[1] == "av1"]
+        ok = [r for r in av1 if r[4] >= baseline[4] - tol]
+        if ok:
+            best = min(ok, key=lambda r: r[3])
+            saving = (1 - best[3] / baseline[3]) * 100
+            print(f"\n  -> smallest AV1 within {tol:g} VMAF of baseline: "
+                  f"q{best[2]}  ({best[3]/1e6:.1f} MB, "
+                  f"{saving:.1f}% smaller than HEVC CQP q{args.hevc_quality}, "
+                  f"vmaf {best[4]:.2f})")
+        elif av1:
+            best = max(av1, key=lambda r: r[4])
+            print(f"\n  -> no AV1 setting matched baseline VMAF "
+                  f"({baseline[4]:.2f}); best was q{best[2]} at {best[4]:.2f}. "
+                  f"Try lower --av1-values.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="VMAF calibration for ffmpeg-encode")
+    ap.add_argument("files", nargs="+", help="source files to sample")
+    ap.add_argument("-t", "--seconds", type=float, default=30.0,
+                    help="sample length (default: 30)")
+    ap.add_argument("-s", "--offset", type=float, default=5.0,
+                    help="sample start offset (default: 5)")
+    ap.add_argument("--hevc-quality", type=int, default=27,
+                    help="HEVC baseline CQP quality (default: 27)")
+    ap.add_argument("--hevc-values", type=int, nargs="+", default=[],
+                    help="extra HEVC -qp values to sweep (optional)")
+    ap.add_argument("--av1-values", type=int, nargs="+",
+                    default=[90, 95, 97, 100, 105],
+                    help="AV1 CQP -global_quality values to sweep")
+    ap.add_argument("--tolerance", type=float, default=0.5,
+                    help="allowed VMAF drop vs baseline (default: 0.5)")
+    ap.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 4) // 2),
+                    help="libvmaf threads")
+    ap.add_argument("--n-subsample", type=int, default=5,
+                    help="score every Nth frame (default: 5; keeps libvmaf RAM low)")
+    ap.add_argument("--keep", action="store_true", help="keep encoded samples")
+    args = ap.parse_args()
+
+    fe = load_encoder()
+    device = fe.find_vaapi_device()
+    if not device:
+        print("error: no VAAPI device found", file=sys.stderr)
+        sys.exit(1)
+
+    tmp = tempfile.mkdtemp(prefix="encode-bench-")
+    try:
+        for src in args.files:
+            if not os.path.exists(src):
+                print(f"skip (missing): {src}", file=sys.stderr)
+                continue
+            bench_file(fe, src, args, device, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()

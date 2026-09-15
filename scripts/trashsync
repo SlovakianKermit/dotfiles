@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Sync KDE's trashrc "Empty" flag with the real state of the trash.
+#
+# Workaround for KDE bug 293651: when a non-KDE app (e.g. LosslessCut via
+# GIO/Electron) moves files to a volume trash, KDE never updates
+# ~/.config/trashrc [Status] Empty, so Dolphin's "Empty Trash" action stays
+# greyed out even though the trash is not empty.
+#
+# Invoked by shared-trash-sync.path whenever a watched trash changes.
+
+set -euo pipefail
+
+TRASH_DIRS=(
+    "$HOME/.local/share/Trash"
+    "/mnt/shared/.Trash-1000"
+)
+
+shopt -s nullglob
+
+empty=true
+for dir in "${TRASH_DIRS[@]}"; do
+    [[ -d "$dir/info" ]] || continue
+    entries=("$dir"/info/*.trashinfo)
+    if (( ${#entries[@]} > 0 )); then
+        empty=false
+        break
+    fi
+done
+
+kwriteconfig6 --file trashrc --group Status --key Empty --type bool "$empty"
