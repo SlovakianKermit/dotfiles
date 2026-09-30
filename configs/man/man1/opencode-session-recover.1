@@ -1,0 +1,149 @@
+.TH OPENCODE-SESSION-RECOVER 1 "2026-09-30" "opencode-session-recover" "User Commands"
+.SH NAME
+opencode-session-recover \- repair opencode v1 to v2 session visibility
+.SH SYNOPSIS
+.B opencode-session-recover
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B opencode-session-recover
+repairs the session history database used by
+.BR opencode (1)
+after a V1 to V2 upgrade. The one\-time V1 to V2 history migration copies rows
+from the legacy
+.IR session ", " message " and " part
+tables into
+.IR session_v2 " and " session_message .
+It is gated by the
+.B migration.v1\-v2
+key in the
+.B kv
+table and runs once.
+.P
+Two problems follow from that design. First, sessions created in V1 after the
+migration completed are never copied. Second, every copied V1 session keeps the
+legacy project id
+.IR global ,
+which V2 does not list for a real directory, so old conversations are hidden
+even though they are present.
+.B opencode-session-recover
+fixes both: it re\-runs the migration idempotently for any session still
+missing, then re\-files legacy
+.I global
+sessions under the project V2 now uses for their directory.
+.P
+The legacy
+.IR session ", " message " and " part
+tables are never modified, so they remain a fallback copy. The database lives
+under
+.IR $XDG_DATA_HOME/opencode/ ,
+or
+.I ~/.local/share/opencode/
+when unset.
+.SH OPTIONS
+.TP
+.B \-\-dry\-run
+Operate on a throwaway copy of the database and change nothing. The copy is
+snapshotted with
+.BR sqlite3 (1)
+.B VACUUM
+.BR INTO ,
+an isolated server runs the migration against it, and the resulting counts and
+newly imported sessions are printed.
+.TP
+.BR \-\-yes ", " \-y
+Do not prompt for confirmation before modifying the live database.
+.TP
+.BI \-\-db " PATH"
+Operate on
+.I PATH
+instead of the default database. Overrides
+.BR OPENCODE_DB .
+.TP
+.BR \-h ", " \-\-help
+Show a short help message and exit.
+.SH BEHAVIOUR
+.SS What it does
+.IP \(bu 2
+Counts sessions present in the legacy
+.I session
+table but missing from
+.IR session_v2 .
+.IP \(bu 2
+If any are missing, stops the OpenCode service, snapshots the database, sets
+.B migration.v1\-v2
+to
+.B {"phase":"sessions"}
+and starts the service so its boot migration imports them. The value is set
+rather than deleted on purpose: an undefined phase also clears the
+.I event
+table.
+.IP \(bu 2
+Stops the service again and updates
+.I session_v2.project_id
+from
+.I global
+to the project whose worktree matches each session's directory; rows with no
+matching project are left untouched.
+.IP \(bu 2
+Restarts the service and prints per\-metric counts plus the sessions imported by
+that run.
+.PP
+If nothing is missing and nothing needs re\-filing, the script reports that the
+database is already consistent and exits without touching it.
+.SS Requirements
+.IP \(bu 2
+.BR sqlite3 (1)
+must be installed.
+.IP \(bu 2
+.BR opencode (1)
+must be on
+.BR PATH .
+.IP \(bu 2
+Close every OpenCode terminal and desktop client before a real run: the script
+stops and restarts the shared background service, which disconnects them.
+.SS Environment
+.TP
+.B OPENCODE_DB
+Default database path when
+.B \-\-db
+is not given.
+.TP
+.B OPENCODE_RECOVER_TIMEOUT
+Seconds to wait for the migration to report completion. Default:
+.IR 300 .
+.SH EXAMPLES
+Preview the repair without changing anything:
+.IP
+.EX
+opencode-session-recover \-\-dry\-run
+.EE
+.P
+Apply the repair without a confirmation prompt:
+.IP
+.EX
+opencode-session-recover \-\-yes
+.EE
+.P
+Operate on a specific database:
+.IP
+.EX
+opencode-session-recover \-\-db /tmp/opencode/opencode.db
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, or nothing was left to do.
+.TP
+.B 1
+Failure: bad options, missing database, missing dependency, or a failed backup.
+.SH FILES
+.TP
+.I ~/.local/share/opencode/opencode.db
+Default OpenCode database.
+.TP
+.IR ~/.local/share/opencode/opencode.db.bak\- YYYYMMDD\-HHMMSS
+Consistent snapshot written before any modification. Keep it until the repaired
+database has been verified, then remove it by hand.
+.SH SEE ALSO
+.BR sqlite3 (1),
+.BR dotfiles-sync (1)

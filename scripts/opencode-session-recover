@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+#
+# opencode-session-recover - repair V1 -> V2 session visibility.
+#
+# The one-time OpenCode V1 -> V2 history migration copies rows from the legacy
+# `session` / `message` / `part` tables into `session_v2` / `session_message`.
+# It is gated by the kv key migration.v1-v2 and runs once. Sessions created in
+# V1 after it completed are never copied, and every copied V1 session keeps the
+# legacy project id "global", which V2 does not list for a real directory.
+#
+# This script re-runs that migration (idempotently) for any session that is
+# still missing, then re-files legacy "global" sessions under the project V2
+# now uses for their directory, so they appear in the normal session list.
+#
+set -euo pipefail
+
+PROG="${0##*/}"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/opencode"
+DB="${OPENCODE_DB:-$DATA/opencode.db}"
+KVKEY="migration.v1-v2"
+MIG_TIMEOUT="${OPENCODE_RECOVER_TIMEOUT:-300}"
+
+DRY=0
+ASSUME_YES=0
+
+log()  { printf '\n==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG [OPTIONS]
+
+Repairs OpenCode V1 -> V2 session visibility: re-imports V1 sessions that the
+one-time history migration missed, then re-files legacy project "global"
+sessions under the project V2 assigns to their directory.
+
+Options:
+  --dry-run      Operate on a throwaway copy of the database; change nothing.
+  --yes, -y      Do not prompt for confirmation.
+  --db PATH      Database to operate on (default: $DB).
+  -h, --help     Show this help and exit.
+
+Environment:
+  OPENCODE_DB                  Default database path (overridden by --db).
+  OPENCODE_RECOVER_TIMEOUT     Seconds to wait for the migration (default 300).
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)   DRY=1 ;;
+    --yes|-y)    ASSUME_YES=1 ;;
+    --db)        shift; [ $# -gt 0 ] || die "--db needs a path"; DB="$1" ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           die "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+[ -f "$DB" ] || die "database not found: $DB"
+command -v sqlite3  >/dev/null 2>&1 || die "sqlite3 not found in PATH"
+command -v opencode >/dev/null 2>&1 || die "opencode not found in PATH"
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/opencode-recover.XXXXXX")"
+SERVE_PID=""
+cleanup() {
+  if [ -n "$SERVE_PID" ] && kill -0 "$SERVE_PID" 2>/dev/null; then
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# --- SQL helpers --------------------------------------------------------------
+
+missing_count() {
+  sqlite3 "$1" "SELECT COUNT(*) FROM session WHERE id NOT IN (SELECT id FROM session_v2);"
+}
+
+refile_count() {
+  sqlite3 "$1" "
+    SELECT COUNT(*) FROM session_v2 s
+     WHERE s.project_id='global' AND s.directory<>'/'
+       AND EXISTS (SELECT 1 FROM project p WHERE p.worktree=s.directory);"
+}
+
+set_phase_sessions() {
+  sqlite3 "$1" "
+    INSERT INTO kv (key, value, time_created, time_updated)
+    VALUES ('$KVKEY', '{\"phase\":\"sessions\"}',
+            strftime('%s','now')*1000, strftime('%s','now')*1000)
+    ON CONFLICT(key) DO UPDATE SET
+      value='{\"phase\":\"sessions\"}', time_updated=strftime('%s','now')*1000;"
+}
+
+refile() {
+  sqlite3 "$1" "
+    BEGIN;
+    UPDATE session_v2
+       SET project_id = (SELECT p.id FROM project p
+                          WHERE p.worktree = session_v2.directory LIMIT 1)
+     WHERE project_id='global' AND directory<>'/'
+       AND EXISTS (SELECT 1 FROM project p WHERE p.worktree = session_v2.directory);
+    COMMIT;
+    SELECT changes();"
+}
+
+print_report() {
+  local db="$1" missing_file="$2"
+  sqlite3 -header -column "$db" "
+    SELECT 'session_v2 total'                                  AS metric, COUNT(*) AS n FROM session_v2
+    UNION ALL SELECT 'legacy project global remaining',        COUNT(*) FROM session_v2 WHERE project_id='global'
+    UNION ALL SELECT 'legacy rows w/o matching project',       COUNT(*) FROM session_v2
+        WHERE project_id='global' AND directory<>'/'
+          AND NOT EXISTS (SELECT 1 FROM project p WHERE p.worktree=session_v2.directory);
+  "
+  if [ -s "$missing_file" ]; then
+    local idlist
+    idlist="$(sed "s/.*/'&'/" "$missing_file" | paste -sd, -)"
+    echo
+    echo "Sessions imported by this run:"
+    sqlite3 -header -column "$db" "
+      SELECT datetime(time_updated/1000,'unixepoch','localtime') AS updated, title
+        FROM session_v2
+       WHERE id IN ($idlist)
+       ORDER BY time_updated DESC;"
+  fi
+}
+
+# --- migration runners --------------------------------------------------------
+
+# Dry run: isolated server against a copy of the database.
+migrate_copy() {
+  local copy="$1" port phase deadline
+  set_phase_sessions "$copy"
+  port=$(( (RANDOM % 20000) + 25000 ))
+  log "Running migration on a copy (ephemeral port $port)"
+  OPENCODE_DB="$copy" opencode serve --hostname 127.0.0.1 --port "$port" \
+    >"$WORK/serve.log" 2>&1 &
+  SERVE_PID=$!
+  deadline=$(( $(date +%s) + MIG_TIMEOUT ))
+  phase=""
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    phase="$(sqlite3 "$copy" "SELECT value FROM kv WHERE key='$KVKEY'" 2>/dev/null || true)"
+    case "$phase" in *'"completed"'*) log "Migration completed."; break ;; esac
+    if ! kill -0 "$SERVE_PID" 2>/dev/null; then
+      warn "ephemeral server exited early; see $WORK/serve.log"
+      break
+    fi
+    sleep 1
+  done
+  kill "$SERVE_PID" 2>/dev/null || true
+  wait "$SERVE_PID" 2>/dev/null || true
+  SERVE_PID=""
+  case "$phase" in *'"completed"'*) return 0 ;; *) return 1 ;; esac
+}
+
+# Real run: start the managed service so its boot migration runs.
+migrate_service() {
+  local db="$1" deadline s
+  log "Starting OpenCode service (boot migration runs now)"
+  opencode service start >/dev/null 2>&1 || true
+  deadline=$(( $(date +%s) + MIG_TIMEOUT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    s="$(opencode api get /api/experimental/migration/v1 2>/dev/null || true)"
+    case "$s" in *'"completed"'*) log "Migration completed."; return 0 ;; esac
+    # Fall back to reading the kv marker directly in case the API is unreachable.
+    s="$(sqlite3 "$db" "SELECT value FROM kv WHERE key='$KVKEY'" 2>/dev/null || true)"
+    case "$s" in *'"completed"'*) log "Migration completed."; return 0 ;; esac
+    sleep 1
+  done
+  warn "timed out waiting for migration status"
+  return 1
+}
+
+stop_service() {
+  local deadline
+  log "Stopping OpenCode service (open clients will disconnect)"
+  opencode service stop >/dev/null 2>&1 || true
+  deadline=$(( $(date +%s) + 10 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if ! opencode service status >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
+  sleep 1
+}
+
+# --- dry run ------------------------------------------------------------------
+
+if [ "$DRY" = 1 ]; then
+  COPY="$WORK/opencode.db"
+  log "Snapshotting $DB"
+  sqlite3 "$DB" "VACUUM INTO '$COPY'"
+
+  MISSING="$(missing_count "$COPY")"
+  REFILE="$(refile_count "$COPY")"
+  printf 'missing from session_v2 : %s\n' "$MISSING"
+  printf 're-filable global rows  : %s\n' "$REFILE"
+
+  if [ "$MISSING" = 0 ] && [ "$REFILE" = 0 ]; then
+    log "Nothing to do; the live database is already consistent."
+    exit 0
+  fi
+
+  MISSING_FILE="$WORK/missing.ids"
+  : > "$MISSING_FILE"
+  if [ "$MISSING" != 0 ]; then
+    sqlite3 "$COPY" "SELECT id FROM session WHERE id NOT IN (SELECT id FROM session_v2);" > "$MISSING_FILE"
+    migrate_copy "$COPY" || warn "migration did not report completion"
+  fi
+
+  log "Re-filing legacy global sessions on the copy"
+  refile "$COPY" >/dev/null
+  print_report "$COPY" "$MISSING_FILE"
+  log "Dry run only: the live database was not modified."
+  exit 0
+fi
+
+# --- real run -----------------------------------------------------------------
+
+if [ "$ASSUME_YES" != 1 ]; then
+  printf '\nThis will stop the OpenCode service, back up the database, re-run\n'
+  printf 'the V1 -> V2 session migration if needed, and re-file legacy "global"\n'
+  printf 'sessions under their directory project.\n'
+  printf 'Database: %s\n' "$DB"
+  printf 'Proceed? [y/N] '
+  read -r ans || die "aborted"
+  case "$ans" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 1 ;; esac
+fi
+
+log "Backing up database"
+BAK="$DB.bak-$(date +%Y%m%d-%H%M%S)"
+sqlite3 "$DB" "VACUUM INTO '$BAK'" || die "backup failed; aborting"
+printf 'backup: %s\n' "$BAK"
+
+MISSING="$(missing_count "$DB")"
+REFILE="$(refile_count "$DB")"
+printf 'missing from session_v2 : %s\n' "$MISSING"
+printf 're-filable global rows  : %s\n' "$REFILE"
+
+if [ "$MISSING" = 0 ] && [ "$REFILE" = 0 ]; then
+  log "Nothing to do; the database is already consistent."
+  exit 0
+fi
+
+MISSING_FILE="$WORK/missing.ids"
+: > "$MISSING_FILE"
+[ "$MISSING" != 0 ] && sqlite3 "$DB" "SELECT id FROM session WHERE id NOT IN (SELECT id FROM session_v2);" > "$MISSING_FILE"
+
+stop_service
+if [ "$MISSING" != 0 ]; then
+  set_phase_sessions "$DB"
+  migrate_service "$DB" || warn "migration did not report completion; continuing"
+  stop_service
+fi
+
+log "Re-filing legacy global sessions under their directory project"
+refile "$DB"
+
+log "Starting OpenCode service"
+opencode service start >/dev/null 2>&1 || true
+
+print_report "$DB" "$MISSING_FILE"
+log "Done. Backup kept at $BAK"

@@ -1,6 +1,6 @@
-.TH FFMPEG-ENCODE 1 "2026-09-12" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-09-20" "ffmpeg-encode" "User Commands"
 .SH NAME
-ffmpeg-encode \- VAAPI HEVC batch video encoder
+ffmpeg-encode \- VAAPI HEVC/AV1 batch video encoder with curses TUI
 .SH SYNOPSIS
 .B ffmpeg-encode
 [\fIOPTIONS\fR]
@@ -8,8 +8,8 @@ ffmpeg-encode \- VAAPI HEVC batch video encoder
 .B ffmpeg-encode
 .B \-i
 \fIDIR\fR
-.B \-o
-\fIDIR\fR
+[\fB\-i\fR \fIDIR\fR ...]
+[\fB\-o\fR \fIDIR\fR]
 [\fIOPTIONS\fR]
 .P
 .B ffmpeg-encode
@@ -17,78 +17,108 @@ ffmpeg-encode \- VAAPI HEVC batch video encoder
 \fIFILE\fR
 [\fB\-\-output\fR \fIFILE\fR]
 [\fIOPTIONS\fR]
+.P
+.B ffmpeg-encode\-av1
+[\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B ffmpeg-encode
-is a thin wrapper around
+is a wrapper around
 .BR ffmpeg (1)
-that encodes video with hardware-accelerated
-.B hevc_vaapi
-(VAAPI).
-It can process a whole directory tree (batch mode) or a single file.
+that re-encodes video with hardware-accelerated VAAPI
+and shows a live
+.BR curses (3)
+interface for pausing, skipping and monitoring the queue.
+It can process a whole directory tree (batch mode) or a single file, and in
+batch mode several input directories can be given in one run.
+.P
+Two codecs are supported, both driven in constant-quality mode:
+.B hevc
+(default) selects
+.BR hevc_vaapi ,
+.B av1
+selects
+.BR av1_vaapi .
+The
+.B ffmpeg-encode\-av1
+command is a thin wrapper that runs
+.B ffmpeg-encode \-\-codec av1
+with the same arguments.
 .P
 By default it reads from
 .I /mnt/shared/Compressing
 and writes to
 .IR /mnt/shared/Handbraked ,
 preserving relative paths under the output directory.
+When several
+.B \-i
+directories are given, each file's path is preserved relative to the input
+directory it was found under, so all inputs share the single output root.
 .P
-While encoding, a single coloured status line is shown (when stdout is a TTY):
-.IP \(bu 2
-percentage of the
-.B current video
-completed
-.IP \(bu 2
-percentage of the
-.B queue
-completed (weighted by finished files plus current progress)
-.IP \(bu 2
-encode
-.B speed
-in frames per second (fps)
+By default the original file is deleted after a successful encode, but
+.B only
+if the new file is smaller; if the encode came out larger the new file is
+discarded and the original kept. Use
+.B \-k
+to keep both files unconditionally.
 .P
-When the run finishes successfully, a size summary reports original size,
-encoded size, and space saved (human-readable and as a percentage).
+The TUI shows a running percentage, frames per second, a smoothed encoding
+speed multiplier and an estimated time remaining for the current file, the
+per-file size result in the queue, and elapsed / queued counters in the
+header. When the run ends, a summary reports how many files were done,
+failed, skipped or kept, and the total space saved or gained.
 .SH OPTIONS
 .TP
 .BI \-i " DIR"
-Input directory for batch mode. Default:
+Input directory for batch mode. May be repeated to encode several
+directories in one run. Default:
 .IR /mnt/shared/Compressing .
 .TP
 .BI \-o " DIR"
 Output directory for batch mode. Default:
 .IR /mnt/shared/Handbraked .
-Relative paths under the input directory are preserved under this root.
+Relative paths under the input directory are preserved under this root. With
+several
+.B \-i
+directories, the relative path is taken from whichever input directory the
+file was found under; the output root is still single.
 .TP
 .BI \-\-input " FILE"
 Encode a single input file instead of scanning a directory.
 .TP
 .BI \-\-output " FILE"
-Output path for single-file mode. If omitted, the name is derived as
-.IR basename-hevc.mkv
-next to the input. The extension is always forced to
+Output path for single-file mode. If omitted, the name is derived from the
+input path relative to the input directory and placed under the output
+directory (for example
+.IR /mnt/shared/Handbraked/movie.mkv ).
+The extension is always forced to
 .BR .mkv
 even if another extension is given.
 .TP
+.BI \-\-codec " CODEC"
+Video codec:
+.B hevc
+(default) or
+.BR av1 .
+The two codecs use different quality scales, so the default and meaning of
+.B \-q
+change with this option.
+.TP
 .BI \-p " PRESET"
-Speed / quality trade-off:
-.RS
-.TP
-.B speed
-Faster encode (\fB\-preset fast\fR).
-.TP
-.B balanced
-Default. No extra preset flag.
-.TP
-.B quality
-Slower, better quality (\fB\-preset slow\fR).
-.RE
+Speed preset:
+.BR speed ,
+.BR balanced " (default), or " quality .
+VAAPI exposes no quality preset, so this only sets
+.BR \-async_depth
+(8, 4 and 2 respectively); a larger value means more parallelism and a
+faster encode with no effect on output quality.
 .TP
 .BI \-q " QP"
-Constant QP quality value for the VAAPI encoder. Default:
-.BR 27 .
-Lower values mean higher quality and larger files.
+Constant-quality target. Lower means higher quality and larger files. The
+valid range depends on the codec: HEVC 0\-51 (default 27), AV1 0\-255
+(default 97). Out-of-range values are clamped.
 .TP
 .BI \-j " N"
+.TP
 .BI \-\-jobs " N"
 Encode up to
 .I N
@@ -99,24 +129,44 @@ startup would otherwise dominate; a value of 2 or 3 is a good fit for a
 VCN-class GPU.
 .TP
 .B \-n
-Dry run. Print the
-.B ffmpeg
-command that would be run; do not encode or delete anything.
+Dry run. List the files that would be encoded and exit; no encoding or
+deletion is performed.
 .TP
 .BI \-k ", " \-\-keep
-Keep both the original and the encoded file; nothing is deleted, even when
-the encode is larger than the original. This is the only opt-out from the
-default deletion behaviour.
+Keep both the original and the encoded file. This is the opt-out from the
+default behaviour of deleting the original, and it also keeps the encoded
+file even when it is larger than the original.
 .TP
 .B \-h
 Show a short help message and exit.
 .SH BEHAVIOUR
 .SS Encoding
 .IP \(bu 2
-Video codec:
+Constant-quality mode:
 .B hevc_vaapi
-via
-.B \-hwaccel vaapi
+with
+.B \-b:v 0 \-qp
+.IR Q ,
+or
+.B av1_vaapi
+with
+.B \-rc_mode CQP \-global_quality
+.IR Q
+.IP \(bu 2
+Decoding uses
+.B \-hwaccel vaapi \-hwaccel_output_format vaapi
+on an auto-detected device: the first
+.I /dev/dri/renderD*
+node, otherwise the first
+.IR /dev/dri/card* ,
+otherwise
+.IR /dev/dri/renderD128
+.IP \(bu 2
+If VAAPI decoding cannot be initialised for a stream (for example a
+malformed 4K SPS), the file is retried once with software decoding followed
+by
+.BR format=nv12,hwupload ;
+the GPU still encodes
 .IP \(bu 2
 Audio streams are
 .B copied
@@ -135,10 +185,29 @@ Existing output files are overwritten (\fB\-y\fR)
 All outputs use the
 .B .mkv
 (Matroska) container, regardless of the input extension
+.SS Deletion policy
+After a successful encode the original is deleted
+.B only
+when the encoded file is smaller. If the encoded file is the same size or
+larger, it is removed and the original is kept (the job is reported as
+.IR kept ).
+Passing
+.B \-k
+keeps both files in all cases. Files that are cancelled or quit are left
+alone and the original is never removed.
 .SS Batch discovery
-In batch mode, files are found recursively under the input directory with
+In batch mode, files are found recursively under each input directory with
 extensions (case-insensitive):
 .BR mkv ", " mp4 ", " avi ", " mov ", " webm ", " ts ", " mts ", " webp .
+.P
+With several
+.B \-i
+directories the queues are processed
+.IR blocked :
+all files from the first directory (sorted) are queued before the second,
+and so on, in the order the
+.B \-i
+flags are given. Overlapping directories are de-duplicated.
 .SS Requirements
 .IP \(bu 2
 .B ffmpeg
@@ -150,6 +219,8 @@ available (from
 .IP \(bu 2
 .B ffprobe
 (for duration / progress)
+.IP \(bu 2
+A terminal of at least 60 columns by 10 rows for the full interface
 .SH EXAMPLES
 Encode everything under the default directories:
 .IP
@@ -157,25 +228,43 @@ Encode everything under the default directories:
 ffmpeg-encode
 .EE
 .P
-Custom directories and quality preset:
+Custom directories and a speed preset:
 .IP
 .EX
 ffmpeg-encode \-i ~/Videos/raw \-o ~/Videos/encoded \-p quality
 .EE
 .P
-Single file, faster preset:
+Two input directories into one output root (first directory is encoded first):
 .IP
 .EX
-ffmpeg-encode \-\-input video.mkv \-\-output video\-hevc.mkv \-p speed
+ffmpeg-encode \-i ~/Videos/raw \-i /mnt/archive \-o ~/Videos/encoded
 .EE
 .P
-Show the command without running it:
+Encode to AV1 instead of HEVC:
+.IP
+.EX
+ffmpeg-encode \-\-codec av1 \-q 110
+.EE
+.P
+The same thing through the wrapper, which defaults to AV1:
+.IP
+.EX
+ffmpeg-encode-av1 \-i ~/Videos/raw
+.EE
+.P
+Single file with an explicit output path:
+.IP
+.EX
+ffmpeg-encode \-\-input video.mkv \-\-output video-hevc.mkv \-p speed
+.EE
+.P
+List what would be encoded without running it:
 .IP
 .EX
 ffmpeg-encode \-n \-i ~/Videos/raw \-o ~/Videos/encoded
 .EE
 .P
-Tighter quality (lower QP):
+Tighter HEVC quality (lower QP):
 .IP
 .EX
 ffmpeg-encode \-q 24
@@ -195,16 +284,24 @@ ffmpeg-encode \-k
 .SH INTERACTIVE KEYS
 .TP
 .B p
-Pause / resume encoding.
+Pause / resume encoding (sends
+.B SIGSTOP
+/
+.B SIGCONT
+to the running ffmpeg processes).
 .TP
 .B r
-Resume encoding.
+Resume encoding (alias for toggling pause off).
 .TP
 .B s
-Skip the currently encoding file(s).
+Skip the file(s) currently encoding: a partial output is removed and the
+original is left untouched.
 .TP
 .B a
-Add a file to the queue.
+Add a file to the queue with an inline editor (Escape cancels).
+.TP
+.B A
+Re-scan the input directories and queue any files not already present.
 .TP
 .B Up / Down, j / k
 Scroll the queue list one line.
@@ -217,6 +314,10 @@ Jump to the top / bottom of the queue.
 .TP
 .B f
 Re-enable auto-follow, keeping the currently encoding file centred.
+.TP
+.B q
+Quit. Any in-progress encodes are cancelled: their partial output is removed
+and the original files are left untouched. Ctrl+C behaves the same.
 .P
 Scrolling with the arrow keys turns off auto-follow so the queue stops
 jumping around; note that a terminal only repaints the focused tab, so an
@@ -224,11 +325,22 @@ unfocused tab may appear frozen until you switch back to it.
 .SH EXIT STATUS
 .TP
 .B 0
-All encodes succeeded (or dry run completed).
+The run completed and the TUI was closed, or a dry run finished. Note that
+individual encode failures do not change the exit status; they are reported
+in the summary.
 .TP
 .B 1
-One or more encodes failed, invalid options, missing input, or VAAPI
-unavailable.
+Invalid usage detected after parsing:
+.B \-\-jobs
+less than 1, a single input file that does not exist, or VAAPI not available.
+.TP
+.B 2
+Command-line parsing error (unknown option, bad choice for
+.B \-\-codec
+or
+.BR \-p ,
+non-integer
+.BR \-q ).
 .SH FILES
 .TP
 .I /mnt/shared/Compressing
@@ -236,9 +348,13 @@ Default input directory (batch mode).
 .TP
 .I /mnt/shared/Handbraked
 Default output directory (batch mode).
+.TP
+.I /dev/dri/renderD128
+Fallback VAAPI device when no node is auto-detected.
 .SH SEE ALSO
 .BR ffmpeg (1),
 .BR ffprobe (1),
-.BR vainfo (1)
+.BR vainfo (1),
+.BR ffmpeg-encode-av1 (1)
 .SH AUTHOR
 Written for local use with VAAPI on AMD RDNA4 (RX 9070 class).

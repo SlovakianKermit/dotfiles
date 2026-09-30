@@ -1,4 +1,4 @@
-.TH DOTFILES-SYNC 1 "August 2026" "dotfiles-sync" "User Commands"
+.TH DOTFILES-SYNC 1 "2026-09-30" "dotfiles-sync" "User Commands"
 .SH NAME
 dotfiles-sync \- push and pull dotfiles, configs, scripts, and packages via Git
 .SH SYNOPSIS
@@ -60,10 +60,17 @@ Dumps package lists:
 .B pkglist-aur.txt
 (AUR/foreign).
 .IP \(bu 2
-Copies every file under
+Syncs
 .B ~/.local/bin
 into
-.IR scripts/ .
+.I scripts/
+with
+.B rsync \-\-delete
+so the mirror is pruned to match exactly. Backup and cache files are
+excluded, and
+.B \-\-delete\-excluded
+also removes any that were mirrored previously (see
+.BR FILES ).
 .IP \(bu 2
 Syncs symlink targets (e.g.
 .BR ~/.config/fish )
@@ -184,7 +191,10 @@ Custom man pages from
 .TP
 .I scripts/
 Every script and binary from
-.IR ~/.local/bin
+.IR ~/.local/bin ,
+mirrored with
+.B rsync \-\-delete
+so removed scripts do not linger.
 .TP
 .I packages/
 .IR pkglist-arch.txt ,
@@ -194,6 +204,24 @@ Every script and binary from
 .IR skipped-hardware.txt ,
 .I skipped-cachyos.txt
 .RE
+.TP
+.I Global excludes
+Every
+.B rsync
+skips
+\fB*.bak\fR,
+\fB*.bak.*\fR,
+\fB__pycache__/\fR
+and
+\fB*.pyc\fR.
+The scripts sync also uses
+.B \-\-delete\-excluded
+to purge such files from an already-mirrored
+.IR scripts/ .
+Machine-specific runtime state such as
+.I dotfiles/mpv/window-state.json
+is kept out through the repository
+.IR .gitignore .
 .TP
 .I ~/dotfiles/packages/failed.txt
 Packages that failed to install on pull (one per line).

@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE 1 "2026-09-16" "ctbrec-merge" "User Commands"
+.TH CTBREC-MERGE 1 "2026-09-21" "ctbrec-merge" "User Commands"
 .SH NAME
 ctbrec-merge \- losslessly merge ctbrec recordings split by a restart
 .SH SYNOPSIS
@@ -12,7 +12,7 @@ When ctbrec is briefly stopped or restarted, a single model's stream is split
 into several
 .B .ts
 parts. This script finds parts belonging to the same model whose gap between
-the end of one part and the start of the next is small, and concatenates them
+the end of one part and the start of the next is small, and joins them
 losslessly (stream copy, no re-encode).
 .P
 Two layouts are supported:
@@ -35,9 +35,47 @@ Two filename forms are recognised:
 and
 .BI model _Chaturbate_YYYYMMDD\-HHMMSS.mts .
 .P
-A file that is currently open for writing is never merged: the script checks
-for open write file descriptors with
-.BR lsof (8)
+By default the join is written by
+.B append
+mode (see BEHAVIOUR): the earliest part becomes the output and each later part
+is copied onto its end with corrected timestamps, so only the later parts are
+read and written instead of the whole output. When a pre\-flight check fails
+(differing transport packet size or PID, an unaligned part, or
+.B \-\-keep
+or
+.BR \-\-no\-append ),
+the script falls back to a full
+.B ffmpeg \-f concat \-c copy
+remux.
+.P
+The defaults are tuned for a drive\-managed SMR disk, where large write bursts
+cause long stalls:
+.IP \(bu 2
+merging is deferred when more than
+.B \-\-max\-streams
+recordings are open for writing;
+.IP \(bu 2
+the run refuses to start when the filesystem is below
+.B \-\-min\-free\-pct
+percent free;
+.IP \(bu 2
+after a group that merged at least one file the run takes a
+.B \-\-cooldown
+and then waits (up to
+.BR \-\-io\-wait\-max )
+for host io pressure to fall below
+.BR \-\-io\-wait\-threshold .
+Groups that merge nothing are not paced, and
+.B \-\-dry\-run
+never waits.
+Every mergeable group is processed unless
+.B \-\-max\-run\-gb
+sets an output budget (unlimited by default).
+.P
+A file that is currently open for writing is never merged. The script scans
+.B /proc
+for open write file descriptors under
+.BR \-\-dir
 and additionally skips files modified within
 .B \-\-age
 seconds. Parts whose video or audio codec parameters differ are left alone.
@@ -45,11 +83,8 @@ seconds. Parts whose video or audio codec parameters differ are left alone.
 Requires
 .BR python3 (1),
 .BR ffmpeg (1),
-.BR ffprobe (1),
 and
-.BR lsof (8)
-(optional; see
-.BR \-\-no\-lsof ).
+.BR ffprobe (1).
 .SH OPTIONS
 .TP
 .B \-\-dir \fIDIR\fR
@@ -63,30 +98,31 @@ for the parts to be merged. Defaults to
 (5 minutes).
 .TP
 .B \-\-slack \fISECONDS\fR
-Extra slack, in seconds, allowed when pre-selecting candidates by modification
+Extra slack, in seconds, allowed when pre\-selecting candidates by modification
 time. Defaults to
 .BR 30 .
 .TP
 .B \-\-age \fISECONDS\fR
 Skip files modified within the last
 .I SECONDS
-seconds, as a fallback active-file check. Defaults to
+seconds, as a fallback active\-file check. Defaults to
 .BR 300 .
 .TP
 .B \-\-no\-lsof
-Do not run the exact
-.B lsof
-open-for-write check; rely on
+Do not run the open\-for\-write activity scan; rely on
 .B \-\-age
-only.
+only, and skip the
+.B \-\-max\-streams
+deferral.
 .TP
 .B \-\-keep
 Move the original parts to a
 .B .merged_originals/
-subdirectory instead of deleting them.
+subdirectory instead of deleting them. This disables append mode (the first
+part must stay in place to be extended), so a full concat remux is used.
 .TP
 .B \-\-dry\-run
-Print the merge plan without changing anything.
+Print the merge plan, including the chosen mode, without changing anything.
 .TP
 .B \-\-top\-level
 Only process files directly in
@@ -94,40 +130,116 @@ Only process files directly in
 never enter subdirectories.
 .TP
 .B \-\-verify
-Verify the merged output duration with
-.BR ffprobe (1)
-before deleting the originals (extra full read of the output).
+Check the joined output before deleting the originals (extra full read of the
+output). In append mode the output duration is compared against the expected
+timeline; in concat mode against the input duration sum.
 .TP
 .B \-j, \-\-jobs \fIN\fR
-Number of parallel
-.B ffprobe
-workers. Defaults to
-.BR 8 .
+Number of parallel header probes. Defaults to
+.BR 1 ;
+probing is I/O\-light and serial probing avoids seek thrash on a busy disk.
+.TP
+.B \-\-no\-append
+Disable append mode and always remux via
+.BR "ffmpeg \-f concat" .
+.TP
+.B \-\-min\-free\-pct \fIPERCENT\fR
+Refuse to start when the filesystem holding
+.B \-\-dir
+is less than
+.I PERCENT
+free. Defaults to
+.BR 15 .
+A non\-zero exit is returned.
+.TP
+.B \-\-max\-streams \fIN\fR
+Defer the whole run when more than
+.I N
+recordings are open for writing. Defaults to
+.BR 4 .
+.TP
+.B \-\-cooldown \fISECONDS\fR
+Minimum time to sleep between merged groups. Defaults to
+.BR 10 .
+.TP
+.B \-\-io\-wait\-max \fISECONDS\fR
+After
+.BR \-\-cooldown ,
+wait up to this long for host io pressure to fall below
+.BR \-\-io\-wait\-threshold .
+.B 0
+disables the pressure poll, but not the
+.B \-\-cooldown
+sleep; set
+.B \-\-cooldown 0
+for no pacing at all. Defaults to
+.BR 180 .
+.TP
+.B \-\-io\-wait\-threshold \fIPERCENT\fR
+Host io pressure (full avg10, in percent) considered drained. Defaults to
+.BR 5 .
+.TP
+.B \-\-max\-run\-gb \fIGB\fR
+Stop after roughly
+.I GB
+of merged output in one run.
+.B 0
+(the default) disables the budget so a single run processes every group.
 .SH BEHAVIOUR
 .IP \(bu 2
-Each candidate part is probed with
+Each candidate part is probed with a short, header\-only
 .B ffprobe
-for duration and video/audio codec parameters; adjacent parts with matching
-parameters and a gap within
-.B \-\-gap
-are merged.
+read for start time, codec parameters, and stream PIDs. Duration is estimated
+from the filename start time and the file modification time, avoiding a full
+read of every candidate.
 .IP \(bu 2
-Merging uses
-.B ffmpeg \-f concat \-c copy
-into a
+Adjacent parts with matching parameters, matching PIDs, and a gap within
+.B \-\-gap
+are joined.
+.IP \(bu 2
+Append mode copies each later part with
+.BR "ffmpeg \-c copy \-output_ts_offset" ,
+placing it after the previous part with a small margin so timestamps stay
+monotonic, and writes the result straight onto the end of the earliest part.
+Before extending, the first part's original length is recorded; if ffmpeg fails
+or a size or verify check fails, the file is truncated back and the originals
+are kept. Only the appended parts are removed on success.
+.IP \(bu 2
+Concat fallback (and
+.BR \-\-keep )
+writes an
 .BI name .part
-file, which is renamed into place only after it is complete, so a half-written
+file which is renamed into place only after it is complete, so a half\-written
 file never looks final.
+.IP \(bu 2
+Before each group, free space is checked against the bytes that group will add
+(plus a margin); a group that would not fit is skipped.
+.IP \(bu 2
+Progress is printed before scanning each model and before each ffmpeg append
+or remux, so a long SMR garbage\-collection stall is not mistaken for a hang.
+.IP \(bu 2
+After a group that merged at least one file the script sleeps
+.B \-\-cooldown
+seconds and then polls
+.B /proc/pressure/io
+until host io pressure is below
+.BR \-\-io\-wait\-threshold
+for two consecutive samples or
+.B \-\-io\-wait\-max
+elapses.
 .IP \(bu 2
 The output keeps the first part's filename, so the merged file stays in the
 same directory as its inputs.
 .IP \(bu 2
 Originals are deleted only after the output size is within tolerance of the
-input sum (and, with
+expected size (and, with
 .BR \-\-verify ,
-the duration matches). If ffmpeg fails or the check fails, the originals are
+the duration matches). If ffmpeg fails or a check fails, the originals are
 kept.
 .SH FILES
+.TP
+.B .part
+Temporary output used by the concat fallback.
 .TP
 .B .merged_originals/
 Where originals are moved when
@@ -140,10 +252,22 @@ Preview the merge plan for the default server directory:
 ctbrec-merge \-\-dry\-run
 .EE
 .P
-Merge for real, keeping the originals:
+Merge for real (append mode, low\-I/O defaults):
+.IP
+.EX
+ctbrec-merge
+.EE
+.P
+Merge with the originals kept (forces a concat remux):
 .IP
 .EX
 ctbrec-merge \-\-keep \-\-verify
+.EE
+.P
+Ignore the activity gate and all drain waits:
+.IP
+.EX
+ctbrec-merge \-\-max\-streams 999 \-\-cooldown 0 \-\-io\-wait\-max 0
 .EE
 .P
 Merge the old flat directory layout:
@@ -154,18 +278,18 @@ ctbrec-merge \-\-dir /mnt/shared/Ctbrec/Recording \-\-top\-level
 .SH EXIT STATUS
 .TP
 .B 0
-Completed normally.
+Completed normally, or deferred because too many recordings were active.
 .TP
 .B 1
 .B \-\-dir
-is not a directory.
+is not a directory, or the filesystem is below
+.BR \-\-min\-free\-pct .
 .TP
 .B 130
 Interrupted; a partial
 .B .part
-output is removed.
+output is removed and an in\-progress append is rolled back.
 .SH SEE ALSO
 .BR ctbrec-merge-remote (1),
 .BR ffmpeg (1),
-.BR ffprobe (1),
-.BR lsof (8)
+.BR ffprobe (1)

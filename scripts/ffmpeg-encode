@@ -70,6 +70,7 @@ class Job:
     ous: int = 0
     start: float = 0.0
     paused_accum: float = 0.0
+    cancel: bool = False
 
     @property
     def basename(self) -> str:
@@ -82,9 +83,9 @@ class SharedState:
     ffmpeg_pids: set = field(default_factory=set)
     active: int = 0
     quit: bool = False
-    skip: bool = False
     total_in_bytes: int = 0
     total_out_bytes: int = 0
+    workers: list = field(default_factory=list)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Utilities
@@ -102,6 +103,12 @@ def human_bytes(n: int) -> str:
         n /= 1024
     return f"{n:.1f} PiB"
 
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    return (f"{int(seconds // 3600):02d}:"
+            f"{int((seconds % 3600) // 60):02d}:"
+            f"{int(seconds % 60):02d}")
+
 def get_duration(path: str) -> float:
     try:
         r = subprocess.run(
@@ -114,14 +121,24 @@ def get_duration(path: str) -> float:
         return 0.0
 
 def collect_files(directory: str) -> List[str]:
-    files: List[str] = []
     root = pathlib.Path(directory)
     if not root.is_dir():
-        return files
-    for ext in EXTENSIONS:
-        files.extend(str(p) for p in root.rglob(f"*.{ext}"))
-        files.extend(str(p) for p in root.rglob(f"*.{ext.upper()}"))
-    return sorted(files)
+        return []
+    exts = {f".{e}" for e in EXTENSIONS}
+    return sorted(
+        str(p) for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts
+    )
+
+def collect_all(directories: List[str]) -> List[str]:
+    seen = set()
+    files: List[str] = []
+    for directory in directories:
+        for f in collect_files(directory):
+            if f not in seen:
+                seen.add(f)
+                files.append(f)
+    return files
 
 def check_vaapi() -> bool:
     try:
@@ -138,8 +155,8 @@ def check_vaapi() -> bool:
 # ═══════════════════════════════════════════════════════════════════════
 
 class Queue:
-    def __init__(self, input_dir: str, output_dir: str):
-        self.input_dir = input_dir
+    def __init__(self, input_dirs: List[str], output_dir: str):
+        self.input_dirs = list(input_dirs)
         self.output_dir = output_dir
         self.jobs: List[Job] = []
 
@@ -148,10 +165,13 @@ class Queue:
         if not p.is_file():
             return None
 
-        try:
-            rel = str(p.relative_to(self.input_dir))
-        except ValueError:
-            rel = p.name
+        rel = p.name
+        for root in self.input_dirs:
+            try:
+                rel = str(p.relative_to(root))
+                break
+            except ValueError:
+                continue
 
         output_path = str(pathlib.Path(self.output_dir) / rel)
         output_path = str(pathlib.Path(output_path).with_suffix(".mkv"))
@@ -220,51 +240,66 @@ def _audio_args(copy_audio: bool) -> List[str]:
     return ["-c:a", "aac", "-b:a", "160k"]
 
 def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
-                      device: str, copy_audio: bool = True) -> List[str]:
+                      device: str, copy_audio: bool = True,
+                      sw_decode: bool = False) -> List[str]:
+    # sw_decode: software decode + hwupload for streams the VAAPI decoder
+    # can't initialise on (e.g. malformed 4K SPS); the GPU still encodes.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
         "-vaapi_device", device,
-        "-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL,
-        "-i", job.input_path,
     ]
+    if not sw_decode:
+        cmd.extend(["-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL])
+    cmd.extend(["-i", job.input_path])
+    if sw_decode:
+        cmd.extend(["-vf", "format=nv12,hwupload"])
     cmd.extend(_rate_control_args(codec, preset, quality))
     cmd.extend(_audio_args(copy_audio))
     cmd.extend(["-map", "0:v?", "-map", "0:a?"])
     cmd.extend(["-y", job.output_path])
     return cmd
 
-def _build_fallback_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
-                               device: str, copy_audio: bool = True) -> List[str]:
-    # Software decode + hwupload: for streams the VAAPI h264 decoder can't
-    # initialise on (e.g. malformed 4K SPS), decode on CPU and still let the
-    # GPU do the encode.
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-progress", "pipe:1", "-nostats",
-        "-vaapi_device", device,
-        "-i", job.input_path,
-        "-vf", "format=nv12,hwupload",
-    ]
-    cmd.extend(_rate_control_args(codec, preset, quality))
-    cmd.extend(_audio_args(copy_audio))
-    cmd.extend(["-map", "0:v?", "-map", "0:a?"])
-    cmd.extend(["-y", job.output_path])
-    return cmd
+def _kill_process(pid: int, sig: int):
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except OSError:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
 
 def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]:
     """Run one ffmpeg encode to completion. Returns (returncode, stderr_text)."""
     os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
 
+    with state.lock:
+        if state.quit or job.cancel:
+            job.status = "skipped"
+            return -1, ""
+
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
+        text=True, bufsize=1, start_new_session=True,
     )
 
     with state.lock:
         state.ffmpeg_pids.add(proc.pid)
+
+    # Quit/cancel may have landed while the process was starting: kill it
+    # before it can produce output.
+    with state.lock:
+        cancelled = state.quit or job.cancel
+    if cancelled:
+        _kill_process(proc.pid, signal.SIGKILL)
+        proc.wait()
+        with state.lock:
+            state.ffmpeg_pids.discard(proc.pid)
+        job.status = "skipped"
+        return -1, ""
+
+    with state.lock:
         state.status = "encoding"
-        state.skip = False
         job.status = "encoding"
         job.progress = 0
         job.fps = 0.0
@@ -321,10 +356,14 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     sw_decode = False
     copy_audio = True
 
+    def cancelled() -> bool:
+        with state.lock:
+            return state.quit or job.cancel
+
     def attempt() -> Tuple[int, str]:
-        builder = _build_fallback_ffmpeg_cmd if sw_decode else _build_ffmpeg_cmd
         return _run_ffmpeg(
-            builder(job, codec, preset, quality, device, copy_audio), job, state)
+            _build_ffmpeg_cmd(job, codec, preset, quality, device,
+                              copy_audio, sw_decode), job, state)
 
     try:
         returncode, stderr_text = attempt()
@@ -332,25 +371,24 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
         # VAAPI decode failed (e.g. malformed 4K H.264 SPS the hw decoder
         # refuses): retry once with software decode + hwupload so the GPU
         # still does the encode.
-        if returncode != 0 and _hw_decode_failed(stderr_text):
-            with state.lock:
-                state.skip = False
-            job.status = "encoding"
+        if not cancelled() and returncode != 0 and _hw_decode_failed(stderr_text):
             sw_decode = True
             returncode, stderr_text = attempt()
 
         # Muxing a stream-copied ADTS AAC into Matroska can fail on corrupt
         # captures: retry once with the audio re-encoded as AAC.
-        if returncode != 0 and _audio_mux_failed(stderr_text):
-            with state.lock:
-                state.skip = False
-            job.status = "encoding"
+        if not cancelled() and returncode != 0 and _audio_mux_failed(stderr_text):
             copy_audio = False
             returncode, stderr_text = attempt()
 
         with state.lock:
-            if state.skip:
+            if state.quit or job.cancel:
                 job.status = "skipped"
+                if os.path.exists(job.output_path):
+                    try:
+                        os.remove(job.output_path)
+                    except OSError:
+                        pass
             elif returncode == 0 and os.path.getsize(job.output_path) > 0:
                 out_size = os.path.getsize(job.output_path)
                 if out_size < job.input_size:
@@ -461,7 +499,7 @@ class TUI:
         while not self.state.quit:
             try:
                 self._handle_input()
-                self._check_worker()
+                self._maybe_start_job()
                 self._render()
                 time.sleep(0.05)
             except KeyboardInterrupt:
@@ -487,6 +525,7 @@ class TUI:
                     self.state.active += 1
                     self.state.status = "encoding"
                     job.status = "encoding"
+                    job.cancel = False
                     job.start = time.time()
                     job.paused_accum = 0.0
                 t = threading.Thread(
@@ -495,29 +534,27 @@ class TUI:
                           self.args.quality, self.args.delete),
                     daemon=True,
                 )
+                self.state.workers.append(t)
                 t.start()
                 slots -= 1
-
-    def _check_worker(self):
-        if not self.state.quit:
-            self._maybe_start_job()
 
     def _shutdown(self):
         with self.state.lock:
             self.state.quit = True
             pids = list(self.state.ffmpeg_pids)
-            self.state.skip = True
+            workers = list(self.state.workers)
 
         for pid in pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.5)
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-            except OSError:
-                pass
+            _kill_process(pid, signal.SIGTERM)
+        for t in workers:
+            t.join(timeout=2.0)
+
+        with self.state.lock:
+            pids = list(self.state.ffmpeg_pids)
+        for pid in pids:
+            _kill_process(pid, signal.SIGKILL)
+        for t in workers:
+            t.join(timeout=1.0)
 
     # ── Input ────────────────────────────────────────────────────────
 
@@ -566,51 +603,48 @@ class TUI:
             self.state.quit = True
         elif ch == 3:  # Ctrl+C
             self.state.quit = True
-        elif ch == curses.KEY_RESIZE:
-            pass
 
-    def _toggle_pause(self):
+    def _pause(self):
         with self.state.lock:
-            now = time.time()
-            if self.state.status == "encoding":
-                for pid in self.state.ffmpeg_pids:
-                    os.kill(pid, signal.SIGSTOP)
-                self.state.status = "paused"
-                self.pause_start = now
-            elif self.state.status == "paused":
-                elapsed = now - self.pause_start
-                self.total_paused += elapsed
-                self.pause_start = 0.0
-                for job in self.queue.jobs:
-                    if job.status == "encoding":
-                        job.paused_accum += elapsed
-                for pid in self.state.ffmpeg_pids:
-                    os.kill(pid, signal.SIGCONT)
-                self.state.status = "encoding"
+            if self.state.status != "encoding":
+                return
+            for pid in self.state.ffmpeg_pids:
+                os.kill(pid, signal.SIGSTOP)
+            self.state.status = "paused"
+            self.pause_start = time.time()
 
     def _resume(self):
         with self.state.lock:
-            if self.state.status == "paused":
-                now = time.time()
-                elapsed = now - self.pause_start
-                self.total_paused += elapsed
-                self.pause_start = 0.0
-                for job in self.queue.jobs:
-                    if job.status == "encoding":
-                        job.paused_accum += elapsed
-                for pid in self.state.ffmpeg_pids:
-                    os.kill(pid, signal.SIGCONT)
-                self.state.status = "encoding"
+            if self.state.status != "paused":
+                return
+            elapsed = time.time() - self.pause_start
+            self.total_paused += elapsed
+            self.pause_start = 0.0
+            for job in self.queue.jobs:
+                if job.status == "encoding":
+                    job.paused_accum += elapsed
+            for pid in self.state.ffmpeg_pids:
+                os.kill(pid, signal.SIGCONT)
+            self.state.status = "encoding"
+
+    def _toggle_pause(self):
+        if self.state.status == "paused":
+            self._resume()
+        else:
+            self._pause()
 
     def _skip(self):
         with self.state.lock:
-            if self.state.status in ("encoding", "paused"):
-                self.state.skip = True
-                if self.state.status == "paused":
-                    for pid in self.state.ffmpeg_pids:
-                        os.kill(pid, signal.SIGCONT)
+            if self.state.status not in ("encoding", "paused"):
+                return
+            for job in self.queue.jobs:
+                if job.status in ("encoding", "paused"):
+                    job.cancel = True
+            if self.state.status == "paused":
                 for pid in self.state.ffmpeg_pids:
-                    os.kill(pid, signal.SIGTERM)
+                    os.kill(pid, signal.SIGCONT)
+            for pid in self.state.ffmpeg_pids:
+                _kill_process(pid, signal.SIGTERM)
 
     # ── Queue scrolling ─────────────────────────────────────────────
 
@@ -687,7 +721,7 @@ class TUI:
 
     def _scan_and_add(self):
         existing = {job.input_path for job in self.queue.jobs}
-        files = collect_files(self.args.i)
+        files = collect_all(self.args.i)
         added = 0
         for f in files:
             if f not in existing:
@@ -724,7 +758,7 @@ class TUI:
         self.stdscr.refresh()
 
     def _render_small(self, max_y, max_x):
-        msg = "Terminal too small — need at least 80×24"
+        msg = "Terminal too small — need at least 60×10"
         y = max(0, max_y // 2)
         x = max(0, (max_x - len(msg)) // 2)
         try:
@@ -863,24 +897,19 @@ class TUI:
             if fps > 0:
                 label_str += f"    {fps:5.1f} fps"
 
-            if self._smooth_speed > 0:
-                label_str += f"    {self._smooth_speed:.1f}x"
-                if current and current.duration > 0:
-                    content_sec = ous / 1_000_000.0 if ous > 0 else pct / 100.0 * current.duration
-                    rem_sec = max(0, current.duration - content_sec)
-                    eta = rem_sec / self._smooth_speed
-                    label_str += f"    ETA {eta // 3600:02.0f}:{(eta % 3600) // 60:02.0f}:{eta % 60:02.0f}"
-            elif ous > 0 and active_elapsed > 1 and current and current.duration > 0:
+            speed = self._smooth_speed
+            content_sec = ous / 1_000_000.0
+            if speed <= 0 and ous > 0 and active_elapsed > 1:
                 # fallback average speed before smooth-sampling has enough data
-                cs = ous / 1_000_000.0
-                avg = cs / active_elapsed if active_elapsed > 0 else 0
-                if avg > 0:
-                    label_str += f"    {avg:.1f}x"
-                    rem_sec = max(0, current.duration - cs)
-                    eta = rem_sec / avg
-                    label_str += f"    ETA {eta // 3600:02.0f}:{(eta % 3600) // 60:02.0f}:{eta % 60:02.0f}"
+                speed = content_sec / active_elapsed
+            if speed > 0:
+                label_str += f"    {speed:.1f}x"
+                if current and current.duration > 0:
+                    if content_sec <= 0:
+                        content_sec = pct / 100.0 * current.duration
+                    label_str += f"    ETA {fmt_duration((current.duration - content_sec) / speed)}"
             elif ous == 0 and current:
-                label_str += f"    starting…"
+                label_str += "    starting…"
         elif status == "idle":
             label_str = "  idle"
         else:
@@ -1038,8 +1067,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Batch VAAPI encoder (HEVC or AV1) with curses TUI.",
     )
-    p.add_argument("-i", default=DEFAULT_INPUT_DIR,
-                   help="Input directory (batch mode)")
+    p.add_argument("-i", action="append", default=None, metavar="DIR",
+                   help="Input directory (batch mode); repeat to encode "
+                        f"multiple directories (default: {DEFAULT_INPUT_DIR})")
     p.add_argument("-o", default=DEFAULT_OUTPUT_DIR,
                    help="Output directory (batch mode)")
     p.add_argument("--input",
@@ -1070,6 +1100,8 @@ def main_curses(stdscr, queue: Queue, state: SharedState, args):
 
 def main():
     args = parse_args()
+    if not args.i:
+        args.i = [DEFAULT_INPUT_DIR]
     args.delete = not args.keep  # delete is default; -k keeps both files
     if args.jobs < 1:
         print("Error: --jobs must be >= 1", file=sys.stderr)
@@ -1086,7 +1118,7 @@ def main():
         if args.input:
             files = [args.input]
         else:
-            files = collect_files(args.i)
+            files = collect_all(args.i)
         print(f"Would encode {len(files)} file(s):")
         for f in files:
             print(f"  {f}")
@@ -1109,9 +1141,9 @@ def main():
         if args.output:
             job.output_path = str(pathlib.Path(args.output).with_suffix(".mkv"))
     else:
-        files = collect_files(args.i)
+        files = collect_all(args.i)
         if not files:
-            print(f"No video files found in: {args.i}", file=sys.stderr)
+            print(f"No video files found in: {', '.join(args.i)}", file=sys.stderr)
             print(f"Searched extensions: {', '.join(EXTENSIONS)}", file=sys.stderr)
             print("Launching with empty queue — press 'a' to add files.", file=sys.stderr)
         for f in files:

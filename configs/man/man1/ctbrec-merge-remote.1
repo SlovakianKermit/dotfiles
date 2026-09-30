@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE-REMOTE 1 "2026-09-16" "ctbrec-merge-remote" "User Commands"
+.TH CTBREC-MERGE-REMOTE 1 "2026-09-24" "ctbrec-merge-remote" "User Commands"
 .SH NAME
 ctbrec-merge-remote \- run ctbrec-merge on the Proxmox server over ssh
 .SH SYNOPSIS
@@ -19,17 +19,54 @@ disabled) and executes
 with
 .B \-\-dir /mnt/pve/Data_Storage/ctbrec
 plus any arguments given to the wrapper. All scanning, probing, and merging
-happen on the server; nothing is copied to the local machine. Only standard
-output and standard error are streamed back, and the remote exit status is
-returned as the wrapper's exit status.
+happen on the server; nothing is copied to the local machine. The remote
+interpreter is run with
+.B PYTHONUNBUFFERED\=1
+so that, despite ssh having no TTY, progress lines stream back live instead of
+arriving in buffered blocks. Standard output and standard error are streamed
+back, and the remote exit status is returned as the wrapper's exit status.
 .SH OPTIONS
-Every option is forwarded verbatim to
+.TP
+.BR \-d ", " \-\-detach
+Run the remote job in a detached session on the server while still streaming
+its output here. The command runs under
+.BR setsid (1)
+with its output written to a log file; the wrapper follows that file with
+.BR tail (1)
+so updates appear live on the terminal exactly as in the normal mode. Because
+the job is in its own session, closing the terminal or losing the ssh connection
+does not stop it: the streamed view ends, but the merge keeps running on the
+server. The remote exit status is still returned when the job finishes while
+connected, and the log file path is printed so the run can be inspected later.
+.TP
+.B \-\-ignore\-storage\-limit
+Run even when the target filesystem is below the
+.B \-\-min\-free\-pct
+threshold (default 15%). The wrapper translates this flag into
+.B \-\-min\-free\-pct 0
+for the remote
+.BR ctbrec-merge (1),
+bypassing the coarse free\-space gate. The per\-group check that still requires
+enough room for a group's output plus a
+.B 1 GB
+margin remains in force, so the run stops naturally once the drive is nearly
+full. If
+.B \-\-min\-free\-pct
+is also given on the command line, this flag wins.
+.P
+All other options are forwarded verbatim to
 .BR ctbrec-merge (1);
 see that page for the full list. The most useful are
 .BR \-\-dry\-run ,
 .BR \-\-keep ,
 and
 .BR \-\-verify .
+.P
+Unlike
+.BR \-\-detach ,
+without it a disconnect sends
+.B SIGHUP
+to the remote process group and the job is terminated.
 .SH ENVIRONMENT
 .TP
 .B CTBREC_MERGE_SERVER
@@ -59,9 +96,23 @@ Merge on the server, verifying each output:
 .EX
 ctbrec-merge-remote \-\-verify
 .EE
+.P
+Merge on the server so the job survives closing the terminal:
+.IP
+.EX
+ctbrec-merge-remote \-\-detach \-\-verify
+.EE
+.P
+Merge on a drive that is below the 15% free threshold:
+.IP
+.EX
+ctbrec-merge-remote \-\-ignore\-storage\-limit \-\-verify
+.EE
 .SH EXIT STATUS
 The exit status of the remote
 .BR ctbrec-merge (1).
 .SH SEE ALSO
 .BR ctbrec-merge (1),
-.BR ssh (1)
+.BR ssh (1),
+.BR setsid (1),
+.BR tail (1)

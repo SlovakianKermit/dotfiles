@@ -29,6 +29,15 @@ declare -A RSYNC_EXCLUDES=(
   ["configs/opencode"]="node_modules/ package.json package-lock.json bun.lock .gitignore"
 )
 
+# Patterns excluded from every rsync: local backups and runtime caches that
+# should never reach the repository.
+GLOBAL_EXCLUDES=(
+  "*.bak"
+  "*.bak.*"
+  "__pycache__/"
+  "*.pyc"
+)
+
 SYMLINKS=(
   "${HOME}/.config/alacritty:dotfiles/alacritty"
   "${HOME}/.config/fastfetch:dotfiles/fastfetch"
@@ -111,6 +120,20 @@ require() {
 }
 
 is_dry_run()  { $DRY_RUN; }
+
+# Build the rsync --exclude arguments for a repo-relative destination path:
+# the global backups/caches list plus any path-specific patterns.
+rsync_exclude_args() {
+  local rel="$1" pat
+  for pat in "${GLOBAL_EXCLUDES[@]}"; do
+    printf ' --exclude=%s' "${pat}"
+  done
+  if [[ -n "${RSYNC_EXCLUDES[${rel}]:-}" ]]; then
+    for pat in ${RSYNC_EXCLUDES[${rel}]}; do
+      printf ' --exclude=%s' "${pat}"
+    done
+  fi
+}
 
 # ============================================================
 # CACHYOS REPOSITORY SETUP
@@ -295,14 +318,19 @@ cmd_push() {
   : >"${REPO_DIR}/packages/skipped-hardware.txt"
   : >"${REPO_DIR}/packages/skipped-cachyos.txt"
 
-  log "Copying scripts..."
+  log "Syncing scripts..."
   mkdir -p "${REPO_DIR}/scripts"
   if [[ -d "${HOME}/.local/bin" ]]; then
+    local script_excludes
+    script_excludes="$(rsync_exclude_args scripts)"
     if $DRY_RUN; then
-      log "Would copy scripts from ~/.local/bin/"
+      log "Would rsync: ~/.local/bin/ -> scripts/${script_excludes}"
+    elif rsync -a --delete --delete-excluded ${script_excludes} "${HOME}/.local/bin/" "${REPO_DIR}/scripts/" 2>/dev/null; then
+      ok "Scripts synced."
     else
+      warn "rsync failed, falling back to cp: ~/.local/bin"
       cp -r "${HOME}/.local/bin/." "${REPO_DIR}/scripts/" 2>/dev/null || true
-      ok "Scripts copied."
+      ok "Scripts copied (fallback)."
     fi
   else
     warn "~/.local/bin not found, skipping."
@@ -318,12 +346,8 @@ cmd_push() {
         ok "Already linked: ${src}"
         continue
       fi
-      local rsync_excludes=""
-      if [[ -n "${RSYNC_EXCLUDES[${entry##*:}]:-}" ]]; then
-        for pat in ${RSYNC_EXCLUDES[${entry##*:}]}; do
-          rsync_excludes+=" --exclude=${pat}"
-        done
-      fi
+      local rsync_excludes
+      rsync_excludes="$(rsync_exclude_args "${entry##*:}")"
       if $DRY_RUN; then
         log "Would rsync: ${src} -> ${dest}${rsync_excludes}"
       elif rsync -a --delete ${rsync_excludes} "${src%/}/" "${dest}/" 2>/dev/null; then
@@ -349,12 +373,8 @@ cmd_push() {
         log "Would copy: ${src} -> ${dest}"
         continue
       fi
-      local rsync_excludes=""
-      if [[ -n "${RSYNC_EXCLUDES[${entry##*:}]:-}" ]]; then
-        for pat in ${RSYNC_EXCLUDES[${entry##*:}]}; do
-          rsync_excludes+=" --exclude=${pat}"
-        done
-      fi
+      local rsync_excludes
+      rsync_excludes="$(rsync_exclude_args "${entry##*:}")"
       if [[ -d "${src}" ]]; then
         rsync -a --delete ${rsync_excludes} "${src%/}/" "${dest}/" 2>/dev/null ||
           cp -r "${src}" "${dest}"

@@ -17,6 +17,7 @@ pkgbrowser
 qimgv
 r2modman-bin
 sober-bin
+spotifast-bin
 typing_test
 vesktop
 wthrr-bin

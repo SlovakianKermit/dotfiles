@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/v2/cli.json",
+  "plugins": [
+    "@tarquinen/opencode-dcp@3.2.0"
+  ],
+  "attention": {
+    "notifications": true,
+    "sound": true,
+    "volume": 0.5
+  }
+}

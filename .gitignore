@@ -16,3 +16,10 @@ configs/obsidian/DawnWebGPUCache/
 configs/obsidian/Session Storage/
 configs/obsidian/Local Storage/
 dotfiles/xnviewmp/XnView-*.db
+
+# Local backups and runtime caches (never sync these)
+*.bak
+*.bak.*
+*.pyc
+__pycache__/
+dotfiles/mpv/window-state.json

@@ -82,6 +82,7 @@ inetutils
 iperf3
 iwd
 jdk21-openjdk
+jellyfin-mpv-shim
 jfsutils
 kate
 kcalc
@@ -120,8 +121,11 @@ mda.lv2
 meld
 mesa-utils
 micro
+mkinitcpio
 modemmanager
 moonlight-qt
+mpv-mpris
+mpv-shim-default-shaders
 mtools
 mtr
 nano
@@ -179,6 +183,7 @@ python-defusedxml
 python-packaging
 python-pip
 python-pyqt5
+python-pystray
 qbittorrent
 rclone
 rebuild-detector

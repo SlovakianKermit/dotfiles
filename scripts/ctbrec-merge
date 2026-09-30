@@ -3,9 +3,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -15,7 +17,12 @@ FLAT_RE = re.compile(r'^(.+)_Chaturbate_(\d{8})-(\d{6})\.mts$')
 VKEY = ("codec_name", "width", "height", "r_frame_rate")
 AKEY = ("codec_name", "sample_rate", "channels")
 
+APPEND_MARGIN = 0.5
+FREE_MARGIN_BYTES = 1000 * 1000 * 1000
+
 CURRENT_PART = None
+CURRENT_APPEND = None
+CURRENT_APPEND_SIZE = 0
 DELETED_SO_FAR = 0
 KEPT_SO_FAR = 0
 
@@ -35,52 +42,135 @@ def parse_filename(name):
     return None
 
 
-def probe(path):
+def probe_header(path):
     cmd = [
         "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels",
+        "-read_intervals", "0%+1",
+        "-show_entries", "format=start_time",
+        "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels,id",
         "-of", "json", path,
     ]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return None
     try:
-        data = json.loads(r.stdout)
-        dur = float(data["format"]["duration"])
+        start = float(json.loads(r.stdout)["format"]["start_time"])
     except (KeyError, ValueError, TypeError):
         return None
     v = a = None
-    for s in data.get("streams", []):
+    pids = []
+    for s in json.loads(r.stdout).get("streams", []):
         if s.get("codec_type") == "video" and v is None:
             v = s
         elif s.get("codec_type") == "audio" and a is None:
             a = s
+        if s.get("id") is not None:
+            pids.append(str(s["id"]))
     vsig = tuple(v.get(k) for k in VKEY) if v else None
     asig = tuple(a.get(k) for k in AKEY) if a else None
-    return dur, vsig, asig
+    return start, vsig, asig, tuple(sorted(pids))
+
+
+def probe_duration(path):
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1", path,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def ts_packet_size(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except OSError:
+        return None
+    if len(head) >= 389 and head[0] == 0x47 and head[188] == 0x47 and head[376] == 0x47:
+        return 188
+    if len(head) >= 389 and head[4] == 0x47 and head[196] == 0x47 and head[388] == 0x47:
+        return 192
+    return None
 
 
 def active_write_paths(root):
-    try:
-        r = subprocess.run(
-            ["lsof", "-w", "+D", root],
-            capture_output=True, text=True, timeout=600,
-        )
-    except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"  warn: lsof failed ({e}), relying on --age only", file=sys.stderr)
-        return None
     active = set()
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) < 9 or parts[0] == "COMMAND":
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return None
+    for pid in pids:
+        if not pid.isdigit():
             continue
-        if not re.match(r'^\d+[uw]', parts[3]):
+        fddir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
             continue
-        path = parts[-1]
-        if path.startswith(root):
-            active.add(path)
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fddir, fd))
+            except OSError:
+                continue
+            if not target.startswith(root):
+                continue
+            if not (target.endswith(".ts") or target.endswith(".mts")):
+                continue
+            try:
+                with open(f"/proc/{pid}/fdinfo/{fd}") as fi:
+                    flags = None
+                    for line in fi:
+                        if line.startswith("flags:"):
+                            flags = int(line.split()[1], 8)
+                            break
+            except (OSError, ValueError):
+                continue
+            if flags is not None and (flags & 0o3) in (1, 2):
+                active.add(target)
     return active
+
+
+def io_full_avg10():
+    try:
+        with open("/proc/pressure/io") as f:
+            for line in f:
+                if line.startswith("full"):
+                    for tok in line.split():
+                        if tok.startswith("avg10="):
+                            return float(tok.split("=", 1)[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def wait_for_drain(args):
+    if args.cooldown > 0:
+        time.sleep(args.cooldown)
+    if args.io_wait_max <= 0:
+        return
+    deadline = time.monotonic() + args.io_wait_max
+    stable = 0
+    notified = False
+    while time.monotonic() < deadline:
+        v = io_full_avg10()
+        if v is None:
+            return
+        if v <= args.io_wait_threshold:
+            stable += 1
+            if stable >= 2:
+                return
+        else:
+            stable = 0
+            if not notified:
+                print(f"  disk busy ({v:.0f}% io pressure), waiting up to {args.io_wait_max:.0f}s")
+                notified = True
+        time.sleep(2.0)
 
 
 def find_chain_groups(rows, threshold):
@@ -138,17 +228,20 @@ def process_group(model, entries, args):
                 candidates.append(prev)
             if not candidates or candidates[-1] is not cur:
                 candidates.append(cur)
+    if len(candidates) >= 2:
+        print(f"scanning [{model}] ({len(candidates)} candidate file(s))")
     if len(candidates) < 2:
         return (0, 0, 0, 0, 0, [])
 
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        results = list(ex.map(lambda e: (e, probe(e["path"])), candidates))
+        results = list(ex.map(lambda e: (e, probe_header(e["path"])), candidates))
     by_path = {}
     for e, p in results:
         if p is None:
             print(f"  warn: could not probe {e['name']}", file=sys.stderr)
             continue
-        e["dur"], e["vsig"], e["asig"] = p
+        e["start_time"], e["vsig"], e["asig"], e["pids"] = p
+        e["dur"] = max(0.0, e["mtime"] - e["start"])
         by_path[e["path"]] = e
     candidates = [e for e in candidates if e["path"] in by_path]
     candidates.sort(key=lambda e: e["start"])
@@ -187,98 +280,28 @@ def process_group(model, entries, args):
     return (merged, bytes_out, n_del, n_keep, skipped, summary)
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        prog="ctbrec-merge",
-        description="Losslessly merge ctbrec recordings of the same model that were split by a restart (small gaps).",
-    )
-    ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
-                    help="base directory (one folder per model, or flat .mts files)")
-    ap.add_argument("--gap", type=int, default=300,
-                    help="max gap in seconds between recordings to merge (default 300)")
-    ap.add_argument("--slack", type=int, default=30,
-                    help="extra seconds of slack when finding candidates via mtime (default 30)")
-    ap.add_argument("--age", type=int, default=300,
-                    help="skip files modified in the last N seconds (default 300)")
-    ap.add_argument("--no-lsof", action="store_true",
-                    help="skip the exact lsof open-for-write check (fall back to --age only)")
-    ap.add_argument("--keep", action="store_true",
-                    help="move merged originals to .merged_originals/ instead of deleting")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="print the merge plan without changing anything")
-    ap.add_argument("--top-level", action="store_true",
-                    help="only process files directly in --dir, never enter subdirectories")
-    ap.add_argument("--verify", action="store_true",
-                    help="verify merged output duration with ffprobe (extra full read)")
-    ap.add_argument("-j", "--jobs", type=int, default=8,
-                    help="parallel ffprobe workers (default 8)")
-    args = ap.parse_args()
-
-    if not os.path.isdir(args.dir):
-        print(f"error: {args.dir} is not a directory", file=sys.stderr)
-        return 1
-
-    now = datetime.now().timestamp()
-    active_paths = None
-    if not args.no_lsof:
-        active_paths = active_write_paths(args.dir)
-        if active_paths is not None:
-            print(f"lsof: {len(active_paths)} file(s) currently open for writing")
-    files = sorted(os.listdir(args.dir))
-    total_merged = 0
-    total_bytes = 0
-    deleted = 0
-    kept = 0
-    skipped_params = 0
-    active = 0
-    summary = []
-
-    subdirs = [d for d in files if os.path.isdir(os.path.join(args.dir, d))]
-    top_files = [f for f in files if os.path.isfile(os.path.join(args.dir, f))]
-    has_top_recordings = any(parse_filename(f) for f in top_files)
-    model_groups = []
-    if args.top_level or has_top_recordings:
-        entries, act = collect_entries(args.dir, now, args.age, active_paths)
-        active += act
-        by_model = {}
-        for e in entries:
-            by_model.setdefault(e["model"], []).append(e)
-        model_groups = [(m, es) for m, es in by_model.items() if len(es) >= 2]
-    elif subdirs:
-        for d in subdirs:
-            cpath = os.path.join(args.dir, d)
-            entries, act = collect_entries(cpath, now, args.age, active_paths)
-            active += act
-            if len(entries) >= 2:
-                model_groups.append((d, entries))
-
-    for model, entries in model_groups:
-        merged, bytes_out, n_del, n_keep, skipped, res_summary = process_group(model, entries, args)
-        total_merged += merged
-        total_bytes += bytes_out
-        deleted += n_del
-        kept += n_keep
-        skipped_params += skipped
-        summary.extend(res_summary)
-
-    if summary:
-        print("\nSummary:")
-        for s in summary:
-            print(f"  {s['model']}: {s['parts']} parts -> {s['name']} ({s['size']/1e6:.0f} MB, gaps {s['gaps']})")
-    print(f"\ndone: {total_merged} files merged ({total_bytes/1e6:.0f} MB output)")
-    if deleted:
-        print(f"      {deleted} originals deleted")
-    if kept:
-        print(f"      {kept} originals moved to .merged_originals/")
-    if skipped_params:
-        print(f"      {skipped_params} files not merged (codec/params differ)")
-    if active:
-        print(f"      {active} files skipped (open for writing or modified within --age)")
-    return 0
+def append_preflight(group):
+    if len(group) < 2:
+        return None
+    sizes = {}
+    for e in group:
+        ps = ts_packet_size(e["path"])
+        if ps is None:
+            return None
+        sizes[e["path"]] = ps
+    if len(set(sizes.values())) != 1:
+        return None
+    ps = next(iter(sizes.values()))
+    if any(e["size"] % ps != 0 for e in group):
+        return None
+    if group[0].get("start_time") is None:
+        return None
+    if any(e.get("pids") != group[0].get("pids") for e in group[1:]):
+        return None
+    return {"packet": ps, "start_time": group[0]["start_time"]}
 
 
 def merge_run(group, args):
-    gap_txt = ""
     gaps = []
     for prev, cur in zip(group, group[1:]):
         gaps.append(round(cur["start"] - (prev["start"] + prev["dur"])))
@@ -286,7 +309,7 @@ def merge_run(group, args):
 
     model = group[0]["model"]
     out_name = group[0]["name"]
-    out_path = os.path.join(group[0]["dir"], out_name)
+    out_path = group[0]["path"]
     in_sizes = sum(e["size"] for e in group)
     in_durs = sum(e["dur"] for e in group)
 
@@ -297,9 +320,22 @@ def merge_run(group, args):
 
     base = {"model": model, "name": out_name, "parts": len(group), "gaps": gap_txt}
 
+    pre = None if args.keep else append_preflight(group)
+    mode = "append" if (args.append and pre) else "concat"
+    print(f"     mode: {mode}")
+
     if args.dry_run:
         base.update({"merged": False, "size": 0, "n_del": 0, "n_keep": 0})
         return base
+
+    du = shutil.disk_usage(group[0]["dir"])
+    need = (in_sizes - group[0]["size"] if mode == "append" else in_sizes) + FREE_MARGIN_BYTES
+    if du.free < need:
+        print(f"  skip: need {need/1e9:.1f} GB free, have {du.free/1e9:.1f} GB", file=sys.stderr)
+        return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+
+    if mode == "append":
+        return append_run(group, args, pre, base, gaps)
 
     part_path = out_path + ".part"
     global CURRENT_PART
@@ -309,6 +345,7 @@ def merge_run(group, args):
     except OSError:
         pass
     list_txt = "".join(f"file '{e['path']}'\n" for e in group)
+    print(f"  remuxing {len(group)} parts with ffmpeg concat")
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
         tf.write(list_txt)
         list_path = tf.name
@@ -319,6 +356,7 @@ def merge_run(group, args):
         r = subprocess.run(cmd, input=None, capture_output=True, text=True)
     finally:
         os.remove(list_path)
+    CURRENT_PART = None
     if r.returncode != 0:
         print(f"  error: ffmpeg failed, kept originals\n{r.stderr}", file=sys.stderr)
         try:
@@ -337,8 +375,8 @@ def merge_run(group, args):
         return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
 
     if args.verify:
-        p = probe(part_path)
-        if p is None or abs(p[0] - in_durs) > 2:
+        p = probe_duration(part_path)
+        if p is None or abs(p - in_durs) > max(5.0, 0.02 * in_durs):
             print(f"  error: verify failed, kept originals", file=sys.stderr)
             try:
                 os.remove(part_path)
@@ -371,6 +409,188 @@ def merge_run(group, args):
     return {"merged": True, **base, "size": out_size, "n_del": n_del, "n_keep": n_keep}
 
 
+def append_run(group, args, pre, base, gaps):
+    global CURRENT_APPEND, CURRENT_APPEND_SIZE, DELETED_SO_FAR
+    out_path = group[0]["path"]
+    orig_size = os.path.getsize(out_path)
+    start1 = pre["start_time"]
+    t1 = group[0]["start"]
+    last_off = start1
+    appended = 0
+    CURRENT_APPEND = out_path
+    CURRENT_APPEND_SIZE = orig_size
+    with open(out_path, "ab") as f:
+        for e in group[1:]:
+            off = start1 + (e["start"] - t1)
+            if off < last_off + APPEND_MARGIN:
+                off = last_off + APPEND_MARGIN
+            print(f"  appending {e['name']} ({e['size']/1e6:.0f} MB)")
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                   "-i", e["path"], "-map", "0", "-c", "copy",
+                   "-muxdelay", "0", "-muxpreload", "0",
+                   "-output_ts_offset", f"{off:.3f}",
+                   "-f", "mpegts", "pipe:1"]
+            r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+            if r.returncode != 0:
+                f.flush()
+                os.truncate(out_path, orig_size)
+                CURRENT_APPEND = None
+                print(f"  error: ffmpeg append failed, part rolled back, kept originals\n{r.stderr.decode(errors='replace')}", file=sys.stderr)
+                return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+            last_off = off + max(0.0, e["mtime"] - e["start"])
+            appended += e["size"]
+        f.flush()
+        os.fsync(f.fileno())
+    new_size = os.path.getsize(out_path)
+    expected = orig_size + appended
+    if abs(new_size - expected) > max(2 * 1024 * 1024, 0.03 * expected):
+        os.truncate(out_path, orig_size)
+        CURRENT_APPEND = None
+        print(f"  error: appended size {new_size} vs expected {expected}, part rolled back", file=sys.stderr)
+        return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+
+    if args.verify:
+        p = probe_duration(out_path)
+        expected_dur = last_off + max(0.0, group[-1]["mtime"] - group[-1]["start"]) - start1
+        if p is None or abs(p - expected_dur) > max(10.0, 0.05 * expected_dur):
+            os.truncate(out_path, orig_size)
+            CURRENT_APPEND = None
+            print(f"  error: verify failed, part rolled back", file=sys.stderr)
+            return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+
+    n_del = len(group) - 1
+    for e in group[1:]:
+        os.remove(e["path"])
+        DELETED_SO_FAR += 1
+    CURRENT_APPEND = None
+    CURRENT_APPEND_SIZE = 0
+
+    print(f"  ok: {group[0]['name']} ({new_size/1e6:.0f} MB), appended {len(group)-1} part(s), {appended/1e6:.0f} MB folded in")
+    return {"merged": True, **base, "size": new_size, "n_del": n_del, "n_keep": 0}
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ctbrec-merge",
+        description="Losslessly merge ctbrec recordings of the same model that were split by a restart (small gaps).",
+    )
+    ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
+                    help="base directory (one folder per model, or flat .mts files)")
+    ap.add_argument("--gap", type=int, default=300,
+                    help="max gap in seconds between recordings to merge (default 300)")
+    ap.add_argument("--slack", type=int, default=30,
+                    help="extra seconds of slack when finding candidates via mtime (default 30)")
+    ap.add_argument("--age", type=int, default=300,
+                    help="skip files modified in the last N seconds (default 300)")
+    ap.add_argument("--no-lsof", action="store_true",
+                    help="skip the open-for-write activity check (fall back to --age only)")
+    ap.add_argument("--keep", action="store_true",
+                    help="move merged originals to .merged_originals/ instead of deleting (disables append)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the merge plan without changing anything")
+    ap.add_argument("--top-level", action="store_true",
+                    help="only process files directly in --dir, never enter subdirectories")
+    ap.add_argument("--verify", action="store_true",
+                    help="verify merged output duration with ffprobe (extra full read)")
+    ap.add_argument("-j", "--jobs", type=int, default=1,
+                    help="parallel header probes (default 1)")
+    ap.add_argument("--no-append", dest="append", action="store_false",
+                    help="disable byte-append merging, always remux via ffmpeg concat")
+    ap.add_argument("--min-free-pct", type=float, default=15.0,
+                    help="refuse to run when the filesystem is less than this percent free (default 15)")
+    ap.add_argument("--max-streams", type=int, default=4,
+                    help="defer when more than this many recordings are open for writing (default 4)")
+    ap.add_argument("--cooldown", type=float, default=10.0,
+                    help="minimum seconds to sleep between merged groups (default 10)")
+    ap.add_argument("--io-wait-max", type=float, default=180.0,
+                    help="after --cooldown, wait up to this many seconds for io pressure to fall below --io-wait-threshold; 0 disables (default 180)")
+    ap.add_argument("--io-wait-threshold", type=float, default=5.0,
+                    help="host io pressure (full avg10 percent) considered drained (default 5)")
+    ap.add_argument("--max-run-gb", type=float, default=0.0,
+                    help="stop after this many GB of output per run; 0 disables (default unlimited)")
+    args = ap.parse_args()
+
+    if not os.path.isdir(args.dir):
+        print(f"error: {args.dir} is not a directory", file=sys.stderr)
+        return 1
+
+    du = shutil.disk_usage(args.dir)
+    free_pct = 100.0 * du.free / du.total
+    if free_pct < args.min_free_pct:
+        print(f"error: only {free_pct:.1f}% free (< --min-free-pct {args.min_free_pct:.0f}), refusing to merge", file=sys.stderr)
+        return 1
+
+    now = datetime.now().timestamp()
+    active_paths = None
+    if not args.no_lsof:
+        active_paths = active_write_paths(args.dir)
+        if active_paths is not None:
+            print(f"active: {len(active_paths)} recording(s) open for writing")
+            if len(active_paths) > args.max_streams:
+                print(f"deferring: {len(active_paths)} active recordings (> --max-streams {args.max_streams})", file=sys.stderr)
+                return 0
+
+    files = sorted(os.listdir(args.dir))
+    total_merged = 0
+    total_bytes = 0
+    deleted = 0
+    kept = 0
+    skipped_params = 0
+    active = 0
+    summary = []
+
+    subdirs = [d for d in files if os.path.isdir(os.path.join(args.dir, d))]
+    top_files = [f for f in files if os.path.isfile(os.path.join(args.dir, f))]
+    has_top_recordings = any(parse_filename(f) for f in top_files)
+    model_groups = []
+    if args.top_level or has_top_recordings:
+        entries, act = collect_entries(args.dir, now, args.age, active_paths)
+        active += act
+        by_model = {}
+        for e in entries:
+            by_model.setdefault(e["model"], []).append(e)
+        model_groups = [(m, es) for m, es in by_model.items() if len(es) >= 2]
+    elif subdirs:
+        for d in subdirs:
+            cpath = os.path.join(args.dir, d)
+            entries, act = collect_entries(cpath, now, args.age, active_paths)
+            active += act
+            if len(entries) >= 2:
+                model_groups.append((d, entries))
+
+    budget = args.max_run_gb * 1e9
+    ran = 0
+    for model, entries in model_groups:
+        merged, bytes_out, n_del, n_keep, skipped, res_summary = process_group(model, entries, args)
+        total_merged += merged
+        total_bytes += bytes_out
+        deleted += n_del
+        kept += n_keep
+        skipped_params += skipped
+        summary.extend(res_summary)
+        ran += 1
+        if budget and total_bytes >= budget:
+            print(f"run budget reached ({args.max_run_gb:.0f} GB); stopping", file=sys.stderr)
+            break
+        if merged and ran < len(model_groups):
+            wait_for_drain(args)
+
+    if summary:
+        print("\nSummary:")
+        for s in summary:
+            print(f"  {s['model']}: {s['parts']} parts -> {s['name']} ({s['size']/1e6:.0f} MB, gaps {s['gaps']})")
+    print(f"\ndone: {total_merged} files merged ({total_bytes/1e6:.0f} MB output)")
+    if deleted:
+        print(f"      {deleted} originals deleted")
+    if kept:
+        print(f"      {kept} originals moved to .merged_originals/")
+    if skipped_params:
+        print(f"      {skipped_params} files not merged (codec/params differ)")
+    if active:
+        print(f"      {active} files skipped (open for writing or modified within --age)")
+    return 0
+
+
 if __name__ == "__main__":
     try:
         sys.exit(main())
@@ -378,6 +598,11 @@ if __name__ == "__main__":
         if CURRENT_PART:
             try:
                 os.remove(CURRENT_PART)
+            except OSError:
+                pass
+        if CURRENT_APPEND and CURRENT_APPEND_SIZE:
+            try:
+                os.truncate(CURRENT_APPEND, CURRENT_APPEND_SIZE)
             except OSError:
                 pass
         print("\ninterrupted: partial output cleaned up", file=sys.stderr)

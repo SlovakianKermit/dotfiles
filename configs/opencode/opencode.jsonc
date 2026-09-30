@@ -1,16 +1,16 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "deepseek/deepseek-flash",
-  "plugin": [
-    "opencode-pty",
-    "@tarquinen/opencode-dcp",
-    "opencode-supermemory@latest"
+  "plugins": [
+    "opencode-pty/v2",
+    "@tarquinen/opencode-dcp@3.2.0",
+    "opencode-supermemory@2.0.15"
   ],
-  "provider": {
+  "providers": {
     "deepseek": {
-      "npm": "@ai-sdk/openai-compatible",
+      "package": "aisdk:@ai-sdk/openai-compatible",
       "name": "DeepSeek",
-      "options": {
+      "settings": {
         "baseURL": "https://api.deepseek.com/v1"
       },
       "models": {
@@ -23,68 +23,57 @@
       }
     }
   },
-  "agent": {
+  "agents": {
     "compaction": {
       "model": "deepseek/deepseek-flash"
     },
     "plan": {
-      "permission": {
-        "edit": "deny",
-        "external_directory": {
-          "*": "allow"
-        },
-        "bash": {
-          "*": "allow",
-          "rm -rf *": "deny",
-          "rm -fr *": "deny",
-          "shutdown *": "deny",
-          "reboot *": "deny",
-          "poweroff *": "deny",
-          "systemctl start *": "deny",
-          "systemctl stop *": "deny",
-          "systemctl restart *": "deny",
-          "pacman -S *": "deny",
-          "pacman -R *": "deny",
-          "pacman -U *": "deny",
-          "sudo *": "deny",
-          "ssh * sudo *": "deny"
-        }
-      }
+      "permissions": [
+        { "action": "edit", "resource": "*", "effect": "deny" },
+        { "action": "external_directory", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "rm -rf *", "effect": "deny" },
+        { "action": "shell", "resource": "rm -fr *", "effect": "deny" },
+        { "action": "shell", "resource": "shutdown *", "effect": "deny" },
+        { "action": "shell", "resource": "reboot *", "effect": "deny" },
+        { "action": "shell", "resource": "poweroff *", "effect": "deny" },
+        { "action": "shell", "resource": "systemctl start *", "effect": "deny" },
+        { "action": "shell", "resource": "systemctl stop *", "effect": "deny" },
+        { "action": "shell", "resource": "systemctl restart *", "effect": "deny" },
+        { "action": "shell", "resource": "pacman -S *", "effect": "deny" },
+        { "action": "shell", "resource": "pacman -R *", "effect": "deny" },
+        { "action": "shell", "resource": "pacman -U *", "effect": "deny" },
+        { "action": "shell", "resource": "sudo *", "effect": "deny" },
+        { "action": "shell", "resource": "ssh * sudo *", "effect": "deny" }
+      ]
     }
   },
-  "permission": {
-    "read": "allow",
-    "edit": {
-      "*": "ask",
-      "**/.local/bin/**": "allow",
-      "tmp/**": "allow"
-    },
-    "external_directory": {
-      "**/.local/bin/**": "allow",
-      "**/tmp/**": "allow"
-    },
-    "bash": {
-      "*": "allow",
-      "*rm -rf*": "deny",
-      "*rm -fr*": "deny",
-      "*shred *": "deny",
-      "*wipefs*": "deny",
-      "*mkfs*": "deny",
-      "*dd if=*": "deny",
-      "*> /dev/sd*": "deny",
-      "*shutdown*": "deny",
-      "*reboot*": "deny",
-      "*poweroff*": "deny"
-    },
-    "searxng": "allow"
-  },
+  "permissions": [
+    { "action": "read", "resource": "*", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "ask" },
+    { "action": "edit", "resource": "$HOME/.local/bin/*", "effect": "allow" },
+    { "action": "edit", "resource": "$HOME/.local/share/man/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "$HOME/.local/bin/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "$HOME/.local/share/man/*", "effect": "allow" },
+    { "action": "shell", "resource": "*", "effect": "allow" },
+    { "action": "shell", "resource": "*rm -rf*", "effect": "deny" },
+    { "action": "shell", "resource": "*rm -fr*", "effect": "deny" },
+    { "action": "shell", "resource": "*shred *", "effect": "deny" },
+    { "action": "shell", "resource": "*wipefs*", "effect": "deny" },
+    { "action": "shell", "resource": "*mkfs*", "effect": "deny" },
+    { "action": "shell", "resource": "*dd if=*", "effect": "deny" },
+    { "action": "shell", "resource": "*> /dev/sd*", "effect": "deny" },
+    { "action": "shell", "resource": "*shutdown*", "effect": "deny" },
+    { "action": "shell", "resource": "*reboot*", "effect": "deny" },
+    { "action": "shell", "resource": "*poweroff*", "effect": "deny" },
+    { "action": "searxng", "resource": "*", "effect": "allow" }
+  ],
   "compaction": {
     "auto": true,
-    "prune": true,
-    "reserved": 10000
+    "buffer": 10000
   },
   "instructions": [
     "~/.config/opencode/instructions.md",
-    "~/.config/opencode/plugin/shell-strategy/shell_strategy.md"
+    "~/.config/opencode/instructions/shell_strategy.md"
   ]
 }

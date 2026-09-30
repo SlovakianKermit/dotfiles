@@ -48,7 +48,6 @@ linux-firmware
 linux-firmware-amdgpu
 localsend
 mangojuice
-mkinitcpio
 octopi
 opencl-mesa
 pacman-contrib
@@ -60,8 +59,8 @@ proton-cachyos-native
 protonup-qt
 ryujinx
 shelly
+shelly-flatpak-backend
 speedtest++
-sunshine
 ventoy-bin
 vulkan-radeon
 xpadneo-dkms

@@ -1,0 +1,39 @@
+.TH FFMPEG-ENCODE-AV1 1 "2026-09-20" "ffmpeg-encode-av1" "User Commands"
+.SH NAME
+ffmpeg-encode-av1 \- run ffmpeg-encode in AV1 mode
+.SH SYNOPSIS
+.B ffmpeg-encode-av1
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B ffmpeg-encode-av1
+is a thin wrapper that invokes
+.BR ffmpeg-encode (1)
+with
+.B \-\-codec av1
+prepended, so the AV1 VAAPI encoder is selected by default.
+.P
+All options are passed through unchanged and behave exactly as documented in
+.BR ffmpeg-encode (1).
+An explicit
+.B \-\-codec
+later on the command line overrides the default.
+.SH OPTIONS
+See
+.BR ffmpeg-encode (1).
+.SH EXAMPLES
+Encode a directory tree to AV1 with the default quality:
+.IP
+.EX
+ffmpeg-encode-av1 \-i ~/Videos/raw \-o ~/Videos/encoded
+.EE
+.P
+AV1 at a specific quality target:
+.IP
+.EX
+ffmpeg-encode-av1 \-q 110
+.EE
+.SH SEE ALSO
+.BR ffmpeg-encode (1),
+.BR ffmpeg (1)
+.SH AUTHOR
+Written for local use with VAAPI on AMD RDNA4 (RX 9070 class).

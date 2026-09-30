@@ -5,5 +5,37 @@ SERVER="${CTBREC_MERGE_SERVER:-proxmox}"
 REMOTE_BIN="${CTBREC_MERGE_BIN:-/usr/local/bin/ctbrec-merge}"
 REMOTE_DIR="${CTBREC_MERGE_DIR:-/mnt/pve/Data_Storage/ctbrec}"
 
-exec ssh -o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes \
-  "$SERVER" "$REMOTE_BIN" --dir "$REMOTE_DIR" "$@"
+detach=0
+ignore_storage_limit=0
+args=()
+for a in "$@"; do
+  case "$a" in
+    -d|--detach) detach=1 ;;
+    --ignore-storage-limit) ignore_storage_limit=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+
+if (( ignore_storage_limit )); then
+  args+=(--min-free-pct 0)
+fi
+
+SSH_OPTS=(-o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
+
+if (( detach )); then
+  remote_cmd="env PYTHONUNBUFFERED=1 $(printf '%q ' "$REMOTE_BIN" --dir "$REMOTE_DIR" ${args[@]+"${args[@]}"})"
+  exec ssh "${SSH_OPTS[@]}" "$SERVER" bash -s <<EOF
+log=\$(mktemp "\${TMPDIR:-/tmp}/ctbrec-merge.XXXXXX.log")
+echo "detached: survives disconnect; server log: \$log"
+setsid --wait $remote_cmd >"\$log" 2>&1 </dev/null &
+pid=\$!
+tail -n +1 -F --pid="\$pid" "\$log" 2>/dev/null || true
+wait "\$pid" 2>/dev/null
+rc=\$?
+printf '\ndetached job finished (exit %s); full log kept at %s\n' "\$rc" "\$log"
+exit "\$rc"
+EOF
+fi
+
+exec ssh "${SSH_OPTS[@]}" "$SERVER" \
+  env PYTHONUNBUFFERED=1 "$REMOTE_BIN" --dir "$REMOTE_DIR" ${args[@]+"${args[@]}"}
