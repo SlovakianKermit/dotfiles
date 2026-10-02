@@ -1,0 +1,205 @@
+.TH DICTATE 1 "2026-10-01" "dictate" "User Commands"
+.SH NAME
+dictate \- toggle voice dictation into the focused window
+.SH SYNOPSIS
+.B dictate
+[\fIOPTIONS\fR]
+.P
+.B dictate
+.B \-i
+\fIFILE\fR
+[\fB\-o\fR]
+.SH DESCRIPTION
+.B dictate
+records from the microphone and transcribes speech locally with
+.BR whisper-cli (1),
+then types the result into whichever window currently has focus \- including
+terminals, editors and browsers. The default mode is a toggle: the first
+invocation starts recording, the next stops it, transcribes and types.
+.P
+Recording uses
+.BR pw-record (1)
+(PipeWire) at 16\ kHz mono; if
+.B pw-record
+is unavailable the script falls back to
+.BR parec (1).
+Text is injected with
+.BR ydotool (1),
+which sends real input events through
+.IR /dev/uinput
+and therefore works on Wayland compositors such as KWin that do not implement
+the virtual-keyboard protocol used by
+.BR wtype (1).
+.P
+Transcription is fully offline. The model is loaded from disk on every run, so
+.B dictate
+holds no memory while idle; only the small
+.B ydotoold
+daemon stays resident.
+.SH OPTIONS
+.TP
+.BI \-i " FILE"
+Transcribe
+.I FILE
+(WAV, MP3, and other formats whisper.cpp can read) and type the result,
+instead of toggling the microphone.
+.TP
+.B \-o
+Print the transcript to standard output instead of typing it.
+.TP
+.BI \-m " FILE"
+Path to the whisper model. Default:
+.IR ~/.local/share/whisper/models/ggml-large-v3-turbo-q5_0.bin .
+.TP
+.BI \-l " LANG"
+Spoken language as an ISO code (en, de, ...), or
+.B auto
+to detect it. Default:
+.IR en .
+.TP
+.BI \-d " DEV"
+Capture device or PipeWire target node. Default: the system default source.
+.TP
+.BI \-t " N"
+Number of threads passed to
+.BR whisper-cli .
+Default: the number of CPUs
+.RB ( nproc ).
+.TP
+.B \-h
+Show a short help message and exit.
+.SH BEHAVIOUR
+.SS State
+Toggle state lives in
+.IR $XDG_RUNTIME_DIR/dictate- N ,
+where
+.I N
+is the user id. The recorder's PID is stored in
+.I rec.pid
+and the audio in
+.IR rec.wav .
+An
+.BR flock (1)
+lock stops two toggles from racing.
+.SS Transcript cleanup
+Non-speech tags emitted by whisper (for example
+.B [BLANK_AUDIO]
+or
+.BR (silence) )
+are removed, newlines are collapsed to spaces, and surrounding whitespace is
+trimmed. No trailing newline or
+.B Enter
+key is inserted, so the text can be reviewed before it is sent.
+.SS Typing speed
+The transcript is typed with
+.BR ydotool .
+The inter-key delay and hold default to 8\ ms (faster than ydotool's own
+20\ ms); raise
+.B DICTATE_KEY_DELAY
+and
+.B DICTATE_KEY_HOLD
+if a busy application drops characters.
+.SS Notifications
+Progress is reported by desktop notifications through
+.BR notify-send (1):
+recording, transcribing, inserted, or an error.
+.SS Requirements
+.IP \(bu 2
+.B whisper-cli
+and a ggml model (package
+.BR whisper-cpp ).
+.IP \(bu 2
+.B ydotool
+with the
+.B ydotoold
+user service running, for typing.
+.IP \(bu 2
+.B pw-record
+(PipeWire) or
+.BR parec .
+.SH ENVIRONMENT
+These variables set the defaults; the matching command-line options override
+them.
+.TP
+.B DICTATE_MODEL
+Path to the whisper model (see
+.BR \-m ).
+.TP
+.B DICTATE_LANG
+Spoken language (see
+.BR \-l ).
+.TP
+.B DICTATE_DEVICE
+Capture device (see
+.BR \-d ).
+.TP
+.B DICTATE_THREADS
+Number of whisper threads. Default:
+.BR nproc .
+.TP
+.B DICTATE_KEY_DELAY
+Milliseconds between typed keys, passed to
+.BR ydotool .
+Default: 8.
+.TP
+.B DICTATE_KEY_HOLD
+Milliseconds each key is held, passed to
+.BR ydotool .
+Default: 8.
+.SH EXAMPLES
+Toggle dictation (bind this to a global shortcut):
+.IP
+.EX
+dictate
+.EE
+.P
+Transcribe a file and print it:
+.IP
+.EX
+dictate \-i interview.wav \-o
+.EE
+.P
+Transcribe a file and type it into the focused window:
+.IP
+.EX
+dictate \-i note.mp3
+.EE
+.P
+Use a smaller, faster model:
+.IP
+.EX
+dictate \-m ~/.local/share/whisper/models/ggml-small.en.bin
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including the "no speech detected" and "no audio captured" cases.
+.TP
+.B 1
+Failure: a dependency is missing, the model is absent, or another
+.B dictate
+run already holds the lock.
+.TP
+.B 2
+Usage error (unknown option or missing argument).
+.SH FILES
+.TP
+.I ~/.local/share/whisper/models/
+Default model directory.
+.TP
+.I $XDG_RUNTIME_DIR/dictate- N /
+Runtime state: PID file, recorded WAV and lock.
+.SH SEE ALSO
+.BR whisper-cli (1),
+.BR ydotool (1),
+.BR ydotoold (8),
+.BR pw-record (1),
+.BR parec (1),
+.BR notify-send (1)
+.SH BUGS
+Text is typed into whatever window has focus at the moment transcription
+finishes; do not trigger it while a password or other secure prompt is focused.
+The cleanup pass also removes any real parentheses or brackets that whisper
+produces verbatim.
+.SH AUTHOR
+Written for local use.

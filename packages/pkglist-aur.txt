@@ -16,6 +16,7 @@ onlinefix-linux-launcher-bin
 pkgbrowser
 qimgv
 r2modman-bin
+rayburst-bin
 sober-bin
 spotifast-bin
 typing_test
@@ -23,4 +24,5 @@ vesktop
 wthrr-bin
 xnviewmp
 y-cruncher
+yay-bin
 yayfzf

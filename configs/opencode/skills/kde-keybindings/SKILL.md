@@ -1,6 +1,6 @@
 ---
 name: kde-keybindings
-description: Use when reading, changing, adding, removing, or debugging KDE Plasma global keyboard shortcuts/keybindings (hotkeys) from the CLI. Triggers on "kde keybind", "kde shortcut", "global shortcut", "rebind", "keybinding", "Super", "Meta", "krunner", "kwin", "kglobalshortcutsrc", "always on top", "keep above", "khotkeys", "D-Bus shortcut", or mapping a Super/Alt/Ctrl combo to a KDE action on Wayland. Covers the live org.kde.kglobalaccel D-Bus API and the kglobalshortcutsrc file format (Plasma 5 and 6).
+description: Use when reading, changing, adding, removing, or debugging KDE Plasma global keyboard shortcuts/keybindings (hotkeys) from the CLI. Triggers on "kde keybind", "kde shortcut", "global shortcut", "custom shortcut", "command shortcut", "script shortcut", "bind a script to a key", "rebind", "keybinding", "Super", "Meta", "krunner", "kwin", "kglobalshortcutsrc", "always on top", "keep above", "khotkeys", "D-Bus shortcut", or mapping a Super/Alt/Ctrl combo to a KDE action on Wayland. Covers the live org.kde.kglobalaccel D-Bus API, custom command/script shortcuts via .desktop files, and the kglobalshortcutsrc file format (Plasma 5 and 6).
 ---
 
 # KDE keybindings (global shortcuts)
@@ -130,6 +130,7 @@ Worked values:
 - `Meta+Space` = `0x10000000 | 0x20` = `268435488`
 - `Alt+F2` = `0x08000000 | 0x01000031` = `150994993`
 - `Ctrl+Shift+S` = `0x04000000 | 0x02000000 | 0x53` = `100664403`
+- `Meta+Z` = `0x10000000 | 0x5A` = `268435546`
 
 Never hand-guess when an action already has keys: read them back with
 `shortcutKeys` (below) and reuse the ints verbatim.
@@ -148,6 +149,154 @@ grep -nE 'Window Above Other Windows|Meta\+Space' ~/.config/kglobalshortcutsrc
 
 The daemon normally rewrites `kglobalshortcutsrc` on success. If it did not
 persist, write the same value with `kwriteconfig6` (see below).
+
+## 5. Custom command / script shortcuts (Plasma 6)
+
+To bind a global hotkey to a **script or command** (rather than a KWin/other
+built-in action) you must first make KGlobalAccel aware of it through a
+`.desktop` file. This is the modern replacement for the removed KHotKeys
+"Custom Shortcuts". Such entries always use the service action unique
+`_launch` and appear under `[services][<file>.desktop]` in the rc.
+
+### Step 1 — the desktop file
+
+Create `~/.local/share/applications/<name>.desktop`:
+
+```ini
+[Desktop Entry]
+Name=Dictate
+Exec=/home/user/.local/bin/dictate
+Icon=audio-input-microphone
+Type=Application
+NoDisplay=true
+StartupNotify=false
+X-KDE-GlobalAccel-CommandShortcut=true
+```
+
+- **`X-KDE-GlobalAccel-CommandShortcut=true` is the magic key.** Without it the
+  component never registers, even after `kbuildsycoca6` (verified: adding a
+  plain `.desktop` produced no component; adding this key did).
+- Use an **absolute** `Exec=` path — do not rely on `$HOME` expansion.
+- `NoDisplay=true` is fine and does not block registration (as long as the
+  command-shortcut key is present); existing `net.local.*` entries use exactly
+  this combination.
+- `Name=` becomes the componentFriendly used in the `actionId`.
+
+```bash
+kbuildsycoca6 --noincremental    # refresh the service database
+```
+
+### Step 2 — make the component live
+
+`kglobalaccel` (owned by `kwin_wayland` on Plasma 6) does **not** reliably pick
+up a brand new desktop file on its own — `kbuildsycoca6` alone left the
+component unregistered. Register it immediately with `doRegister`:
+
+```bash
+gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+  --method org.kde.KGlobalAccel.doRegister \
+  "['dictate.desktop','_launch','Dictate','Dictate']"
+```
+
+Returns `()` on success, and a component appears immediately:
+
+```bash
+busctl --user tree org.kde.kglobalaccel | grep -i dictate   # /component/dictate_desktop
+```
+
+`doRegister` works when called from a separate process (e.g. `gdbus`); it is not
+restricted to the app itself. Otherwise the component is picked up at the next
+login, when the desktop files are scanned.
+
+### ⚠ Activation needs a new session — check `isActive`
+
+Registering the component and setting the shortcut is **not enough**: the
+component comes up with `isActive == false` and KWin never grabs the key, so the
+combo falls through to the focused window (e.g. `Meta+Shift+D` just types `D`).
+Command shortcuts present at login report `isActive == true`.
+
+```bash
+# false => registered but NOT grabbed (the shortcut will not fire)
+gdbus call --session --dest org.kde.kglobalaccel \
+  --object-path /component/dictate_desktop \
+  --method org.kde.kglobalaccel.Component.isActive
+```
+
+There is **no D-Bus method to flip this live** (verified): `doRegister` only
+creates the D-Bus object; `setForeignShortcutKeys` only writes config;
+`setShortcutKeys` with flags `1` (SetPresent) or `4` (IsDefault) does not
+activate it; and the main interface exposes no reload/scan method. In Plasma 6.7
+there is no separate daemon to restart either — `/usr/lib/kglobalacceld` runs as
+a `static` `plasma-kglobalaccel.service` that exits, and `kwin_wayland` owns
+`org.kde.kglobalaccel`.
+
+**Fix: log out and back in** (a session restart, *not* a service restart). At
+the next session start the desktop-file scan registers the component as active
+and grabs the key from the `[services][<file>.desktop]` rc entry. This is the
+same reason a freshly added command shortcut does not work until you re-login —
+and it is why `doRegister` is only a convenience for *inspecting/verifying* the
+component, not a way to make it live. Do **not** restart
+`kwin_wayland`/`plasmashell` to force it.
+
+### Step 3 — bind it
+
+Same setter as any action, with the service `actionId`:
+
+```bash
+gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+  --method org.kde.KGlobalAccel.setForeignShortcutKeys \
+  "['dictate.desktop','_launch','Dictate','Dictate']" \
+  "[([268435546],)]"        # Meta+Z
+```
+
+### Step 4 — verify
+
+```bash
+# the action, its live keys and defaults
+gdbus call --session --dest org.kde.kglobalaccel \
+  --object-path /component/dictate_desktop \
+  --method org.kde.kglobalaccel.Component.allShortcutInfos
+# -> ([('_launch','Dictate','dictate.desktop','Dictate','default',
+#       'Default Context',[268435546],@ai [])],)
+
+# persisted rc entry (stored in sorted order among the other [services] groups)
+grep -nA1 'services\]\[dictate.desktop\]' ~/.config/kglobalshortcutsrc
+```
+
+### Persistence is asynchronous — do NOT double-write
+
+`setForeignShortcutKeys` **does** persist, but the daemon writes
+`kglobalshortcutsrc` lazily and in sorted order. An immediate `grep` can show
+nothing while the write is still queued, which is easy to mistake for failure.
+
+> Do not "fix" an apparently-missing entry by also hand-editing the file. The
+> daemon later adds its own sorted `[services][<name>.desktop]` block and your
+> manual block becomes a **duplicate group**. Wait a moment, re-grep, and only
+> edit by hand if the daemon genuinely never writes — then remove the extra copy
+> (the daemon's is the alphabetically-placed one).
+
+### Finding a free combo / checking conflicts
+
+```bash
+# every Meta combo currently in use
+grep -oE 'Meta\+[A-Za-z0-9+]+' ~/.config/kglobalshortcutsrc | sort -u
+
+# authoritative: every action holding a given key code
+gdbus call --session --dest org.kde.kglobalaccel --object-path /kglobalaccel \
+  --method org.kde.KGlobalAccel.getGlobalShortcutsByKey 268435546
+# one entry that is ours => the combo is free for us
+```
+
+Gotchas discovered the hard way:
+
+- `getGlobalShortcutsByKey` takes a **single int**, not an array: passing
+  `[268435546]` fails with `can not parse as value of type 'i'`.
+- `isGlobalShortcutAvailable(int, str)` returns `false` when the combo is
+  already assigned **even to your own component**, so it is not a clean
+  "is this free?" test — use `getGlobalShortcutsByKey` instead.
+- A new `.desktop` is only auto-scanned at session start; without `doRegister`
+  the shortcut will not work until you log out and back in.
+- Worked example: **`Meta+Z` = `0x10000000 | 0x5A` = `268435546`**.
 
 ## kglobalshortcutsrc format
 

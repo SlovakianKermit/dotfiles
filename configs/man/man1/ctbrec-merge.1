@@ -1,6 +1,6 @@
-.TH CTBREC-MERGE 1 "2026-09-21" "ctbrec-merge" "User Commands"
+.TH CTBREC-MERGE 1 "2026-10-02" "ctbrec-merge" "User Commands"
 .SH NAME
-ctbrec-merge \- losslessly merge ctbrec recordings split by a restart
+ctbrec-merge \- losslessly merge and repair ctbrec transport stream recordings
 .SH SYNOPSIS
 .B ctbrec-merge
 [\fIOPTIONS\fP]
@@ -38,8 +38,10 @@ and
 By default the join is written by
 .B append
 mode (see BEHAVIOUR): the earliest part becomes the output and each later part
-is copied onto its end with corrected timestamps, so only the later parts are
-read and written instead of the whole output. When a pre\-flight check fails
+is copied onto its end with corrected timestamps that place it directly after
+the previous part's content, so only the later parts are read and written
+instead of the whole output and the merged timeline has no phantom gaps. When a
+pre\-flight check fails
 (differing transport packet size or PID, an unaligned part, or
 .B \-\-keep
 or
@@ -47,6 +49,15 @@ or
 the script falls back to a full
 .B ffmpeg \-f concat \-c copy
 remux.
+.P
+.B \-\-fix\-timestamps
+switches the script into repair mode. Instead of merging, it scans the
+recordings under
+.B \-\-dir
+and rewrites, in place and losslessly, any whose timeline contains phantom gaps
+left by an earlier merge (see BEHAVIOUR). Repair ffmpeg runs at low CPU/IO
+priority with a hard per\-device bandwidth cap, so an unrelated encode reading
+the same disk keeps its share of the device.
 .P
 The defaults are tuned for a drive\-managed SMR disk, where large write bursts
 cause long stalls:
@@ -74,11 +85,16 @@ sets an output budget (unlimited by default).
 .P
 A file that is currently open for writing is never merged. The script scans
 .B /proc
-for open write file descriptors under
-.BR \-\-dir
-and additionally skips files modified within
+for open write file descriptors and matches them to recordings by inode
+(spare device and inode number) rather than by path, so recorders running in a
+container, where the same files appear under a different path, are still
+detected. Files modified within
 .B \-\-age
-seconds. Parts whose video or audio codec parameters differ are left alone.
+seconds are additionally skipped as a fallback. Parts whose video (codec,
+dimensions) or audio (codec, sample rate, channels) parameters differ are left
+alone. The nominal frame rate is not compared: variable\-framerate sources
+report an unstable value from a header\-only probe, which would otherwise block
+otherwise\-identical parts.
 .P
 Requires
 .BR python3 (1),
@@ -94,8 +110,8 @@ Base directory to scan. Defaults to
 .B \-\-gap \fISECONDS\fR
 Maximum gap, in seconds, between the end of one part and the start of the next
 for the parts to be merged. Defaults to
-.BR 300
-(5 minutes).
+.BR 3600
+(60 minutes).
 .TP
 .B \-\-slack \fISECONDS\fR
 Extra slack, in seconds, allowed when pre\-selecting candidates by modification
@@ -131,8 +147,11 @@ never enter subdirectories.
 .TP
 .B \-\-verify
 Check the joined output before deleting the originals (extra full read of the
-output). In append mode the output duration is compared against the expected
-timeline; in concat mode against the input duration sum.
+output). The duration is compared against the expected timeline, and the raw
+transport PTS is scanned for discontinuities. In append mode the expected
+timeline is
+.B one part after another
+with the wall\-clock gaps removed.
 .TP
 .B \-j, \-\-jobs \fIN\fR
 Number of parallel header probes. Defaults to
@@ -149,7 +168,8 @@ Refuse to start when the filesystem holding
 is less than
 .I PERCENT
 free. Defaults to
-.BR 15 .
+.BR 3.81 ,
+which is roughly 75 GB on the 2 TB recording volume.
 A non\-zero exit is returned.
 .TP
 .B \-\-max\-streams \fIN\fR
@@ -185,6 +205,56 @@ Stop after roughly
 of merged output in one run.
 .B 0
 (the default) disables the budget so a single run processes every group.
+.TP
+.B \-\-fix\-timestamps
+Repair mode: scan the recordings and remux, in place, any whose container
+duration far exceeds its actual content, removing the phantom timeline gaps of
+an earlier merge. No merging is performed in this mode.
+.TP
+.B \-\-fix\-threshold \fIRATIO\fR
+Repair files whose container\-duration / content\-duration ratio exceeds
+.IR RATIO .
+The ratio is about
+.B 1.0
+for a file with no phantom gaps. Defaults to
+.BR 1.05 .
+.TP
+.B \-\-fix\-sample \fISECONDS\fR
+Seconds of packets sampled from the start of a file when estimating its content
+bitrate and so its content duration. Defaults to
+.BR 60 .
+.TP
+.B \-\-nice \fIN\fR
+Run repair ffmpeg at nice level
+.IR N .
+Defaults to
+.BR 19 .
+.TP
+.B \-\-io\-rate \fIRATE\fR
+Hard per\-device read and write bandwidth cap for repair ffmpeg, applied with
+.BR systemd\-run (1)
+via
+.B IOReadBandwidthMax
+and
+.BR IOWriteBandwidthMax .
+Defaults to
+.BR 80M .
+.B 0
+disables the cap, leaving only
+.B nice
+and
+.BR ionice .
+.TP
+.B \-\-io\-device \fIDEV\fR
+Block device for
+.BR \-\-io\-rate .
+Defaults to the device backing
+.BR \-\-dir ,
+detected with
+.BR findmnt (1).
+When
+.B \-\-dir
+is on a network filesystem there is no block device and the cap is skipped.
 .SH BEHAVIOUR
 .IP \(bu 2
 Each candidate part is probed with a short, header\-only
@@ -199,11 +269,25 @@ are joined.
 .IP \(bu 2
 Append mode copies each later part with
 .BR "ffmpeg \-c copy \-output_ts_offset" ,
-placing it after the previous part with a small margin so timestamps stay
-monotonic, and writes the result straight onto the end of the earliest part.
-Before extending, the first part's original length is recorded; if ffmpeg fails
-or a size or verify check fails, the file is truncated back and the originals
-are kept. Only the appended parts are removed on success.
+placing it directly after the previous part's content (subtracting the part's
+own start timestamp) with a small margin so timestamps stay monotonic and the
+merged timeline stays continuous. The result is written straight onto the end
+of the earliest part. Before extending, the first part's original length is
+recorded; if ffmpeg fails or a size or verify check fails, the file is
+truncated back and the originals are kept. Only the appended parts are removed
+on success.
+.IP \(bu 2
+In repair mode each candidate is measured by comparing its container duration
+with the duration implied by its size and its opening\-seconds bitrate. Files
+above
+.B \-\-fix\-threshold
+are remuxed with
+.BR "ffmpeg \-c copy"
+to a
+.B .part
+file, the raw transport PTS is scanned for discontinuities, and the file is
+replaced only when the timeline is continuous; a failed repair never destroys
+the original.
 .IP \(bu 2
 Concat fallback (and
 .BR \-\-keep )
@@ -239,7 +323,7 @@ kept.
 .SH FILES
 .TP
 .B .part
-Temporary output used by the concat fallback.
+Temporary output used by the concat fallback and by repair mode.
 .TP
 .B .merged_originals/
 Where originals are moved when
@@ -275,6 +359,22 @@ Merge the old flat directory layout:
 .EX
 ctbrec-merge \-\-dir /mnt/shared/Ctbrec/Recording \-\-top\-level
 .EE
+.P
+Preview and then repair merged files that have phantom timeline gaps:
+.IP
+.EX
+ctbrec-merge \-\-fix\-timestamps \-\-dry\-run
+ctbrec-merge \-\-fix\-timestamps
+.EE
+.P
+Repair without a bandwidth cap (only
+.B nice
+and
+.BR ionice ):
+.IP
+.EX
+ctbrec-merge \-\-fix\-timestamps \-\-io\-rate 0
+.EE
 .SH EXIT STATUS
 .TP
 .B 0
@@ -292,4 +392,6 @@ output is removed and an in\-progress append is rolled back.
 .SH SEE ALSO
 .BR ctbrec-merge-remote (1),
 .BR ffmpeg (1),
-.BR ffprobe (1)
+.BR ffprobe (1),
+.BR systemd-run (1),
+.BR findmnt (1)

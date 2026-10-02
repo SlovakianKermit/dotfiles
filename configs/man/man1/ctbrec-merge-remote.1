@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE-REMOTE 1 "2026-09-24" "ctbrec-merge-remote" "User Commands"
+.TH CTBREC-MERGE-REMOTE 1 "2026-10-01" "ctbrec-merge-remote" "User Commands"
 .SH NAME
 ctbrec-merge-remote \- run ctbrec-merge on the Proxmox server over ssh
 .SH SYNOPSIS
@@ -42,7 +42,7 @@ connected, and the log file path is printed so the run can be inspected later.
 .B \-\-ignore\-storage\-limit
 Run even when the target filesystem is below the
 .B \-\-min\-free\-pct
-threshold (default 15%). The wrapper translates this flag into
+threshold (default 3.81%). The wrapper translates this flag into
 .B \-\-min\-free\-pct 0
 for the remote
 .BR ctbrec-merge (1),
@@ -103,7 +103,7 @@ Merge on the server so the job survives closing the terminal:
 ctbrec-merge-remote \-\-detach \-\-verify
 .EE
 .P
-Merge on a drive that is below the 15% free threshold:
+Merge on a drive that is below the 3.81% free threshold:
 .IP
 .EX
 ctbrec-merge-remote \-\-ignore\-storage\-limit \-\-verify

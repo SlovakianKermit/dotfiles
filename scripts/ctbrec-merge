@@ -14,7 +14,7 @@ from datetime import datetime
 FILENAME_RE = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_(\d{3})\.ts$')
 FLAT_RE = re.compile(r'^(.+)_Chaturbate_(\d{8})-(\d{6})\.mts$')
 
-VKEY = ("codec_name", "width", "height", "r_frame_rate")
+VKEY = ("codec_name", "width", "height")
 AKEY = ("codec_name", "sample_rate", "channels")
 
 APPEND_MARGIN = 0.5
@@ -100,6 +100,14 @@ def ts_packet_size(path):
 
 
 def active_write_paths(root):
+    # Returns a set of (st_dev, st_ino) keys for recordings open for writing.
+    # Matching is by inode rather than by path: the recorders may run in a
+    # different mount namespace (e.g. an LXC container) and see the same files
+    # under a different path, so a prefix match against "root" would miss them.
+    try:
+        root_dev = os.stat(root).st_dev
+    except OSError:
+        return None
     active = set()
     try:
         pids = os.listdir("/proc")
@@ -114,13 +122,18 @@ def active_write_paths(root):
         except OSError:
             continue
         for fd in fds:
+            fdpath = os.path.join(fddir, fd)
             try:
-                target = os.readlink(os.path.join(fddir, fd))
+                target = os.readlink(fdpath)
             except OSError:
                 continue
-            if not target.startswith(root):
-                continue
             if not (target.endswith(".ts") or target.endswith(".mts")):
+                continue
+            try:
+                st = os.stat(fdpath)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
                 continue
             try:
                 with open(f"/proc/{pid}/fdinfo/{fd}") as fi:
@@ -132,7 +145,7 @@ def active_write_paths(root):
             except (OSError, ValueError):
                 continue
             if flags is not None and (flags & 0o3) in (1, 2):
-                active.add(target)
+                active.add((st.st_dev, st.st_ino))
     return active
 
 
@@ -203,7 +216,7 @@ def collect_entries(cpath, now, age, active_paths=None):
             st = os.stat(path)
         except OSError:
             continue
-        if active_paths and path in active_paths:
+        if active_paths and (st.st_dev, st.st_ino) in active_paths:
             active += 1
             continue
         if now - st.st_mtime <= age:
@@ -414,14 +427,17 @@ def append_run(group, args, pre, base, gaps):
     out_path = group[0]["path"]
     orig_size = os.path.getsize(out_path)
     start1 = pre["start_time"]
-    t1 = group[0]["start"]
     last_off = start1
+    # Content-continuous offsets: place each part immediately after the
+    # previous part's content instead of at its wall-clock position, so the
+    # merged timeline has no phantom gaps and byte<->time seeking stays linear.
+    cur_end = start1 + max(0.0, group[0]["mtime"] - group[0]["start"])
     appended = 0
     CURRENT_APPEND = out_path
     CURRENT_APPEND_SIZE = orig_size
     with open(out_path, "ab") as f:
         for e in group[1:]:
-            off = start1 + (e["start"] - t1)
+            off = cur_end - e.get("start_time", 0.0)
             if off < last_off + APPEND_MARGIN:
                 off = last_off + APPEND_MARGIN
             print(f"  appending {e['name']} ({e['size']/1e6:.0f} MB)")
@@ -437,7 +453,8 @@ def append_run(group, args, pre, base, gaps):
                 CURRENT_APPEND = None
                 print(f"  error: ffmpeg append failed, part rolled back, kept originals\n{r.stderr.decode(errors='replace')}", file=sys.stderr)
                 return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
-            last_off = off + max(0.0, e["mtime"] - e["start"])
+            last_off = off
+            cur_end = off + e.get("start_time", 0.0) + max(0.0, e["mtime"] - e["start"])
             appended += e["size"]
         f.flush()
         os.fsync(f.fileno())
@@ -451,11 +468,13 @@ def append_run(group, args, pre, base, gaps):
 
     if args.verify:
         p = probe_duration(out_path)
-        expected_dur = last_off + max(0.0, group[-1]["mtime"] - group[-1]["start"]) - start1
-        if p is None or abs(p - expected_dur) > max(10.0, 0.05 * expected_dur):
+        expected_dur = cur_end - start1
+        bad = p is None or abs(p - expected_dur) > max(10.0, 0.05 * expected_dur)
+        nj = 0 if bad else len(scan_pts_jumps(out_path))
+        if bad or nj:
             os.truncate(out_path, orig_size)
             CURRENT_APPEND = None
-            print(f"  error: verify failed, part rolled back", file=sys.stderr)
+            print(f"  error: verify failed ({nj} PTS discontinuity/ies), part rolled back", file=sys.stderr)
             return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
 
     n_del = len(group) - 1
@@ -469,6 +488,262 @@ def append_run(group, args, pre, base, gaps):
     return {"merged": True, **base, "size": new_size, "n_del": n_del, "n_keep": 0}
 
 
+def remove_quiet(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def probe_gap_ratio(path, sample_seconds):
+    """Cheaply estimate the phantom (gap) timeline of a file.
+
+    The container duration is compared against the duration implied by the
+    filesize and the content bitrate sampled from the opening seconds (which is
+    always real content, never a gap).  A ratio above 1 means part of the
+    timeline is backed by no bytes -- i.e. seeking will jump.  Returns a dict or
+    None when the file cannot be measured.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size <= 0 or sample_seconds <= 0:
+        return None
+    dur = probe_duration(path)
+    if dur is None or dur <= 0:
+        return None
+    cmd = ["ffprobe", "-v", "error",
+           "-read_intervals", f"0%+{sample_seconds:g}",
+           "-show_entries", "packet=size",
+           "-of", "default=nw=1:nk=1", path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    total = n = 0
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line == "N/A":
+            continue
+        try:
+            total += int(line)
+            n += 1
+        except ValueError:
+            pass
+    if n < 100 or total <= 0:
+        return None
+    # PES payload bytes -> on-disk bytes (4-byte TS header per 188-byte packet).
+    bytes_per_sec = total * (188.0 / 184.0) / sample_seconds
+    est = size / bytes_per_sec
+    return {"size": size, "duration": dur, "est": est,
+            "ratio": dur / est, "gap": dur - est}
+
+
+def scan_pts_jumps(path, max_jump=2.0, chunk_packets=20000):
+    """Stream a transport stream and return PTS discontinuities over max_jump.
+
+    Unlike ffprobe, whose demuxer silently repairs timestamp discontinuities,
+    this reads the raw PES headers, so it is the ground truth for whether a
+    player seeking by PCR/PTS would jump.
+    """
+    chunk = 188 * chunk_packets
+    jumps = []
+    last = {}
+    with open(path, "rb") as f:
+        offset = 0
+        carry = b""
+        while True:
+            buf = f.read(chunk)
+            if not buf:
+                break
+            data = carry + buf
+            end = len(data) - (len(data) % 188)
+            i = 0
+            while i < end:
+                if data[i] == 0x47:
+                    pid = ((data[i + 1] & 0x1F) << 8) | data[i + 2]
+                    if data[i + 1] & 0x40:  # payload unit start indicator
+                        afc = (data[i + 3] >> 4) & 0x3
+                        idx = i + 4
+                        if afc & 0x2:
+                            idx = i + 5 + data[i + 4]
+                        if (afc & 0x1) and idx + 14 <= i + 188 and data[idx:idx + 3] == b"\x00\x00\x01":
+                            if data[idx + 7] & 0x80:  # PTS present
+                                pts = (((data[idx + 9] >> 1) & 0x7) << 30) | (data[idx + 10] << 22) | \
+                                      ((data[idx + 11] >> 1) << 15) | (data[idx + 12] << 7) | (data[idx + 13] >> 1)
+                                t = pts / 90000.0
+                                prev = last.get(pid)
+                                if prev is not None and abs(t - prev) > max_jump:
+                                    jumps.append((pid, offset + i, prev, t))
+                                last[pid] = t
+                i += 188
+            carry = data[end:]
+            offset += end
+    return jumps
+
+
+def backing_device(path):
+    """Block device backing path, or None for network/virtual filesystems."""
+    r = subprocess.run(["findmnt", "-no", "SOURCE", "--target", path],
+                       capture_output=True, text=True)
+    src = r.stdout.strip()
+    if src.startswith("/dev/"):
+        return src
+    return None
+
+
+def io_priority_prefix(args):
+    """Run a child at low CPU/IO priority, hard-capped on disk bandwidth.
+
+    The bandwidth cap lives in the child's own cgroup, so an unrelated ffmpeg
+    encode reading the same disk (via a different cgroup, e.g. through Samba)
+    keeps its share of the device.  Falls back to nice/ionice alone when no
+    block device backs --dir or systemd-run is unavailable.
+    """
+    rate = (args.io_rate or "").strip()
+    device = args.io_device or backing_device(args.dir)
+    if rate and rate not in ("0", "off", "none"):
+        if device and shutil.which("systemd-run"):
+            return ["systemd-run", "--scope", "-q", "--collect",
+                    "-p", f"IOReadBandwidthMax={device} {rate}",
+                    "-p", f"IOWriteBandwidthMax={device} {rate}",
+                    "-p", "IOWeight=10", "--",
+                    "nice", "-n", str(args.nice), "ionice", "-c3"]
+    return ["nice", "-n", str(args.nice), "ionice", "-c3"]
+
+
+def fix_one(path, args):
+    """Remux one file in place to collapse phantom timeline gaps.
+
+    The output is written to a .part file and only renamed into place after the
+    raw PTS discontinuity scan confirms the timeline is continuous.  On any
+    failure the original is left untouched.
+    """
+    global CURRENT_PART
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        return False, f"stat failed: {exc}"
+    part = path + ".part"
+    CURRENT_PART = part
+    remove_quiet(part)
+    cmd = io_priority_prefix(args) + [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", path, "-map", "0", "-c", "copy", "-f", "mpegts", part,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        remove_quiet(part)
+        CURRENT_PART = None
+        return False, f"could not run ffmpeg: {exc}"
+    if r.returncode != 0:
+        remove_quiet(part)
+        CURRENT_PART = None
+        return False, f"ffmpeg failed: {r.stderr.strip()[:300]}"
+    out_size = os.path.getsize(part)
+    if abs(out_size - size) > max(2 * 1024 * 1024, 0.03 * size):
+        remove_quiet(part)
+        CURRENT_PART = None
+        return False, f"output size {out_size} vs input {size}"
+    jumps = scan_pts_jumps(part)
+    if jumps:
+        remove_quiet(part)
+        CURRENT_PART = None
+        return False, f"{len(jumps)} PTS discontinuity/ies remain (e.g. {jumps[0]})"
+    if args.keep:
+        bak = os.path.join(os.path.dirname(path), ".merged_originals")
+        os.makedirs(bak, exist_ok=True)
+        dest = os.path.join(bak, os.path.basename(path))
+        i = 1
+        while os.path.exists(dest):
+            dest = os.path.join(bak, f"{os.path.basename(path)}.{i}")
+            i += 1
+        os.rename(path, dest)
+        os.rename(part, path)
+    else:
+        os.replace(part, path)
+    CURRENT_PART = None
+    return True, out_size
+
+
+def run_repair(args, active_paths, now):
+    """Repair already-merged files whose timeline has phantom gaps."""
+    files = sorted(os.listdir(args.dir))
+    subdirs = [d for d in files if os.path.isdir(os.path.join(args.dir, d))]
+    top_files = [f for f in files if os.path.isfile(os.path.join(args.dir, f))]
+    has_top = any(parse_filename(f) for f in top_files)
+    if args.top_level or has_top or not subdirs:
+        dirs = [args.dir]
+    else:
+        dirs = [os.path.join(args.dir, d) for d in subdirs]
+
+    entries = []
+    for d in dirs:
+        es, _act = collect_entries(d, now, args.age, active_paths)
+        entries.extend(es)
+    entries.sort(key=lambda e: e["start"])
+    print(f"scanning {len(entries)} file(s) for phantom timeline gaps...")
+
+    selected = []
+    for e in entries:
+        info = probe_gap_ratio(e["path"], args.fix_sample)
+        if info is None:
+            continue
+        e.update(info)
+        if info["ratio"] > args.fix_threshold:
+            selected.append(e)
+
+    total_gb = sum(e["size"] for e in selected) / 1e9
+    gap_h = sum(e["gap"] for e in selected) / 3600.0
+    print(f"found {len(selected)} file(s) with ratio > {args.fix_threshold:g} "
+          f"({total_gb:.1f} GB, ~{gap_h:.1f} h of phantom timeline)")
+    for e in sorted(selected, key=lambda e: e["ratio"], reverse=True):
+        print(f"  {e['ratio']:.2f}x  gap~{e['gap']:.0f}s  {e['size']/1e9:.2f}GB  {e['name']}")
+
+    if args.dry_run or not selected:
+        return 0
+
+    rate = (args.io_rate or "").strip()
+    device = args.io_device or backing_device(args.dir)
+    if rate and rate not in ("0", "off", "none"):
+        if device and shutil.which("systemd-run"):
+            print(f"io cap: {rate} read/write on {device}, nice {args.nice}")
+        else:
+            print("warn: io cap unavailable (no block device / no systemd-run); "
+                  "using nice only", file=sys.stderr)
+
+    fixed = failed = 0
+    written = 0
+    budget = args.max_run_gb * 1e9
+    for e in selected:
+        du = shutil.disk_usage(os.path.dirname(e["path"]))
+        need = e["size"] + FREE_MARGIN_BYTES
+        if du.free < need:
+            print(f"  skip {e['name']}: need {need/1e9:.1f} GB free, "
+                  f"have {du.free/1e9:.1f} GB", file=sys.stderr)
+            continue
+        print(f"fixing {e['name']} ({e['ratio']:.2f}x, {e['size']/1e9:.2f} GB)")
+        ok, res = fix_one(e["path"], args)
+        if ok:
+            fixed += 1
+            written += res
+            print(f"  ok: {e['name']} ({res/1e6:.0f} MB), gaps removed")
+        else:
+            failed += 1
+            print(f"  error: {e['name']}: {res}, kept original", file=sys.stderr)
+        if budget and written >= budget:
+            print(f"run budget reached ({args.max_run_gb:.0f} GB); stopping", file=sys.stderr)
+            break
+        if args.cooldown > 0:
+            time.sleep(args.cooldown)
+
+    print(f"\ndone: {fixed} file(s) repaired ({written/1e6:.0f} MB output)")
+    if failed:
+        print(f"      {failed} failed (original kept)")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="ctbrec-merge",
@@ -476,8 +751,8 @@ def main():
     )
     ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
                     help="base directory (one folder per model, or flat .mts files)")
-    ap.add_argument("--gap", type=int, default=300,
-                    help="max gap in seconds between recordings to merge (default 300)")
+    ap.add_argument("--gap", type=int, default=3600,
+                    help="max gap in seconds between recordings to merge (default 3600)")
     ap.add_argument("--slack", type=int, default=30,
                     help="extra seconds of slack when finding candidates via mtime (default 30)")
     ap.add_argument("--age", type=int, default=300,
@@ -496,8 +771,8 @@ def main():
                     help="parallel header probes (default 1)")
     ap.add_argument("--no-append", dest="append", action="store_false",
                     help="disable byte-append merging, always remux via ffmpeg concat")
-    ap.add_argument("--min-free-pct", type=float, default=15.0,
-                    help="refuse to run when the filesystem is less than this percent free (default 15)")
+    ap.add_argument("--min-free-pct", type=float, default=3.81,
+                    help="refuse to run when the filesystem is less than this percent free (default 3.81)")
     ap.add_argument("--max-streams", type=int, default=4,
                     help="defer when more than this many recordings are open for writing (default 4)")
     ap.add_argument("--cooldown", type=float, default=10.0,
@@ -508,6 +783,18 @@ def main():
                     help="host io pressure (full avg10 percent) considered drained (default 5)")
     ap.add_argument("--max-run-gb", type=float, default=0.0,
                     help="stop after this many GB of output per run; 0 disables (default unlimited)")
+    ap.add_argument("--fix-timestamps", action="store_true",
+                    help="repair already-merged files with phantom timeline gaps (remux in place) instead of merging")
+    ap.add_argument("--fix-threshold", type=float, default=1.05,
+                    help="repair files whose container/content duration ratio exceeds this (default 1.05)")
+    ap.add_argument("--fix-sample", type=float, default=60.0,
+                    help="seconds of packets to sample when estimating content duration (default 60)")
+    ap.add_argument("--nice", type=int, default=19,
+                    help="run repair ffmpeg at this nice level (default 19)")
+    ap.add_argument("--io-rate", default="80M",
+                    help="hard read/write bandwidth cap per device for repair ffmpeg via systemd-run (default 80M; 0 disables)")
+    ap.add_argument("--io-device", default=None,
+                    help="block device for --io-rate (default: detected from --dir)")
     args = ap.parse_args()
 
     if not os.path.isdir(args.dir):
@@ -529,6 +816,9 @@ def main():
             if len(active_paths) > args.max_streams:
                 print(f"deferring: {len(active_paths)} active recordings (> --max-streams {args.max_streams})", file=sys.stderr)
                 return 0
+
+    if args.fix_timestamps:
+        return run_repair(args, active_paths, now)
 
     files = sorted(os.listdir(args.dir))
     total_merged = 0

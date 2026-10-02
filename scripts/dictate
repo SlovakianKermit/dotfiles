@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# dictate - toggle dictation on Wayland: microphone -> whisper.cpp -> type
+#           the transcript into whatever window currently has focus.
+#
+set -euo pipefail
+
+PROG=${0##*/}
+
+MODEL=${DICTATE_MODEL:-$HOME/.local/share/whisper/models/ggml-large-v3-turbo-q5_0.bin}
+LANG_=${DICTATE_LANG:-en}
+DEVICE=${DICTATE_DEVICE:-}
+THREADS=${DICTATE_THREADS:-$(nproc 2>/dev/null || echo 4)}
+KEY_DELAY=${DICTATE_KEY_DELAY:-8}
+KEY_HOLD=${DICTATE_KEY_HOLD:-8}
+OUTMODE=type
+INFILE=
+
+usage() {
+  cat <<EOF
+Usage: $PROG [OPTIONS]
+
+Toggle dictation. The first invocation starts recording from the microphone;
+the next invocation stops, transcribes with whisper.cpp and types the text
+into the focused window.
+
+Options:
+  -i FILE   transcribe FILE instead of toggling the microphone
+  -o        print the transcript to stdout instead of typing it
+  -m FILE   whisper model (default: $MODEL)
+  -l LANG   spoken language (default: $LANG_, or 'auto' to detect)
+  -d DEV    capture device/target (default: system default source)
+  -t N      whisper threads (default: number of CPUs)
+  -h        show this help
+
+Environment:
+  DICTATE_MODEL      model path
+  DICTATE_LANG       language
+  DICTATE_DEVICE     capture device
+  DICTATE_THREADS    thread count (default: nproc)
+  DICTATE_KEY_DELAY  ms between typed keys (default: 8)
+  DICTATE_KEY_HOLD   ms each key is held (default: 8)
+EOF
+}
+
+while getopts ":i:om:l:d:t:h" opt; do
+  case $opt in
+    i) INFILE=$OPTARG ;;
+    o) OUTMODE=stdout ;;
+    m) MODEL=$OPTARG ;;
+    l) LANG_=$OPTARG ;;
+    d) DEVICE=$OPTARG ;;
+    t) THREADS=$OPTARG ;;
+    h) usage; exit 0 ;;
+    \?) echo "$PROG: invalid option -$OPTARG" >&2; usage >&2; exit 2 ;;
+    :)  echo "$PROG: option -$OPTARG requires an argument" >&2; usage >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp}/dictate-$UID
+PIDFILE=$RUNTIME_DIR/rec.pid
+WAVFILE=$RUNTIME_DIR/rec.wav
+mkdir -p "$RUNTIME_DIR"
+
+notify() { # notify SUMMARY [BODY]
+  command -v notify-send >/dev/null 2>&1 || return 0
+  notify-send -a dictate -h string:x-canonical-private-synchronous:dictate \
+    "$1" "${2:-}" >/dev/null 2>&1 || true
+}
+
+die() {
+  notify "Dictation error" "$1"
+  echo "$PROG: $1" >&2
+  exit 1
+}
+
+# --- dependency checks ---------------------------------------------------
+command -v whisper-cli >/dev/null 2>&1 || die "whisper-cli not found (install whisper-cpp)"
+[ -f "$MODEL" ] || die "model not found: $MODEL"
+if [ "$OUTMODE" = type ]; then
+  command -v ydotool >/dev/null 2>&1 || die "ydotool not found (install ydotool)"
+fi
+
+recorder_tool() {
+  if command -v pw-record >/dev/null 2>&1; then
+    echo pw-record
+  elif command -v parec >/dev/null 2>&1; then
+    echo parec
+  fi
+}
+
+is_recording() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid
+  pid=$(cat "$PIDFILE" 2>/dev/null) || return 1
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+start_recording() {
+  local tool cmd
+  tool=$(recorder_tool)
+  [ -n "$tool" ] || die "no recorder found (need pw-record or parec)"
+  rm -f "$WAVFILE" "$RUNTIME_DIR/rec.log"
+  if [ "$tool" = pw-record ]; then
+    cmd=(pw-record --rate 16000 --channels 1 --format s16)
+    [ -n "$DEVICE" ] && cmd+=(--target "$DEVICE")
+    cmd+=("$WAVFILE")
+  else
+    cmd=(parec --file-format=wav --rate=16000 --channels=1 --format=s16le
+         -d "${DEVICE:-@DEFAULT_SOURCE@}" "$WAVFILE")
+  fi
+  nohup "${cmd[@]}" </dev/null >"$RUNTIME_DIR/rec.log" 2>&1 9>&- &
+  echo "$!" >"$PIDFILE"
+  disown 2>/dev/null || true
+  notify "🎙 Dictation: recording" "Press the shortcut again to stop"
+}
+
+stop_recording() {
+  local pid i
+  pid=$(cat "$PIDFILE" 2>/dev/null) || pid=
+  rm -f "$PIDFILE"
+  [ -n "$pid" ] || return 0
+  kill -INT "$pid" 2>/dev/null || true
+  for i in $(seq 1 50); do          # up to 5s for a clean WAV finalise
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+transcribe() {
+  local cmd=(whisper-cli -m "$MODEL" -f "$WAVFILE" -l "$LANG_" -nt -np)
+  [ -n "$THREADS" ] && cmd+=(-t "$THREADS")
+  "${cmd[@]}" 2>/dev/null
+}
+
+clean_text() {
+  sed -E '
+    s/\[[[:space:]]*(BLANK_AUDIO|Silence|SILENCE|silence|Music|MUSIC|music|SOUND|Sound|sound|noise|Noise|NOISE|inaudible|INAUDIBLE|Inaudible)[^]]*\]//g;
+    s/\([[:space:]]*(silence|Silence|music|Music|inaudible|Inaudible|noise|Noise)[^)]*\)//g
+  ' | tr '\n' ' ' | tr -s '[:space:]' ' ' | sed -E 's/^ //; s/ $//'
+}
+
+type_text() {
+  if [ "$OUTMODE" = stdout ]; then
+    printf '%s\n' "$1"
+  else
+    printf '%s' "$1" | ydotool type -d "$KEY_DELAY" -H "$KEY_HOLD" -f -
+  fi
+}
+
+# --- one shot: transcribe a file ----------------------------------------
+if [ -n "$INFILE" ]; then
+  [ -f "$INFILE" ] || die "input file not found: $INFILE"
+  WAVFILE=$INFILE
+  text=$( { transcribe | clean_text; } || true )
+  [ -n "$text" ] || { notify "Dictation" "No speech detected"; exit 0; }
+  type_text "$text"
+  exit 0
+fi
+
+# --- toggle --------------------------------------------------------------
+exec 9>"$RUNTIME_DIR/lock"
+if ! flock -n 9; then
+  notify "Dictation busy" "Another dictate run is in progress"
+  exit 1
+fi
+
+if is_recording; then
+  stop_recording
+  if [ ! -s "$WAVFILE" ]; then
+    notify "Dictation" "No audio captured"
+    exit 0
+  fi
+  notify "✍️ Dictation: transcribing…"
+  text=$( { transcribe | clean_text; } || true )
+  if [ -z "$text" ]; then
+    notify "Dictation" "No speech detected"
+    exit 0
+  fi
+  type_text "$text"
+  notify "✅ Dictation" "Inserted text"
+else
+  start_recording
+fi

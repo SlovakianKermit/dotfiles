@@ -54,6 +54,7 @@ pacman-contrib
 parsec-bin
 paru
 plasma-login-manager
+plymouth
 power-profiles-daemon
 proton-cachyos-native
 protonup-qt
@@ -64,5 +65,4 @@ speedtest++
 ventoy-bin
 vulkan-radeon
 xpadneo-dkms
-yay-bin
 zen-browser-bin

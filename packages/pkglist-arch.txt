@@ -3,7 +3,6 @@ alacritty
 alsa-firmware
 alsa-plugins
 alsa-utils
-aria2
 ark
 audacity
 awesome-terminal-fonts
@@ -60,6 +59,8 @@ flatpak
 flatseal
 fsarchiver
 fwupd
+ggml
+ggml-vulkan
 ghostty
 gimp
 git
@@ -169,7 +170,6 @@ plasma-pa
 plasma-systemmonitor
 plasma-thunderbolt
 plocate
-plymouth
 plymouth-kcm
 poppler-glib
 powerdevil
@@ -232,6 +232,7 @@ vlc
 vlc-plugins-all
 wget
 which
+whisper-cpp
 wimlib
 wireplumber
 wl-clipboard
@@ -242,5 +243,6 @@ xf86-video-amdgpu
 xfsprogs
 xl2tpd
 xsettingsd
+ydotool
 yt-dlp
 zam-plugins

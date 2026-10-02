@@ -279,6 +279,9 @@ toggle do not disturb=none,none,Toggle do not disturb
 [services][com.mitchellh.ghostty.desktop]
 new-window=Meta+Return
 
+[services][dictate.desktop]
+_launch=Meta+Shift+D
+
 [services][net.local.pkg-install-aur.sh.desktop]
 _launch=Meta+I
 
@@ -296,8 +299,6 @@ _launch=Search\tAlt+F2
 
 [services][org.kde.spectacle.desktop]
 ActiveWindowScreenShot=Meta+Print\tMeta+Ctrl+S
-CurrentMonitorScreenShot=none
-OpenWithoutScreenshot=none
 
 [services][pkg-installer-aur.desktop]
 _launch=Meta+Shift+U
