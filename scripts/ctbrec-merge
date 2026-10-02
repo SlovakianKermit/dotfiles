@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -881,7 +882,12 @@ def main():
     return 0
 
 
+def _sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _sigterm)
     try:
         sys.exit(main())
     except KeyboardInterrupt:
