@@ -647,11 +647,22 @@ def fix_one(path, args):
         remove_quiet(part)
         CURRENT_PART = None
         return False, f"output size {out_size} vs input {size}"
-    jumps = scan_pts_jumps(part)
-    if jumps:
+    # The remux must have collapsed the phantom timeline: the output duration
+    # should now match its real content, so the gap ratio returns to ~1.0.
+    # Any residual PTS jumps below that are genuine source dropouts, not merge
+    # gaps, and are left untouched.
+    info = probe_gap_ratio(part, args.fix_sample)
+    if info is None or info["ratio"] > max(1.02, args.fix_threshold):
         remove_quiet(part)
         CURRENT_PART = None
-        return False, f"{len(jumps)} PTS discontinuity/ies remain (e.g. {jumps[0]})"
+        why = "unmeasurable" if info is None else f"ratio {info['ratio']:.2f}"
+        return False, f"phantom timeline remains ({why})"
+    jumps = scan_pts_jumps(part)
+    big = [j for j in jumps if abs(j[3] - j[2]) > 120.0]
+    if big:
+        remove_quiet(part)
+        CURRENT_PART = None
+        return False, f"{len(big)} large PTS discontinuity/ies remain (e.g. {big[0]})"
     if args.keep:
         bak = os.path.join(os.path.dirname(path), ".merged_originals")
         os.makedirs(bak, exist_ok=True)
@@ -665,7 +676,7 @@ def fix_one(path, args):
     else:
         os.replace(part, path)
     CURRENT_PART = None
-    return True, out_size
+    return True, out_size, len(jumps)
 
 
 def run_repair(args, active_paths, now):
@@ -725,11 +736,12 @@ def run_repair(args, active_paths, now):
                   f"have {du.free/1e9:.1f} GB", file=sys.stderr)
             continue
         print(f"fixing {e['name']} ({e['ratio']:.2f}x, {e['size']/1e9:.2f} GB)")
-        ok, res = fix_one(e["path"], args)
+        ok, res, residual = fix_one(e["path"], args)
         if ok:
             fixed += 1
             written += res
-            print(f"  ok: {e['name']} ({res/1e6:.0f} MB), gaps removed")
+            note = f", {residual} small source dropout(s) kept" if residual else ""
+            print(f"  ok: {e['name']} ({res/1e6:.0f} MB), gaps removed{note}")
         else:
             failed += 1
             print(f"  error: {e['name']}: {res}, kept original", file=sys.stderr)
