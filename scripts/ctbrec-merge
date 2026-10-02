@@ -624,7 +624,7 @@ def fix_one(path, args):
     try:
         size = os.path.getsize(path)
     except OSError as exc:
-        return False, f"stat failed: {exc}"
+        return False, f"stat failed: {exc}", 0
     part = path + ".part"
     CURRENT_PART = part
     remove_quiet(part)
@@ -637,32 +637,25 @@ def fix_one(path, args):
     except OSError as exc:
         remove_quiet(part)
         CURRENT_PART = None
-        return False, f"could not run ffmpeg: {exc}"
+        return False, f"could not run ffmpeg: {exc}", 0
     if r.returncode != 0:
         remove_quiet(part)
         CURRENT_PART = None
-        return False, f"ffmpeg failed: {r.stderr.strip()[:300]}"
+        return False, f"ffmpeg failed: {r.stderr.strip()[:300]}", 0
     out_size = os.path.getsize(part)
     if abs(out_size - size) > max(2 * 1024 * 1024, 0.03 * size):
         remove_quiet(part)
         CURRENT_PART = None
-        return False, f"output size {out_size} vs input {size}"
-    # The remux must have collapsed the phantom timeline: the output duration
-    # should now match its real content, so the gap ratio returns to ~1.0.
-    # Any residual PTS jumps below that are genuine source dropouts, not merge
-    # gaps, and are left untouched.
-    info = probe_gap_ratio(part, args.fix_sample)
-    if info is None or info["ratio"] > max(1.02, args.fix_threshold):
-        remove_quiet(part)
-        CURRENT_PART = None
-        why = "unmeasurable" if info is None else f"ratio {info['ratio']:.2f}"
-        return False, f"phantom timeline remains ({why})"
+        return False, f"output size {out_size} vs input {size}", 0
+    # The remux must have collapsed the merge-scale phantom gaps.  Genuine
+    # small source dropouts (a few seconds) are inherent to the recording and
+    # cannot be removed with a stream copy, so only large jumps are rejected.
     jumps = scan_pts_jumps(part)
-    big = [j for j in jumps if abs(j[3] - j[2]) > 120.0]
+    big = [j for j in jumps if abs(j[3] - j[2]) > 60.0]
     if big:
         remove_quiet(part)
         CURRENT_PART = None
-        return False, f"{len(big)} large PTS discontinuity/ies remain (e.g. {big[0]})"
+        return False, f"{len(big)} large PTS discontinuity/ies remain (e.g. {big[0]})", 0
     if args.keep:
         bak = os.path.join(os.path.dirname(path), ".merged_originals")
         os.makedirs(bak, exist_ok=True)
