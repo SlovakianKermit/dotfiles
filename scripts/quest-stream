@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PORT="${QUEST_STREAM_PORT:-8080}"
+ROOT="${QUEST_STREAM_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/quest-stream}"
+SOURCES=(
+  /mnt/data_storage/ctbrec
+  /mnt/data_storage/Handbraked
+  /mnt/data_storage/compressing
+)
+
+die() { printf 'quest-stream: %s\n' "$*" >&2; exit 1; }
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+Usage: quest-stream
+
+Serve ${SOURCES[*]}
+to a Meta Quest over the USB cable. In DeoVR open:
+  http://127.0.0.1:${PORT}
+
+Environment:
+  QUEST_STREAM_PORT   TCP port bound on 127.0.0.1 (default: 8080)
+  QUEST_STREAM_ROOT   symlink staging directory
+                      (default: ~/.local/share/quest-stream)
+EOF
+  exit 0
+fi
+
+command -v miniserve >/dev/null 2>&1 || die "miniserve not found (install: sudo pacman -S miniserve)"
+command -v adb >/dev/null 2>&1 || die "adb not found (install: android-tools)"
+
+# Stage the two source folders as symlinks under one root so a single
+# miniserve instance can serve both (miniserve follows symlinks by default).
+mkdir -p "$ROOT"
+for src in "${SOURCES[@]}"; do
+  [[ -d "$src" ]] || die "missing source directory: $src"
+  ln -sfn "$src" "$ROOT/$(basename "$src")"
+done
+
+# Keep the adb reverse tunnel alive. adb reverse mappings are dropped when the
+# headset disconnects, so an unattended service has to re-apply it.
+(
+  while :; do
+    if adb get-state >/dev/null 2>&1; then
+      adb reverse "tcp:${PORT}" "tcp:${PORT}" >/dev/null 2>&1 || true
+    fi
+    sleep 15
+  done
+) &
+
+printf 'quest-stream: serving %s\n' "${SOURCES[*]}"
+printf 'quest-stream: bound to 127.0.0.1:%s (USB -> headset only)\n' "$PORT"
+printf 'quest-stream: DeoVR URL http://127.0.0.1:%s\n' "$PORT"
+
+exec miniserve -i 127.0.0.1 -p "$PORT" "$ROOT"

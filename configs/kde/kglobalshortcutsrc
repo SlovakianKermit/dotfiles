@@ -299,6 +299,8 @@ _launch=Search\tAlt+F2
 
 [services][org.kde.spectacle.desktop]
 ActiveWindowScreenShot=Meta+Print\tMeta+Ctrl+S
+CurrentMonitorScreenShot=none
+OpenWithoutScreenshot=none
 
 [services][pkg-installer-aur.desktop]
 _launch=Meta+Shift+U

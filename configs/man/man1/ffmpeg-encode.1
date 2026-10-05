@@ -1,4 +1,4 @@
-.TH FFMPEG-ENCODE 1 "2026-09-20" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-10-06" "ffmpeg-encode" "User Commands"
 .SH NAME
 ffmpeg-encode \- VAAPI HEVC/AV1 batch video encoder with curses TUI
 .SH SYNOPSIS
@@ -61,6 +61,21 @@ discarded and the original kept. Use
 .B \-k
 to keep both files unconditionally.
 .P
+With
+.B \-\-vr
+the encoder targets stereoscopic VR180/VR360 material. Such captures arrive
+as a single, heavily pre-compressed side-by-side HEVC frame, so the normal
+quality default can re-encode larger than the source and be discarded. VR
+mode selects a more conservative quality default, writes its outputs under a
+.B VR
+subdirectory of the output root (for example
+.IR /mnt/shared/Handbraked/VR ),
+and, after a successful encode, refuses any output whose pixel dimensions
+differ from the source (the job fails and the file is removed). It never
+rescales, crops or reduces the frame, and an explicit
+.B \-q
+still overrides the default.
+.P
 The TUI shows a running percentage, frames per second, a smoothed encoding
 speed multiplier and an estimated time remaining for the current file, the
 per-file size result in the queue, and elapsed / queued counters in the
@@ -80,7 +95,11 @@ Relative paths under the input directory are preserved under this root. With
 several
 .B \-i
 directories, the relative path is taken from whichever input directory the
-file was found under; the output root is still single.
+file was found under; the output root is still single. With
+.B \-\-vr
+the files are placed one level deeper, under a
+.B VR
+subdirectory of this root.
 .TP
 .BI \-\-input " FILE"
 Encode a single input file instead of scanning a directory.
@@ -136,6 +155,21 @@ deletion is performed.
 Keep both the original and the encoded file. This is the opt-out from the
 default behaviour of deleting the original, and it also keeps the encoded
 file even when it is larger than the original.
+.TP
+.B \-\-vr
+VR mode for stereoscopic VR180/VR360 captures. Sets the quality default to
+HEVC
+.B \-qp
+30, or AV1
+.B \-global_quality
+130, writes outputs under a
+.B VR
+subdirectory of the output root, and verifies after encoding that the output
+keeps the source's exact width and height; if it does not, the job is reported
+as failed and the output removed. The encoder never downscales or crops in
+this mode. An explicit
+.B \-q
+overrides the VR quality default.
 .TP
 .B \-h
 Show a short help message and exit.
@@ -195,6 +229,30 @@ Passing
 .B \-k
 keeps both files in all cases. Files that are cancelled or quit are left
 alone and the original is never removed.
+.SS VR mode
+Stereoscopic VR is delivered as one side-by-side frame (for example
+5760x2880 HEVC at roughly 7.5 Mbit/s, that is two 2880x2880 fisheye eyes).
+The platform has already compressed it heavily, so re-encoding at the normal
+default can grow the file and be discarded as
+.IR kept .
+.B \-\-vr
+raises the quality target to the conservative end that still produces a real
+saving (HEVC QP 30, AV1 CQ 130) and, because VR viewers magnify any
+resolution loss, fails any encode whose output dimensions differ from the
+input. Colour range is preserved: full-range
+.B yuvj420p
+captures stay full-range through both the hardware and the software-decode
+paths.
+.P
+VR outputs are kept separate from the normal encode tree: they are written
+under a
+.B VR
+subdirectory of the output root (
+.I /mnt/shared/Handbraked/VR
+by default), with each input's relative path mirrored beneath it. An explicit
+single-file
+.B \-\-output
+still wins over this placement.
 .SS Batch discovery
 In batch mode, files are found recursively under each input directory with
 extensions (case-insensitive):
@@ -268,6 +326,21 @@ Tighter HEVC quality (lower QP):
 .IP
 .EX
 ffmpeg-encode \-q 24
+.EE
+.P
+Encode a stereoscopic VR capture with the conservative VR defaults (output
+goes to
+.IR /mnt/shared/Handbraked/VR/vr180.mkv ):
+.IP
+.EX
+ffmpeg-encode \-\-vr \-\-input vr180.ts
+.EE
+.P
+VR batch run into a custom split tree (outputs land in
+.IR /mnt/shared/Other/VR ):
+.IP
+.EX
+ffmpeg-encode \-\-vr \-i /mnt/shared/Compressing \-o /mnt/shared/Other
 .EE
 .P
 Encode a batch of small files with three parallel jobs:
@@ -348,6 +421,11 @@ Default input directory (batch mode).
 .TP
 .I /mnt/shared/Handbraked
 Default output directory (batch mode).
+.TP
+.I /mnt/shared/Handbraked/VR
+Default output directory for
+.B \-\-vr
+batch mode.
 .TP
 .I /dev/dri/renderD128
 Fallback VAAPI device when no node is auto-detected.

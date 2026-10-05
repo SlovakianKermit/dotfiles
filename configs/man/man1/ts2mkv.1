@@ -1,0 +1,106 @@
+.TH TS2MKV 1 "2026-10-05" "ts2mkv" "User Commands"
+.SH NAME
+ts2mkv \- losslessly remux MPEG-TS captures to Matroska
+.SH SYNOPSIS
+.B ts2mkv
+[\fIOPTIONS\fR] \fIFILE\fR|\fIDIR\fR...
+.SH DESCRIPTION
+.B ts2mkv
+remuxes MPEG-TS captures
+.RI ( .ts / .mts )
+into Matroska
+.RB ( .mkv )
+without re-encoding the video: the compressed bitstream is copied verbatim, so
+the operation is fast and incurs no generation loss. For each input it selects
+the first video stream and the first audio stream, which discards the
+duplicate or multi-program streams common in raw captures and produces a clean
+single-program MKV.
+.P
+Video is always copied. Audio is copied too, but if the source audio has
+unparseable ADTS headers (common in TS captures) the Matroska muxer can abort,
+so the file is retried once with the audio re-encoded as AAC at 160 kbit/s.
+Timestamps are regenerated and normalised so players can seek.
+.P
+The source is never modified or deleted unless
+.B \-D
+is given.
+.SH OPTIONS
+.TP
+.BI \-o ", " \-\-output " DIR"
+Write output files into
+.I DIR
+instead of alongside each input. Inputs from directories are flattened into
+.IR DIR .
+.TP
+.BR \-D ", " \-\-delete
+Delete the source
+.I .ts
+or
+.I .mts
+after a successful remux.
+.TP
+.BR \-f ", " \-\-force
+Overwrite an existing output
+.IR .mkv .
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH BEHAVIOUR
+.SS What it does
+.IP \(bu 2
+Expands directory arguments recursively for files matching
+.B *.ts
+and
+.B *.mts
+(case-insensitive).
+.IP \(bu 2
+Remuxes with
+.BR ffmpeg (1)
+using
+.B \-map 0:v:0 \-map 0:a:0
+and stream copy.
+.IP \(bu 2
+On mux failure, retries once with the audio re-encoded as AAC 160k.
+.IP \(bu 2
+Writes to a
+.B .part
+file and renames on success, so a failed run never leaves a truncated
+.B .mkv
+behind.
+.SS Requirements
+.IP \(bu 2
+.BR ffmpeg (1)
+.SH EXAMPLES
+Remux all TS captures under a folder, in place:
+.IP
+.EX
+ts2mkv /mnt/data_storage/ctbrec
+.EE
+.P
+Send the outputs to a separate directory:
+.IP
+.EX
+ts2mkv \-o /mnt/data_storage/Handbraked/rawts /mnt/data_storage/ctbrec
+.EE
+.P
+Remux one file and delete the source when done:
+.IP
+.EX
+ts2mkv \-D recording.ts
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+All remuxes succeeded. Skipped files (output already exists) do not count as
+failures.
+.TP
+.B 1
+At least one remux failed, or no input files were found.
+.TP
+.B 2
+Bad usage (no input given).
+.SH SEE ALSO
+.BR ffmpeg (1),
+.BR ffprobe (1)
+.SH AUTHOR
+Written for local use.

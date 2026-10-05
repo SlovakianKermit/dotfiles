@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# ts2mkv — losslessly remux MPEG-TS (.ts/.mts) captures into clean Matroska.
+#
+# No video re-encode: the HEVC/H.264 bitstream is copied verbatim, so this is
+# fast and generation-loss-free. It exists because raw captures are often
+# multi-program MPEG-TS whose duplicate streams and timestamp gaps make players
+# stall; selecting one video + one audio stream into MKV fixes that.
+set -euo pipefail
+
+OUTDIR=""
+DELETE=0
+FORCE=0
+declare -a args=()
+
+die() { printf 'ts2mkv: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: ts2mkv [OPTIONS] FILE|DIR...
+
+Losslessly remux .ts/.mts captures into .mkv (no re-encode). For each input,
+the first video stream and first audio stream are copied into Matroska.
+
+Options:
+  -o, --output DIR   Write .mkv files to DIR (default: alongside each input)
+  -D, --delete       Delete the source .ts/.mts after a successful remux
+  -f, --force        Overwrite an existing output file
+  -h, --help         Show this help and exit
+
+Directories are searched recursively for *.ts and *.mts.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output) [[ $# -ge 2 ]] || die "-o needs an argument"; OUTDIR="$2"; shift 2 ;;
+    -D|--delete) DELETE=1; shift ;;
+    -f|--force)  FORCE=1; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    --)          shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
+    -*)          usage >&2; die "unknown option: $1" ;;
+    *)           args+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#args[@]} -gt 0 ]] || { usage >&2; exit 2; }
+command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found"
+
+# Expand directories into individual .ts/.mts files.
+declare -a inputs=()
+for a in "${args[@]}"; do
+  if [[ -d "$a" ]]; then
+    while IFS= read -r -d '' p; do inputs+=("$p"); done \
+      < <(find "$a" -type f \( -iname '*.ts' -o -iname '*.mts' \) -print0)
+  elif [[ -f "$a" ]]; then
+    inputs+=("$a")
+  else
+    printf 'ts2mkv: skipping (not found): %s\n' "$a" >&2
+  fi
+done
+
+[[ ${#inputs[@]} -gt 0 ]] || die "no input files"
+
+ok=0; skipped=0; failed=0
+for in in "${inputs[@]}"; do
+  base="$(basename "${in%.*}").mkv"
+  if [[ -n "$OUTDIR" ]]; then out="$OUTDIR/$base"; else out="$(dirname "$in")/$base"; fi
+
+  if [[ -e "$out" && $FORCE -eq 0 ]]; then
+    printf 'skip (exists): %s\n' "$out"
+    skipped=$((skipped+1)); continue
+  fi
+
+  mkdir -p "$(dirname "$out")"
+  tmp="$out.part"
+  rm -f "$tmp"
+
+  printf 'remux: %s -> %s\n' "$in" "$out"
+
+  # Attempt 1: copy both streams. Attempt 2: re-encode only the audio (corrupt
+  # ADTS AAC from TS captures can make the Matroska muxer abort).
+  if ffmpeg -hide_banner -loglevel error -y \
+        -fflags +genpts -avoid_negative_ts make_zero \
+        -i "$in" -map 0:v:0 -map 0:a:0? -c copy -c:s none \
+        -f matroska "$tmp"; then
+    :
+  elif ffmpeg -hide_banner -loglevel error -y \
+        -fflags +genpts -avoid_negative_ts make_zero \
+        -i "$in" -map 0:v:0 -map 0:a:0? -c:v copy -c:a aac -b:a 160k -c:s none \
+        -f matroska "$tmp"; then
+    printf '  (audio re-encoded due to unparseable source audio)\n'
+  else
+    rm -f "$tmp"
+    printf 'FAILED: %s\n' "$in" >&2
+    failed=$((failed+1)); continue
+  fi
+
+  mv -f "$tmp" "$out"
+  ok=$((ok+1))
+  if [[ $DELETE -eq 1 ]]; then rm -f "$in"; fi
+done
+
+printf '\nts2mkv: %d done, %d skipped, %d failed\n' "$ok" "$skipped" "$failed"
+[[ $failed -eq 0 ]]

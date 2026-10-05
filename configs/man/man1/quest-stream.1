@@ -1,0 +1,132 @@
+.TH QUEST\-STREAM 1 "2026-10-05" "quest-stream" "User Commands"
+.SH NAME
+quest-stream \- serve video folders to a Meta Quest over USB
+.SH SYNOPSIS
+.B quest-stream
+.SH DESCRIPTION
+.B quest-stream
+serves three local video directories to a Meta Quest headset over the USB cable,
+using
+.BR miniserve (1)
+bound to
+.IR 127.0.0.1 ,
+and keeps an
+.BR adb (1)
+reverse tunnel alive so the headset can reach the host as
+.IR localhost .
+.P
+The folders exported are
+.IR /mnt/data_storage/ctbrec ,
+.IR /mnt/data_storage/Handbraked ,
+and
+.IR /mnt/data_storage/compressing .
+Each is staged as a symlink under
+.I ~/.local/share/quest-stream
+so a single
+.B miniserve
+instance can serve them. The script then re-applies
+.B adb reverse
+on a short interval, because reverse mappings are dropped whenever the headset
+reconnects. The server binds to the loopback interface only, so it is never
+reachable from the LAN.
+.P
+Point DeoVR (or the headset browser) at
+.I http://127.0.0.1:8080
+and both folders appear as browsable listings. DeoVR's
+.B Stream
+field also accepts direct file URLs such as
+.IR http://127.0.0.1:8080/Handbraked/clip.mp4 .
+.P
+The script runs either in the foreground or as the
+.BR systemd (1)
+user unit
+.IR quest-stream.service ,
+which starts it at login.
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Print usage and the DeoVR URL, then exit.
+.SH ENVIRONMENT
+.TP
+.B QUEST_STREAM_PORT
+TCP port bound on
+.IR 127.0.0.1 .
+Default:
+.BR 8080 .
+.TP
+.B QUEST_STREAM_ROOT
+Directory where the symlink staging tree is created. Default:
+.IR ~/.local/share/quest-stream .
+.SH BEHAVIOUR
+.SS What it does
+.IP \(bu 2
+Creates or refreshes symlinks in the staging directory for each source folder.
+.IP \(bu 2
+Runs a background loop that re-applies the
+.B adb reverse
+tunnel every 15 seconds while a device is connected.
+.IP \(bu 2
+Executes
+.B miniserve
+in the foreground; stopping the script stops the server.
+.SS Requirements
+.IP \(bu 2
+.BR miniserve (1)
+(from the
+.B miniserve
+package).
+.IP \(bu 2
+.BR adb (1)
+(from
+.BR android-tools ).
+.IP \(bu 2
+A Meta Quest with Developer Mode enabled and USB debugging authorized.
+.SH EXAMPLES
+Run with defaults:
+.IP
+.EX
+quest-stream
+.EE
+.P
+Use a different port:
+.IP
+.EX
+QUEST_STREAM_PORT=9000 quest-stream
+.EE
+.P
+Control the user service:
+.IP
+.EX
+systemctl \-\-user status quest-stream
+systemctl \-\-user restart quest-stream
+systemctl \-\-user stop quest-stream
+.EE
+.SH FILES
+.TP
+.I /mnt/data_storage/ctbrec
+First exported folder.
+.TP
+.I /mnt/data_storage/Handbraked
+Second exported folder (also shows the nested
+.I Handbraked
+bind mount).
+.TP
+.I /mnt/data_storage/compressing
+Third exported folder.
+.TP
+.I ~/.local/share/quest-stream
+Symlink staging directory served by miniserve.
+.TP
+.I ~/.config/systemd/user/quest-stream.service
+User unit that starts the server at login.
+.SH EXIT STATUS
+.TP
+.B 0
+Server stopped normally.
+.TP
+.B 1
+Missing dependency, or a source directory does not exist.
+.SH SEE ALSO
+.BR miniserve (1),
+.BR adb (1),
+.BR systemctl (1)

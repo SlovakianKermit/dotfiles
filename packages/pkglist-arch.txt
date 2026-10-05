@@ -59,6 +59,7 @@ flatpak
 flatseal
 fsarchiver
 fwupd
+gerbera
 ggml
 ggml-vulkan
 ghostty
@@ -122,6 +123,7 @@ mda.lv2
 meld
 mesa-utils
 micro
+miniserve
 mkinitcpio
 modemmanager
 moonlight-qt

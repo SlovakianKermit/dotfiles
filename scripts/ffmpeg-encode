@@ -3,7 +3,13 @@
 
 Both codecs use constant-quality mode: HEVC via -qp (0-51), AV1 via VAAPI
 CQP -global_quality (0-255).  Select the codec with --codec hevc|av1 (the
-ffmpeg-encode-av1 wrapper passes --codec av1)."""
+ffmpeg-encode-av1 wrapper passes --codec av1).
+
+--vr switches to a conservative quality default suited to stereoscopic
+VR180/VR360 captures (which arrive already heavily compressed as one
+side-by-side HEVC frame) and refuses to shrink the frame: the encoded
+output must keep the source's exact pixel dimensions or the job fails.  VR
+outputs are written under a VR/ subdirectory of the output root."""
 
 import argparse
 import curses
@@ -27,6 +33,9 @@ DEFAULT_INPUT_DIR = "/mnt/shared/Compressing"
 DEFAULT_OUTPUT_DIR = "/mnt/shared/Handbraked"
 DEFAULT_PRESET = "balanced"
 DEFAULT_CODEC = "hevc"
+# --vr writes its outputs into this subdirectory of the output root, so VR
+# captures are kept separate from the normal Handbraked tree.
+VR_SUBDIR = "VR"
 
 # Per-codec settings.  Both encoders run in constant-quality mode: HEVC via
 # its native -qp (0-51), AV1 via VAAPI CQP -global_quality (0-255, roughly
@@ -38,14 +47,22 @@ CODECS = {
         "quality_min": 0,
         "quality_max": 51,
         "default_quality": 27,
+        "vr_quality": 30,
     },
     "av1": {
         "encoder": "av1_vaapi",
         "quality_min": 0,
         "quality_max": 255,
         "default_quality": 97,
+        "vr_quality": 130,
     },
 }
+
+# --vr quality defaults.  Stereoscopic captures are delivered almost at a
+# "baked" bitrate, so the normal default (HEVC QP 27) can re-encode *larger*
+# than the source and be discarded as "kept".  The VR defaults sit at the
+# conservative end of the range that still produces a real saving while
+# staying visually close to the source; an explicit -q still overrides them.
 
 # VAAPI exposes no quality preset; -async_depth only trades parallelism for
 # speed (higher = faster, no effect on quality).  Keep the old preset names
@@ -119,6 +136,20 @@ def get_duration(path: str) -> float:
         return float(r.stdout.strip() or 0)
     except Exception:
         return 0.0
+
+def get_dimensions(path: str) -> Optional[Tuple[int, int]]:
+    """Return (width, height) of the first video stream, or None."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height",
+             "-of", "csv=p=0:s=x", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        w, h = r.stdout.strip().split("x")[:2]
+        return int(w), int(h)
+    except Exception:
+        return None
 
 def collect_files(directory: str) -> List[str]:
     root = pathlib.Path(directory)
@@ -351,7 +382,7 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
             state.ffmpeg_pids.discard(proc.pid)
 
 def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
-                  quality: int, delete_original: bool):
+                  quality: int, delete_original: bool, vr: bool = False):
     device = find_vaapi_device()
     sw_decode = False
     copy_audio = True
@@ -391,7 +422,22 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
                         pass
             elif returncode == 0 and os.path.getsize(job.output_path) > 0:
                 out_size = os.path.getsize(job.output_path)
-                if out_size < job.input_size:
+                # VR: never accept a downscaled/re-cropped frame.  The two
+                # fisheye eyes must survive at their source resolution.
+                dims_changed = ""
+                if vr:
+                    din = get_dimensions(job.input_path)
+                    dout = get_dimensions(job.output_path)
+                    if din and dout and din != dout:
+                        dims_changed = f"{din[0]}x{din[1]} -> {dout[0]}x{dout[1]}"
+                if dims_changed:
+                    job.status = "failed"
+                    job.error = f"VR resolution changed: {dims_changed}"
+                    try:
+                        os.remove(job.output_path)
+                    except OSError:
+                        pass
+                elif out_size < job.input_size:
                     job.status = "done"
                     job.output_size = out_size
                     job.progress = 100
@@ -531,7 +577,7 @@ class TUI:
                 t = threading.Thread(
                     target=ffmpeg_worker,
                     args=(job, self.state, self.args.codec, self.args.preset,
-                          self.args.quality, self.args.delete),
+                          self.args.quality, self.args.delete, self.args.vr),
                     daemon=True,
                 )
                 self.state.workers.append(t)
@@ -778,7 +824,7 @@ class TUI:
 
         pending_count = sum(1 for j in self.queue.jobs if j.status == "pending")
 
-        left = f" ffmpeg-encode [{self.args.codec}] "
+        left = f" ffmpeg-encode [{self.args.codec}{' vr' if self.args.vr else ''}] "
         right = f" Elapsed: {ts}  Queued: {pending_count} "
 
         # If right side would overflow, shorten left
@@ -1092,6 +1138,13 @@ def parse_args() -> argparse.Namespace:
                    help="Keep both the original and the encoded file "
                         "(no deletion; default: delete the original only when "
                         "the encode is smaller)")
+    p.add_argument("--vr", action="store_true",
+                   help="VR mode: conservative quality default (HEVC -qp 30, "
+                        "AV1 -global_quality 130) and fail any encode whose "
+                        "output resolution differs from the source; never "
+                        "downscales. Outputs are written under a VR/ "
+                        "subdirectory of the output root. An explicit -q "
+                        "still overrides the default.")
     return p.parse_args()
 
 def main_curses(stdscr, queue: Queue, state: SharedState, args):
@@ -1108,10 +1161,16 @@ def main():
         sys.exit(1)
 
     # Resolve the codec-dependent quality default and clamp to its valid range.
+    # --vr only changes the default; an explicit -q always wins.
     cfg = CODECS[args.codec]
     if args.quality is None:
-        args.quality = cfg["default_quality"]
+        args.quality = cfg["vr_quality"] if args.vr else cfg["default_quality"]
     args.quality = max(cfg["quality_min"], min(cfg["quality_max"], args.quality))
+
+    # --vr keeps its outputs separate, under a VR/ subdirectory of the output
+    # root (e.g. /mnt/shared/Handbraked/VR).  An explicit single-file
+    # --output still wins over this.
+    output_dir = os.path.join(args.o, VR_SUBDIR) if args.vr else args.o
 
     # ── Dry run ─────────────────────────────────────────────────────
     if args.dry_run:
@@ -1130,7 +1189,7 @@ def main():
         print("  Is libva-utils / intel-media-driver installed?", file=sys.stderr)
         sys.exit(1)
 
-    queue = Queue(args.i, args.o)
+    queue = Queue(args.i, output_dir)
 
     # ── Single-file mode ────────────────────────────────────────────
     if args.input:
