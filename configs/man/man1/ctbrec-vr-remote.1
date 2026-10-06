@@ -1,0 +1,76 @@
+.TH CTBREC-VR-REMOTE 1 "2026-10-06" "ctbrec-vr-remote" "User Commands"
+.SH NAME
+ctbrec-vr-remote \- run ctbrec-vr on the Proxmox server over ssh
+.SH SYNOPSIS
+.B ctbrec-vr-remote
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-vr-remote
+is a thin local wrapper that runs
+.BR ctbrec-vr (1)
+on the Proxmox server. It connects with
+.BR ssh (1)
+(non\-interactive, no TTY, with the host's
+.B RemoteCommand
+disabled) and executes
+.B /usr/local/bin/ctbrec-vr
+with
+.B \-\-dir /mnt/pve/Data_Storage/ctbrec
+plus any arguments given to the wrapper.
+.P
+All scanning, probing, and moving happen on the server, where the recordings
+live; nothing is transferred to the local machine. The remote interpreter runs
+with
+.B PYTHONUNBUFFERED\=1
+so progress streams back live, and the remote exit status becomes the
+wrapper's exit status.
+.SH OPTIONS
+All options are forwarded verbatim to
+.BR ctbrec-vr (1);
+see that page for the full list. The most useful are
+.BR \-\-dry\-run ,
+.BR \-\-age ,
+and
+.BR \-\-max\-moves .
+.SH ENVIRONMENT
+.TP
+.B CTBREC_VR_SERVER
+Ssh host (or alias from
+.BR ssh_config (5))
+to run on. Defaults to
+.BR proxmox .
+.TP
+.B CTBREC_VR_BIN
+Path to the remote executable. Defaults to
+.BR /usr/local/bin/ctbrec-vr .
+.TP
+.B CTBREC_VR_DIR
+Remote recordings root passed as
+.BR \-\-dir .
+Defaults to
+.BR /mnt/pve/Data_Storage/ctbrec .
+.SH EXAMPLES
+Preview what would move on the server:
+.IP
+.EX
+ctbrec-vr-remote \-\-dry\-run
+.EE
+.P
+Do a normal pass on the server:
+.IP
+.EX
+ctbrec-vr-remote
+.EE
+.P
+Move at most 20 files, ignoring I/O pressure:
+.IP
+.EX
+ctbrec-vr-remote \-\-max\-moves 20 \-\-no\-io\-check
+.EE
+.SH EXIT STATUS
+The exit status of the remote
+.BR ctbrec-vr (1).
+.SH SEE ALSO
+.BR ctbrec-vr (1),
+.BR ctbrec-merge-remote (1),
+.BR ssh (1)

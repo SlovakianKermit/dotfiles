@@ -160,7 +160,7 @@ file even when it is larger than the original.
 VR mode for stereoscopic VR180/VR360 captures. Sets the quality default to
 HEVC
 .B \-qp
-30, or AV1
+28, or AV1
 .B \-global_quality
 130, writes outputs under a
 .B VR
@@ -231,15 +231,18 @@ keeps both files in all cases. Files that are cancelled or quit are left
 alone and the original is never removed.
 .SS VR mode
 Stereoscopic VR is delivered as one side-by-side frame (for example
-5760x2880 HEVC at roughly 7.5 Mbit/s, that is two 2880x2880 fisheye eyes).
-The platform has already compressed it heavily, so re-encoding at the normal
-default can grow the file and be discarded as
+5760x2880 HEVC, or 4096x2048 H.264, at roughly 5-10 Mbit/s; that is two
+fisheye eyes). The platform has already compressed it heavily, so
+re-encoding at the normal default can grow the file and be discarded as
 .IR kept .
 .B \-\-vr
 raises the quality target to the conservative end that still produces a real
-saving (HEVC QP 30, AV1 CQ 130) and, because VR viewers magnify any
+saving (HEVC QP 28, AV1 CQ 130) and, because VR viewers magnify any
 resolution loss, fails any encode whose output dimensions differ from the
-input. Colour range is preserved: full-range
+input. The HEVC default was calibrated on H.264 VR sources so the re-encode
+holds mean VMAF around 95 (visually indistinguishable from the source) while
+still roughly halving high-motion clips. Colour range is preserved:
+full-range
 .B yuvj420p
 captures stay full-range through both the hardware and the software-decode
 paths.

@@ -1,0 +1,221 @@
+.TH CTBREC-VR 1 "2026-10-06" "ctbrec-vr" "User Commands"
+.SH NAME
+ctbrec-vr \- move finished VR ctbrec recordings into a vr/ subfolder
+.SH SYNOPSIS
+.B ctbrec-vr
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-vr
+scans a ctbrec recordings tree (default
+.IR /mnt/pve/Data_Storage/ctbrec ),
+identifies recordings whose first video stream is larger than 1080p, and
+renames those that are no longer being written into a
+.B vr
+subfolder of the recordings root.
+.P
+A recording is considered VR when its video height is greater than
+.B \-\-base\-height
+(default 1080) or its width is greater than
+.B \-\-base\-width
+(default 1920). At this site that captures the stereoscopic 5760\(mu2880,
+4096\(mu2048 and related formats while excluding every regular 1080p/720p
+stream, and it does not rely on model names (which can contain
+.RB \(lq vr \(rq
+without being VR).
+.P
+A recording is considered finished when it is neither open for writing
+(inode\-based
+.B /proc
+file\-descriptor check, so recorders in an LXC container are detected) nor
+modified within
+.B \-\-age
+seconds (default 900).
+.P
+Moves use
+.BR rename (2)
+within the same filesystem, so they are instant, copy no data, and need no
+extra space. Files already known to be non\-VR are remembered in a small cache
+so that repeated runs probe only genuinely new recordings; a steady\-state run
+therefore does almost no work. The scan covers the recordings root and one
+level of per\-model subdirectories, skipping
+.IR vr ,
+.IR .merged_originals ,
+.IR compressing ,
+and hidden directories.
+.P
+Probes run
+.B ffprobe
+under
+.BR nice (1)
+and
+.BR ionice (1)
+class 3 by default, and the whole run is
+.I deferred
+(not queued) when host I/O pressure is above
+.B \-\-io\-threshold .
+.P
+The script runs as root, but the recordings share is managed over Samba as
+another user. Because deleting a file needs write permission on its
+directory, the destination is chowned and chmodded on every run to match the
+recordings root (or the explicit
+.BR \-\-owner / \-\-group / \-\-dir\-mode ).
+This also repairs a destination that an earlier run left root\-owned.
+.SH OPTIONS
+.TP
+.BI \-\-dir " DIR"
+Recordings root to scan. Default:
+.IR /mnt/pve/Data_Storage/ctbrec .
+.TP
+.BI \-\-dest " DIR"
+Destination directory. Default:
+.IR DIR/vr .
+.TP
+.BI \-\-owner " USER"
+Owner (name or uid) for the destination directory. Default: the owner of
+.BR \-\-dir .
+.TP
+.BI \-\-group " GROUP"
+Group (name or gid) for the destination directory. Default: the group of
+.BR \-\-dir .
+.TP
+.BI \-\-dir\-mode " OCTAL"
+Permission mode, in octal, for the destination directory. Default: the mode of
+.BR \-\-dir
+(here 0775).
+.TP
+.BI \-\-age " SECONDS"
+Skip files modified within this many seconds. Default: 900.
+.TP
+.BI \-\-base\-height " PX"
+Treat a recording as VR when its video height exceeds
+.IR PX .
+Default: 1080.
+.TP
+.BI \-\-base\-width " PX"
+Treat a recording as VR when its video width exceeds
+.IR PX .
+Default: 1920.
+.TP
+.B \-\-top\-level
+Only scan
+.B \-\-dir
+itself, never descend into per\-model subdirectories.
+.TP
+.BI \-\-max\-moves " N"
+Stop after
+.I N
+moves. Default 0 = unlimited.
+.TP
+.BI \-\-cache " FILE"
+Path to the non\-VR cache file. Default:
+.IR /var/lib/ctbrec\-vr/nonvr.txt
+(or
+.I ~/.cache/ctbrec\-vr/nonvr.txt
+when that is not writable).
+.TP
+.BI \-\-lock " FILE"
+Lock file used to prevent overlapping runs. Default:
+.IR /run/ctbrec\-vr.lock .
+.TP
+.BI \-\-io\-threshold " PCT"
+Defer the run when host I/O pressure
+.RB ( /proc/pressure/io ,
+.B "full avg10" )
+exceeds this percentage. Default: 40, which only trips under genuine
+contention; normal recording load here sits around 3\(en9%.
+.TP
+.B \-\-no\-io\-check
+Do not defer on I/O pressure.
+.TP
+.B \-\-no\-active
+Skip the open\-for\-write check and rely on
+.B \-\-age
+alone.
+.TP
+.B \-\-no\-nice
+Do not run
+.B ffprobe
+under
+.BR nice (1)/ ionice (1).
+.TP
+.B \-\-dry\-run
+Print what would move; change nothing and do not update the cache.
+.TP
+.B \-h ", " \-\-help
+Show a short help message and exit.
+.SH BEHAVIOUR
+.SS Files considered
+Files ending in
+.B .ts
+or
+.B .mts
+in the recordings root and in one level of subdirectories, excluding the
+skipped directories listed above. Zero\-length files are ignored, and files
+whose header cannot be probed are left in place and retried on a later run.
+.SS Moving
+A matching file is renamed into
+.BR \-\-dest .
+If a file of the same name already exists there, a numeric suffix is added.
+.SS Scheduling
+A systemd timer
+.RI ( ctbrec\-vr.timer )
+runs the script every 15 minutes with
+.BR Nice=19
+and
+.BR IOSchedulingClass=idle .
+.SS Requirements
+.B ffprobe
+from
+.BR ffmpeg (1).
+.SH EXAMPLES
+Preview what would move, changing nothing:
+.IP
+.EX
+ctbrec-vr \-\-dry\-run
+.EE
+.P
+Run a normal pass over the default tree:
+.IP
+.EX
+ctbrec-vr
+.EE
+.P
+Move files that are only 5 minutes old, ignoring I/O pressure:
+.IP
+.EX
+ctbrec-vr \-\-age 300 \-\-no\-io\-check
+.EE
+.P
+Move at most 20 files this run:
+.IP
+.EX
+ctbrec-vr \-\-max\-moves 20
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, deferred on I/O pressure, or another run held the lock.
+.TP
+.B 1
+Bad options, missing directory, or
+.B ffprobe
+unavailable.
+.SH FILES
+.TP
+.I /var/lib/ctbrec-vr/nonvr.txt
+Cache of filenames already classified as non\-VR.
+.TP
+.I /run/ctbrec-vr.lock
+Lock held for the duration of a run.
+.TP
+.I /etc/systemd/system/ctbrec-vr.service
+.TQ
+.I /etc/systemd/system/ctbrec-vr.timer
+Systemd units that drive the recurring run.
+.TP
+.I /mnt/pve/Data_Storage/ctbrec/vr
+Default destination for moved recordings.
+.SH SEE ALSO
+.BR ctbrec-vr-remote (1),
+.BR ctbrec-merge (1),
+.BR ffprobe (1)

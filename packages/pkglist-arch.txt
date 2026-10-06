@@ -139,6 +139,7 @@ netctl
 networkmanager
 networkmanager-openvpn
 nfs-utils
+nginx
 nilfs-utils
 nmap
 noto-fonts

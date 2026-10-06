@@ -47,7 +47,7 @@ CODECS = {
         "quality_min": 0,
         "quality_max": 51,
         "default_quality": 27,
-        "vr_quality": 30,
+        "vr_quality": 28,
     },
     "av1": {
         "encoder": "av1_vaapi",
@@ -60,9 +60,11 @@ CODECS = {
 
 # --vr quality defaults.  Stereoscopic captures are delivered almost at a
 # "baked" bitrate, so the normal default (HEVC QP 27) can re-encode *larger*
-# than the source and be discarded as "kept".  The VR defaults sit at the
-# conservative end of the range that still produces a real saving while
-# staying visually close to the source; an explicit -q still overrides them.
+# than the source and be discarded as "kept".  The HEVC VR default (QP 28) was
+# calibrated against H.264 VR sources (4096x2048 @50fps, ~10 Mbps): it keeps
+# mean VMAF >= 95 versus the source while still roughly halving high-motion
+# clips, and is a conservative step below the old QP 30.  An explicit -q still
+# overrides it.
 
 # VAAPI exposes no quality preset; -async_depth only trades parallelism for
 # speed (higher = faster, no effect on quality).  Keep the old preset names
@@ -1139,7 +1141,7 @@ def parse_args() -> argparse.Namespace:
                         "(no deletion; default: delete the original only when "
                         "the encode is smaller)")
     p.add_argument("--vr", action="store_true",
-                   help="VR mode: conservative quality default (HEVC -qp 30, "
+                   help="VR mode: conservative quality default (HEVC -qp 28, "
                         "AV1 -global_quality 130) and fail any encode whose "
                         "output resolution differs from the source; never "
                         "downscales. Outputs are written under a VR/ "

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER="${CTBREC_VR_SERVER:-proxmox}"
+REMOTE_BIN="${CTBREC_VR_BIN:-/usr/local/bin/ctbrec-vr}"
+REMOTE_DIR="${CTBREC_VR_DIR:-/mnt/pve/Data_Storage/ctbrec}"
+
+SSH_OPTS=(-o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
+
+exec ssh "${SSH_OPTS[@]}" "$SERVER" \
+  env PYTHONUNBUFFERED=1 "$REMOTE_BIN" --dir "$REMOTE_DIR" "$@"

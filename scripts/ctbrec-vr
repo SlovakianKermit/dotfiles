@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Move finished VR ctbrec recordings into a vr/ subfolder.
+
+A recording is treated as VR when its first video stream is larger than
+1080p (height > 1080 or width > 1920).  A recording is treated as finished
+when it is neither open for writing nor modified within --age seconds.
+Matching files are renamed (same filesystem, so instant and zero-copy) into
+<dir>/vr.  Files already known to be non-VR are remembered in a small cache
+so steady-state runs probe only genuinely new recordings.
+"""
+import argparse
+import fcntl
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+TS_EXTS = (".ts", ".mts")
+SKIP_DIRS = {"vr", ".merged_originals", "compressing"}
+STATE = {"cache": set(), "cache_path": None, "lock_fd": None, "dirty": False}
+
+
+def probe_dims(path, prefix):
+    """Return (width, height) of the first video stream, or None."""
+    cmd = prefix + [
+        "ffprobe", "-v", "error",
+        "-read_intervals", "0%+1",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0", path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line or line == "N/A":
+            continue
+        parts = line.split(",")
+        if len(parts) >= 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except ValueError:
+                continue
+    return None
+
+
+def active_write_paths(root):
+    """Set of (st_dev, st_ino) for .ts/.mts files currently open for writing.
+
+    Matching is by inode rather than path so recorders running in a different
+    mount namespace (an LXC container) are still detected.
+    """
+    try:
+        root_dev = os.stat(root).st_dev
+    except OSError:
+        return None
+    active = set()
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return None
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        fddir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fddir)
+        except OSError:
+            continue
+        for fd in fds:
+            fdpath = os.path.join(fddir, fd)
+            try:
+                target = os.readlink(fdpath)
+            except OSError:
+                continue
+            if not (target.endswith(".ts") or target.endswith(".mts")):
+                continue
+            try:
+                st = os.stat(fdpath)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            try:
+                with open(f"/proc/{pid}/fdinfo/{fd}") as fi:
+                    flags = None
+                    for line in fi:
+                        if line.startswith("flags:"):
+                            flags = int(line.split()[1], 8)
+                            break
+            except (OSError, ValueError):
+                continue
+            if flags is not None and (flags & 0o3) in (1, 2):
+                active.add((st.st_dev, st.st_ino))
+    return active
+
+
+def io_full_avg10():
+    try:
+        with open("/proc/pressure/io") as f:
+            for line in f:
+                if line.startswith("full"):
+                    for tok in line.split():
+                        if tok.startswith("avg10="):
+                            return float(tok.split("=", 1)[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def probe_prefix(args):
+    if args.no_nice:
+        return []
+    prefix = []
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", "19"]
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-c3"]
+    return prefix
+
+
+def candidate_dirs(root, top_level, dest):
+    if top_level:
+        return [root]
+    dirs = [root]
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return dirs
+    for name in entries:
+        if name.startswith("."):
+            continue
+        if name in SKIP_DIRS:
+            continue
+        p = os.path.join(root, name)
+        if os.path.isdir(p) and os.path.abspath(p) != dest:
+            dirs.append(p)
+    return dirs
+
+
+def load_cache(path):
+    try:
+        with open(path) as f:
+            return {ln.strip() for ln in f if ln.strip()}
+    except OSError:
+        return set()
+
+
+def save_cache():
+    if not STATE["dirty"] or not STATE["cache_path"]:
+        return
+    path = STATE["cache_path"]
+    try:
+        tmp = path + ".tmp"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as f:
+            for name in sorted(STATE["cache"]):
+                f.write(name + "\n")
+        os.replace(tmp, path)
+        STATE["dirty"] = False
+    except OSError as exc:
+        print(f"warn: could not write cache {path}: {exc}", file=sys.stderr)
+
+
+def acquire_lock(path):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as exc:
+        print(f"warn: could not open lock {path}: {exc}", file=sys.stderr)
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    STATE["lock_fd"] = fd
+    return True
+
+
+def move_one(src, destdir, dry_run):
+    base = os.path.basename(src)
+    dst = os.path.join(destdir, base)
+    if os.path.exists(dst):
+        stem, ext = os.path.splitext(base)
+        i = 1
+        while os.path.exists(dst):
+            dst = os.path.join(destdir, f"{stem}_{i}{ext}")
+            i += 1
+    if dry_run:
+        return dst
+    os.makedirs(destdir, exist_ok=True)
+    try:
+        os.rename(src, dst)
+    except OSError:
+        shutil.move(src, dst)
+    return dst
+
+
+def default_cache_path():
+    for d in ("/var/lib/ctbrec-vr",):
+        try:
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, "nonvr.txt")
+        except OSError:
+            continue
+    d = os.path.join(os.path.expanduser("~"), ".cache", "ctbrec-vr")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "nonvr.txt")
+
+
+def _id_or_name(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def ensure_dest(dest, root, args, dry_run):
+    """Create the destination and make it writable by the share owner.
+
+    The mover runs as root, but files on the share are managed over Samba as
+    another user (smbuser). Deleting a file needs write permission on its
+    directory, so the destination is chowned/chmodded to match the recordings
+    root (or the explicit --owner/--group/--dir-mode). This also repairs a
+    destination left root-owned by an earlier run.
+    """
+    try:
+        rst = os.stat(root)
+    except OSError as exc:
+        print(f"warn: cannot stat {root}: {exc}", file=sys.stderr)
+        return
+    uid = _id_or_name(args.owner) if args.owner is not None else rst.st_uid
+    gid = _id_or_name(args.group) if args.group is not None else rst.st_gid
+    mode = args.dir_mode if args.dir_mode is not None else (rst.st_mode & 0o7777)
+
+    if dry_run:
+        try:
+            dst = os.stat(dest)
+        except OSError:
+            print(f"would create {dest} (owner {uid}:{gid}, mode {mode:04o})")
+            return
+        if dst.st_uid != rst.st_uid or dst.st_gid != rst.st_gid \
+                or (dst.st_mode & 0o7777) != mode:
+            print(f"would fix {dest} permissions (owner {uid}:{gid}, mode {mode:04o})")
+        return
+
+    os.makedirs(dest, exist_ok=True)
+    try:
+        dst = os.stat(dest)
+        if dst.st_uid != uid or dst.st_gid != gid:
+            shutil.chown(dest, user=uid, group=gid)
+            print(f"fixed ownership of {dest} to {uid}:{gid}")
+        if (dst.st_mode & 0o7777) != mode:
+            os.chmod(dest, mode)
+            print(f"fixed permissions of {dest} to {mode:04o}")
+    except OSError as exc:
+        print(f"warn: could not set {dest} ownership/permissions: {exc}",
+              file=sys.stderr)
+
+
+
+def run(args):
+    root = os.path.abspath(args.dir)
+    if not os.path.isdir(root):
+        print(f"error: {root} is not a directory", file=sys.stderr)
+        return 1
+    dest = os.path.abspath(args.dest) if args.dest else os.path.join(root, "vr")
+
+    if dest == root:
+        print("error: destination equals source directory", file=sys.stderr)
+        return 1
+
+    ensure_dest(dest, root, args, args.dry_run)
+
+    if not args.no_io_check:
+        v = io_full_avg10()
+        if v is not None and v > args.io_threshold:
+            print(f"deferring: disk io pressure {v:.0f}% > {args.io_threshold:.0f}% "
+                  f"(next run will retry)")
+            return 0
+
+    lock_path = args.lock or ("/run/ctbrec-vr.lock"
+                              if os.access("/run", os.W_OK) else "/tmp/ctbrec-vr.lock")
+    if not acquire_lock(lock_path):
+        print("deferring: another ctbrec-vr run is in progress")
+        return 0
+
+    STATE["cache_path"] = args.cache or default_cache_path()
+    STATE["cache"] = load_cache(STATE["cache_path"])
+
+    prefix = probe_prefix(args)
+    now = time.time()
+    active = None if args.no_active else active_write_paths(root)
+    if active is None and not args.no_active:
+        print("warn: could not enumerate open files; relying on --age only",
+              file=sys.stderr)
+
+    moved = probed = skipped_active = cached = failed = 0
+    matched = []
+    for d in candidate_dirs(root, args.top_level, dest):
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(TS_EXTS):
+                continue
+            path = os.path.join(d, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_size == 0:
+                continue
+            if active is not None and (st.st_dev, st.st_ino) in active:
+                skipped_active += 1
+                continue
+            if now - st.st_mtime <= args.age:
+                skipped_active += 1
+                continue
+            if name in STATE["cache"]:
+                cached += 1
+                continue
+            dims = probe_dims(path, prefix)
+            probed += 1
+            if dims is None:
+                failed += 1
+                continue
+            w, h = dims
+            if h > args.base_height or w > args.base_width:
+                dst = move_one(path, dest, args.dry_run)
+                moved += 1
+                matched.append((name, w, h, dst if args.dry_run else os.path.basename(dst)))
+                if not args.dry_run:
+                    print(f"moved {name} ({w}x{h}) -> {os.path.relpath(dst, root)}")
+            else:
+                if not args.dry_run:
+                    STATE["cache"].add(name)
+                    STATE["dirty"] = True
+            if args.max_moves and moved >= args.max_moves:
+                print(f"reached --max-moves {args.max_moves}; stopping")
+                break
+        if args.max_moves and moved >= args.max_moves:
+            break
+
+    save_cache()
+
+    if args.dry_run and matched:
+        print("would move:")
+        for name, w, h, dst in matched:
+            print(f"  {name} ({w}x{h}) -> {os.path.relpath(dst, root)}")
+    print(f"done: {moved} move(d){' [dry-run]' if args.dry_run else ''}, "
+          f"{probed} probed, {cached} cached non-VR, "
+          f"{skipped_active} active/recent, {failed} unreadable")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="ctbrec-vr",
+        description="Move finished VR ctbrec recordings into a vr/ subfolder.",
+    )
+    ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
+                    help="recordings root (default: /mnt/pve/Data_Storage/ctbrec)")
+    ap.add_argument("--dest", default=None,
+                    help="destination directory (default: <dir>/vr)")
+    ap.add_argument("--owner", default=None,
+                    help="owner for --dest (name or uid; default: owner of --dir)")
+    ap.add_argument("--group", default=None,
+                    help="group for --dest (name or gid; default: group of --dir)")
+    ap.add_argument("--dir-mode", type=lambda s: int(s, 8), default=None,
+                    help="permission mode for --dest in octal (default: mode of --dir)")
+    ap.add_argument("--age", type=int, default=900,
+                    help="skip files modified within this many seconds (default: 900)")
+    ap.add_argument("--base-height", type=int, default=1080,
+                    help="VR when video height exceeds this (default: 1080)")
+    ap.add_argument("--base-width", type=int, default=1920,
+                    help="VR when video width exceeds this (default: 1920)")
+    ap.add_argument("--top-level", action="store_true",
+                    help="only scan --dir itself, not per-model subdirectories")
+    ap.add_argument("--max-moves", type=int, default=0,
+                    help="stop after this many moves; 0 = unlimited (default)")
+    ap.add_argument("--cache", default=None,
+                    help="path to the non-VR cache file (default: /var/lib/ctbrec-vr/nonvr.txt)")
+    ap.add_argument("--lock", default=None,
+                    help="lock file path (default: /run/ctbrec-vr.lock)")
+    ap.add_argument("--io-threshold", type=float, default=40.0,
+                    help="defer when host io pressure full avg10 exceeds this (default: 40)")
+    ap.add_argument("--no-io-check", action="store_true",
+                    help="do not defer on io pressure")
+    ap.add_argument("--no-active", action="store_true",
+                    help="skip the open-for-write check (fall back to --age only)")
+    ap.add_argument("--no-nice", action="store_true",
+                    help="do not run ffprobe under nice/ionice")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print what would move; change nothing")
+    args = ap.parse_args()
+
+    if not shutil.which("ffprobe"):
+        print("error: ffprobe not found in PATH", file=sys.stderr)
+        return 1
+    return run(args)
+
+
+def _cleanup(signum=None, frame=None):
+    save_cache()
+    if STATE["lock_fd"] is not None:
+        try:
+            os.close(STATE["lock_fd"])
+        except OSError:
+            pass
+    if signum is not None:
+        print("\ninterrupted", file=sys.stderr)
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+    try:
+        sys.exit(main())
+    finally:
+        _cleanup()
