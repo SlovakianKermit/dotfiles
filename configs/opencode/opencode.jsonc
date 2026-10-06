@@ -32,18 +32,9 @@
         { "action": "external_directory", "resource": "*", "effect": "allow" },
         { "action": "shell", "resource": "*", "effect": "allow" },
         { "action": "shell", "resource": "rm -rf *", "effect": "deny" },
-        { "action": "shell", "resource": "rm -fr *", "effect": "deny" },
         { "action": "shell", "resource": "shutdown *", "effect": "deny" },
         { "action": "shell", "resource": "reboot *", "effect": "deny" },
-        { "action": "shell", "resource": "poweroff *", "effect": "deny" },
-        { "action": "shell", "resource": "systemctl start *", "effect": "deny" },
-        { "action": "shell", "resource": "systemctl stop *", "effect": "deny" },
-        { "action": "shell", "resource": "systemctl restart *", "effect": "deny" },
-        { "action": "shell", "resource": "pacman -S *", "effect": "deny" },
-        { "action": "shell", "resource": "pacman -R *", "effect": "deny" },
-        { "action": "shell", "resource": "pacman -U *", "effect": "deny" },
-        { "action": "shell", "resource": "sudo *", "effect": "deny" },
-        { "action": "shell", "resource": "ssh * sudo *", "effect": "deny" }
+        { "action": "shell", "resource": "poweroff *", "effect": "deny" }
       ]
     }
   },
@@ -56,12 +47,6 @@
     { "action": "external_directory", "resource": "$HOME/.local/share/man/*", "effect": "allow" },
     { "action": "shell", "resource": "*", "effect": "allow" },
     { "action": "shell", "resource": "*rm -rf*", "effect": "deny" },
-    { "action": "shell", "resource": "*rm -fr*", "effect": "deny" },
-    { "action": "shell", "resource": "*shred *", "effect": "deny" },
-    { "action": "shell", "resource": "*wipefs*", "effect": "deny" },
-    { "action": "shell", "resource": "*mkfs*", "effect": "deny" },
-    { "action": "shell", "resource": "*dd if=*", "effect": "deny" },
-    { "action": "shell", "resource": "*> /dev/sd*", "effect": "deny" },
     { "action": "shell", "resource": "*shutdown*", "effect": "deny" },
     { "action": "shell", "resource": "*reboot*", "effect": "deny" },
     { "action": "shell", "resource": "*poweroff*", "effect": "deny" },
