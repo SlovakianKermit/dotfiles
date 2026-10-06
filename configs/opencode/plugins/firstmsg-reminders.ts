@@ -5,6 +5,8 @@ const REMINDERS = [
   "- When ssh'ing via any alias from ~/.ssh/config (proxmox, laptop, valheim, odysseus-lxc, odysseus-docker), pass `-o RemoteCommand=none -o RequestTTY=no`. Those configs set RemoteCommand (fish / docker exec) which hangs non-interactive ssh.",
   "- User scripts live in ~/.local/bin.",
   "- ~/dotfiles is a GitHub push mirror only - never write to it or treat it as the source of truth. Edit the live files (e.g. ~/.local/bin, ~/.local/share/man, ~/.config/...) and let dotfiles-sync.sh push mirror them.",
+  "- `sudo` is allowed - the shell permission denylist does not block it. Use sudo when a task needs elevated privileges.",
+  "- After making large changes (scripts, configs, skills, man pages, or OpenCode settings), run `dotfiles-sync.sh push \"<message>\"` to mirror them to the ~/dotfiles GitHub repo.",
 ].join("\n")
 
 const seen = new Set<string>()
