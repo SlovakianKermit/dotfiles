@@ -32,9 +32,15 @@
         { "action": "external_directory", "resource": "*", "effect": "allow" },
         { "action": "shell", "resource": "*", "effect": "allow" },
         { "action": "shell", "resource": "rm -rf *", "effect": "deny" },
-        { "action": "shell", "resource": "shutdown *", "effect": "deny" },
+        { "action": "shell", "resource": "sudo rm -rf *", "effect": "deny" },
         { "action": "shell", "resource": "reboot *", "effect": "deny" },
-        { "action": "shell", "resource": "poweroff *", "effect": "deny" }
+        { "action": "shell", "resource": "sudo reboot *", "effect": "deny" },
+        { "action": "shell", "resource": "systemctl reboot *", "effect": "deny" },
+        { "action": "shell", "resource": "shutdown *", "effect": "deny" },
+        { "action": "shell", "resource": "sudo shutdown *", "effect": "deny" },
+        { "action": "shell", "resource": "poweroff *", "effect": "deny" },
+        { "action": "shell", "resource": "sudo poweroff *", "effect": "deny" },
+        { "action": "shell", "resource": "systemctl poweroff *", "effect": "deny" }
       ]
     }
   },
@@ -46,10 +52,16 @@
     { "action": "external_directory", "resource": "$HOME/.local/bin/*", "effect": "allow" },
     { "action": "external_directory", "resource": "$HOME/.local/share/man/*", "effect": "allow" },
     { "action": "shell", "resource": "*", "effect": "allow" },
-    { "action": "shell", "resource": "*rm -rf*", "effect": "deny" },
-    { "action": "shell", "resource": "*shutdown*", "effect": "deny" },
-    { "action": "shell", "resource": "*reboot*", "effect": "deny" },
-    { "action": "shell", "resource": "*poweroff*", "effect": "deny" },
+    { "action": "shell", "resource": "rm -rf *", "effect": "deny" },
+    { "action": "shell", "resource": "sudo rm -rf *", "effect": "deny" },
+    { "action": "shell", "resource": "reboot *", "effect": "deny" },
+    { "action": "shell", "resource": "sudo reboot *", "effect": "deny" },
+    { "action": "shell", "resource": "systemctl reboot *", "effect": "deny" },
+    { "action": "shell", "resource": "shutdown *", "effect": "deny" },
+    { "action": "shell", "resource": "sudo shutdown *", "effect": "deny" },
+    { "action": "shell", "resource": "poweroff *", "effect": "deny" },
+    { "action": "shell", "resource": "sudo poweroff *", "effect": "deny" },
+    { "action": "shell", "resource": "systemctl poweroff *", "effect": "deny" },
     { "action": "searxng", "resource": "*", "effect": "allow" }
   ],
   "compaction": {
