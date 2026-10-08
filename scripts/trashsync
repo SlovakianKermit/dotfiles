@@ -6,7 +6,12 @@
 # ~/.config/trashrc [Status] Empty, so Dolphin's "Empty Trash" action stays
 # greyed out even though the trash is not empty.
 #
-# Invoked by shared-trash-sync.path whenever a watched trash changes.
+# Invoked by shared-trash-sync.path whenever a watched trash changes, and by
+# shared-trash-sync.timer periodically as a safety net (path units stop
+# working if their watched mount is unmounted and remounted).
+#
+# The flag is only rewritten when it actually changes, so the periodic timer
+# does not churn ~/.config/trashrc.
 
 set -euo pipefail
 
@@ -26,5 +31,8 @@ for dir in "${TRASH_DIRS[@]}"; do
         break
     fi
 done
+
+current="$(kreadconfig6 --file trashrc --group Status --key Empty 2>/dev/null || true)"
+[[ "$current" == "$empty" ]] && exit 0
 
 kwriteconfig6 --file trashrc --group Status --key Empty --type bool "$empty"

@@ -1,0 +1,104 @@
+.TH TRASHSYNC 1 "2026-10-08" "trashsync" "User Commands"
+.SH NAME
+trashsync \- sync KDE's trashrc Empty flag with the real trash state
+.SH SYNOPSIS
+.B trashsync
+.SH DESCRIPTION
+.B trashsync
+recomputes whether the trash is empty and stores the result in the
+.B [Status]
+.B Empty
+key of
+.IR ~/.config/trashrc ,
+which KDE applications such as
+.BR dolphin (1)
+read to decide whether to enable their
+.I Empty Trash
+action.
+.P
+It is a workaround for KDE bug 293651: when a non\-KDE application
+(for example
+.BR losslesscut ,
+which trashes files through GIO/Electron) moves them into a volume
+trash, KDE never updates the flag, so
+.B dolphin
+leaves
+.I Empty Trash
+greyed out even though the trash is not empty. This helper rewrites the
+flag so the action becomes available again.
+.P
+The trash is treated as non\-empty if either
+.I ~/.local/share/Trash/info
+or
+.I /mnt/shared/.Trash\-1000/info
+contains at least one
+.I .trashinfo
+file. The flag is written only when its value actually changes, so the
+helper is cheap to run repeatedly.
+.P
+It takes no options, and requires
+.BR kreadconfig6 (1)
+and
+.BR kwriteconfig6 (1).
+.SH EXIT STATUS
+.TP
+.B 0
+Success, whether or not the flag needed changing.
+.TP
+.B 1
+A required command was missing or a configuration call failed.
+.SH FILES
+.TP
+.I ~/.config/trashrc
+KDE trash state file; its
+.B [Status] Empty
+key is read and rewritten.
+.TP
+.I ~/.local/share/Trash/info
+Home trash metadata directory (checked).
+.TP
+.I /mnt/shared/.Trash\-1000/info
+Shared NTFS volume trash metadata directory (checked).
+.TP
+.I ~/.config/systemd/user/shared\-trash\-sync.path
+User path unit that runs
+.B trashsync
+whenever a watched trash changes.
+.TP
+.I ~/.config/systemd/user/shared\-trash\-sync.timer
+User timer that runs
+.B trashsync
+every 30 seconds as a safety net. A path unit's inotify watch stops
+working if the filesystem it watches is unmounted and remounted, so the
+timer guarantees the flag is corrected even then.
+.TP
+.I ~/.config/systemd/user/shared\-trash\-sync.service
+Oneshot service activated by both units above.
+.SH EXAMPLES
+Sync the flag by hand after trashing files from a non\-KDE app:
+.IP
+.EX
+trashsync
+.EE
+.P
+Re\-arm the change watcher after mounting
+.IR /mnt/shared :
+.IP
+.EX
+systemctl \-\-user restart shared\-trash\-sync.path
+.EE
+.P
+Inspect the path unit and the timer:
+.IP
+.EX
+systemctl \-\-user list\-units 'shared\-trash\-sync*' \-\-all
+systemctl \-\-user list\-timers 'shared\-trash\-sync*'
+.EE
+.SH SEE ALSO
+.BR dolphin (1),
+.BR kreadconfig6 (1),
+.BR kwriteconfig6 (1),
+.BR systemd.path (5),
+.BR systemd.timer (5)
+.SH AUTHOR
+Written for local use.
