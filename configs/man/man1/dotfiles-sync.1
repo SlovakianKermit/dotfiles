@@ -1,4 +1,4 @@
-.TH DOTFILES-SYNC 1 "2026-09-30" "dotfiles-sync" "User Commands"
+.TH DOTFILES-SYNC 1 "2026-10-10" "dotfiles-sync" "User Commands"
 .SH NAME
 dotfiles-sync \- push and pull dotfiles, configs, scripts, and packages via Git
 .SH SYNOPSIS
@@ -144,32 +144,31 @@ machine, the following package names are skipped on
 .BR pull :
 .IP \(bu 2
 AMD GPU:
-.BR vulkan-radeon ", " lib32-vulkan-radeon ", " amdvlk ", "
-.BR xv86-video-amdgpu ", " radeontop ", " rocm-* ", " libva-mesa-driver ", "
-.BR mesa-vdpau
+.BR vulkan-radeon ", " lib32-vulkan-radeon ", " amdvlk ", " lib32-amdvlk ", "
+.BR xv86-video-amdgpu ", " radeontop ", " rocm-opencl-runtime ", "
+.BR rocm-hip-runtime ", " libva-mesa-driver ", " lib32-libva-mesa-driver ", "
+.BR mesa-vdpau ", " lib32-mesa-vdpau ", " rocm-core ", " rocm-smi-lib ", "
+.BR hip-runtime-amd ", " composable-kernel
 .IP \(bu 2
 AMD CPU:
 .B amd-ucode
 .IP \(bu 2
 NVIDIA:
 .BR nvidia-dkms ", " nvidia-utils ", " lib32-nvidia-utils ", "
-.BR libva-nvidia-driver ", " nvidia-settings ", " nvtop
+.BR libva-nvidia-driver ", " nvidia-prime ", " nvidia-settings ", " nvtop
 .IP \(bu 2
 Intel GPU:
 .BR vulkan-intel ", " intel-media-driver ", " libva-intel-driver ", "
 .B intel-ucode
 .IP \(bu 2
 CachyOS kernels:
-.BR linux-cachyos ", " linux-cachyos-headers ", " linux-cachyos-nvidia
+.BR linux-cachyos ", " linux-cachyos-headers ", " linux-cachyos-lts ", "
+.BR linux-cachyos-lts-headers ", " linux-cachyos-nvidia
 .SH ENVIRONMENT
-.TP
-.I REPO_DIR
-Repository location (default:
-.BR ~/dotfiles ).
-.TP
-.I GITHUB_REPO
-Remote URL (default:
-.BR https://github.com/SlovakianKermit/dotfiles.git ).
+None. Repository location
+.RI ( ~/dotfiles )
+and remote URL are fixed in the script; they are not read from the
+environment.
 .SH FILES
 .TP
 .I ~/dotfiles/
@@ -235,13 +234,9 @@ CachyOS packages skipped when
 is used.
 .TP
 .I ~/.config/qBittorrent/
-On push, the following are excluded:
+On push, the following are excluded and do not reach the repo:
 .BR BT_backup/ ", " logs/ ", " rss/ ", " search/ ", " GeoIP/ ", "
 .BR qBittorrent.conf ", " qBittorrent-data.conf .
-Config files that survive are
-.B qBittorrent.conf
-(without download paths, as the file is excluded outright) and
-.BR qBittorrent-data.conf .
 .SH EXAMPLES
 .TP
 dotfiles-sync.sh setup

@@ -1,4 +1,4 @@
-.TH COMPRESS-JXL 1 "2026-08-10" "1.1" "User Commands"
+.TH COMPRESS-JXL 1 "2026-10-10" "1.1" "User Commands"
 .SH NAME
 compress-jxl \- batch compress images to JPEG XL
 .SH SYNOPSIS
@@ -20,6 +20,9 @@ the target directory and converts them to JPEG XL (\fB.jxl\fP) using
 Images larger than the target size (2560\(mu1440 by default, see
 \fB\-s\fP) are downscaled before encoding.
 The original file is replaced only if the compressed output is smaller.
+Directories named
+.B Cooking
+under the target are skipped.
 .SH OPTIONS
 .TP
 .BR \-q ", " \-\-quality " \fIquality\fP"
@@ -71,7 +74,7 @@ Print usage summary and exit.
 .PD 0
 .TP
 .I directory
-Target directory (default: \fB~/Pictures/img\fP).
+Target directory (default: \fB~/Pictures/img/Downloads\fP).
 If relative, resolved under the default root.
 .TP
 .I quality
@@ -84,7 +87,7 @@ Numeric effort (1\(en10). Must follow a numeric quality.
 .SH EXAMPLES
 .TP
 compress-jxl.sh
-Run with defaults: quality 85, effort 3, ~/Pictures/img.
+Run with defaults: quality 85, effort 3, ~/Pictures/img/Downloads.
 .TP
 compress-jxl.sh 80
 Quality 80, effort 3, default directory.
@@ -102,7 +105,7 @@ compress-jxl.sh -s 1920x1080 ~/Pictures/wallpapers
 Cap downscaling at 1080p instead of the default 2560\(mu1440.
 .SH FILES
 .TP
-.I ~/Pictures/img/.compress-jxl.log
+.I ~/Pictures/img/Downloads/.compress-jxl.log
 Per-run summary appended after each batch when \fB-l\fP is used.
 .TP
 .I /tmp/jxl_compare_src/

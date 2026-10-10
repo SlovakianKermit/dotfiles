@@ -1,4 +1,4 @@
-.TH FLATTEN 1 "2026-08-07" "flatten.sh" "User Commands"
+.TH FLATTEN 1 "2026-10-10" "flatten.sh" "User Commands"
 .SH NAME
 flatten.sh \- move files up N directory levels out of deep nesting
 .SH SYNOPSIS
@@ -53,7 +53,8 @@ Success.
 .TP
 .B 1
 \fITARGET\fR is not a directory, or
-\fILEVELS\fR is missing, non-numeric, or less than 1. An error message is
+\fILEVELS\fR is non-numeric or less than 1 (omitted
+\fILEVELS\fR defaults to 1). An error message is
 printed before exiting.
 .SH EXAMPLES
 Flatten one level in the current directory:

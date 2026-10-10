@@ -1,0 +1,32 @@
+.TH SUNSHINE-STREAM-UNDO 1 "2026-10-10" "sunshine-stream-undo" "User Commands"
+.SH NAME
+sunshine-stream-undo \- restore the native display mode after a Sunshine stream
+.SH SYNOPSIS
+.B sunshine-stream-undo
+.SH DESCRIPTION
+.B sunshine-stream-undo
+restores output
+.B DP\-2
+to the native 2560x1440@240 mode via
+.BR kscreen-doctor (1),
+then polls up to 30 seconds for the mode to apply.
+Takes no arguments and reads no environment.
+.SH EXAMPLES
+Sunshine post-stream hook:
+.IP
+.EX
+sunshine-stream-undo
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Native mode restored.
+.TP
+.B 1
+Mode did not apply within 30 s, or output not found.
+.SH SEE ALSO
+.BR sunshine-stream-prep (1),
+.BR sunshine-gamescope-run (1),
+.BR kscreen-doctor (1)
+.SH AUTHOR
+Written for local use.

@@ -1,4 +1,4 @@
-.TH CTBREC-VR 1 "2026-10-06" "ctbrec-vr" "User Commands"
+.TH CTBREC-VR 1 "2026-10-10" "ctbrec-vr" "User Commands"
 .SH NAME
 ctbrec-vr \- move finished VR ctbrec recordings into a vr/ subfolder
 .SH SYNOPSIS
@@ -115,7 +115,12 @@ when that is not writable).
 .TP
 .BI \-\-lock " FILE"
 Lock file used to prevent overlapping runs. Default:
-.IR /run/ctbrec\-vr.lock .
+.IR /run/ctbrec\-vr.lock ,
+falling back to
+.IR /tmp/ctbrec\-vr.lock
+when
+.I /run
+is not writable.
 .TP
 .BI \-\-io\-threshold " PCT"
 Defer the run when host I/O pressure

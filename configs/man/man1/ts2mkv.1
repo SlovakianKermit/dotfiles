@@ -1,4 +1,4 @@
-.TH TS2MKV 1 "2026-10-05" "ts2mkv" "User Commands"
+.TH TS2MKV 1 "2026-10-10" "ts2mkv" "User Commands"
 .SH NAME
 ts2mkv \- losslessly remux MPEG-TS captures to Matroska
 .SH SYNOPSIS
@@ -57,8 +57,10 @@ and
 Remuxes with
 .BR ffmpeg (1)
 using
-.B \-map 0:v:0 \-map 0:a:0
-and stream copy.
+.B \-map 0:v:0 \-map 0:a:0?
+and stream copy (the
+.B ?
+tolerates inputs with no audio stream).
 .IP \(bu 2
 On mux failure, retries once with the audio re-encoded as AAC 160k.
 .IP \(bu 2

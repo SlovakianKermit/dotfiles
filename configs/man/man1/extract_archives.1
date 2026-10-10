@@ -1,12 +1,20 @@
-.TH EXTRACT_ARCHIVES 1 "2026-08-07" "extract_archives.sh" "User Commands"
+.TH EXTRACT_ARCHIVES 1 "2026-10-10" "extract_archives.sh" "User Commands"
 .SH NAME
-extract_archives.sh \- recursively extract archives and remove the originals
+extract_archives.sh \- extract archives at limited depth and remove the originals
 .SH SYNOPSIS
 .B extract_archives.sh
+[\fB\-d\fR|\fB\-\-depth\fR \fIN\fR]
 [\fIDIRECTORY\fR]
+.br
+.B extract_archives.sh
+\fB\-h\fR|\fB\-\-help\fR
 .SH DESCRIPTION
 .B extract_archives.sh
-recursively finds archives under the target directory, verifies their
+finds archives under the target directory up to
+.I N
+levels deep (default 1, i.e. only archives directly inside
+.IR DIRECTORY ),
+verifies their
 integrity, extracts each one into a new subdirectory named after the archive
 (without its extension), and deletes the original archive only after a fully
 successful extraction.
@@ -54,8 +62,16 @@ for
 Directory to search recursively. Default:
 .BR . .
 .SH OPTIONS
-None. There are no command-line flags; the script takes a single optional
-positional argument (the search root).
+.TP
+.BI \-d ", " \-\-depth " N"
+Process archives up to
+.I N
+directories deep. Default: 1. Must match
+.IR ^[1\-9][0\-9]*$ ;
+anything else exits 1.
+.TP
+.B \-h\fR, \fB\-\-help
+Show usage and exit.
 .SH BEHAVIOUR
 .SS Integrity check
 Before extraction, every archive is tested:
@@ -63,12 +79,17 @@ Before extraction, every archive is tested:
 .B zip:
 .B unzip \-qt
 .IP \(bu 2
-.B tar
-(and compressed variants):
+.B tar.gz:
+.B gzip \-t
+.IP \(bu 2
+.B tar.bz2:
+.B bzip2 \-t
+.IP \(bu 2
+.B tar.xz:
+.B xz \-t
+.IP \(bu 2
+.B tar:
 .B tar \-tf
-(after a
-.BR tar \ \-\-test-label
-probe)
 .IP \(bu 2
 .B 7z:
 .B 7z t
@@ -109,10 +130,10 @@ Extract archives in the current directory:
 extract_archives.sh
 .EE
 .P
-Process a specific directory tree:
+Process a specific directory two levels deep:
 .IP
 .EX
-extract_archives.sh ~/Downloads
+extract_archives.sh \-d 2 ~/Downloads
 .EE
 .P
 Typical output for a clean run:
@@ -137,8 +158,13 @@ Processing: ~/Downloads/corrupt.zip
 .SH EXIT STATUS
 .TP
 .B 0
-The script always exits 0 when the scan completes; individual failures are
+The scan completed; individual failures are
 reported on stdout in the failed-archives summary, not via the exit status.
+.TP
+.B 1
+Bad
+.B \-d
+value or unknown option.
 .SH SEE ALSO
 .BR tar (1),
 .BR unzip (1),

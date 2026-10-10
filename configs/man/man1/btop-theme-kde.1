@@ -1,0 +1,73 @@
+.TH BTOP-THEME-KDE 1 "2026-10-10" "btop-theme-kde" "User Commands"
+.SH NAME
+btop-theme-kde \- regenerate a btop theme from the active KDE Plasma color scheme
+.SH SYNOPSIS
+.B btop-theme-kde
+.SH DESCRIPTION
+.B btop-theme-kde
+regenerates a
+.BR btop (1)
+theme from the active KDE Plasma color scheme and points
+.I color_theme
+at it in
+.IR ~/.config/btop/btop.conf .
+.P
+It reads the scheme name from
+.I ~/.config/kdeglobals
+.RB ( General / ColorScheme ),
+looks for
+.IR <scheme>.colors
+in
+.I ~/.local/share/color-schemes
+then
+.IR /usr/share/color-schemes ,
+falling back to
+.I kdeglobals
+itself, and writes
+.IR ~/.config/btop/themes/<scheme>.theme .
+Safe to run repeatedly: idempotent, a no-op when nothing changed.
+.SH OPTIONS
+None. There are no command-line flags; environment overrides below are the only inputs.
+.SH ENVIRONMENT
+.TP
+.I KDE_CONFIG
+Path to kdeglobals. Default:
+.IR ~/.config/kdeglobals .
+.TP
+.I BTOP_THEMES_DIR
+Theme output directory. Default:
+.IR ~/.config/btop/themes .
+.TP
+.I BTOP_CONF
+btop config file updated with
+.IR color_theme .
+Default:
+.IR ~/.config/btop/btop.conf .
+.SH EXAMPLES
+Run after switching Plasma scheme:
+.IP
+.EX
+btop-theme-kde
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Theme up to date or regenerated.
+.TP
+.B 1
+No active scheme found, or colors could not be parsed.
+.SH FILES
+.TP
+.I ~/.config/kdeglobals
+Active scheme name and fallback color definitions.
+.TP
+.I ~/.config/btop/themes/<scheme>.theme
+Generated theme.
+.TP
+.I ~/.config/btop/btop.conf
+Updated with
+.IR color_theme="<scheme>" .
+.SH SEE ALSO
+.BR btop (1)
+.SH AUTHOR
+Written for local use.

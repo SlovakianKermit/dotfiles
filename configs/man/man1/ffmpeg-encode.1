@@ -1,4 +1,4 @@
-.TH FFMPEG-ENCODE 1 "2026-10-06" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-10-10" "ffmpeg-encode" "User Commands"
 .SH NAME
 ffmpeg-encode \- VAAPI HEVC/AV1 batch video encoder with curses TUI
 .SH SYNOPSIS
@@ -241,11 +241,7 @@ saving (HEVC QP 28, AV1 CQ 130) and, because VR viewers magnify any
 resolution loss, fails any encode whose output dimensions differ from the
 input. The HEVC default was calibrated on H.264 VR sources so the re-encode
 holds mean VMAF around 95 (visually indistinguishable from the source) while
-still roughly halving high-motion clips. Colour range is preserved:
-full-range
-.B yuvj420p
-captures stay full-range through both the hardware and the software-decode
-paths.
+still roughly halving high-motion clips.
 .P
 VR outputs are kept separate from the normal encode tree: they are written
 under a
@@ -272,11 +268,8 @@ flags are given. Overlapping directories are de-duplicated.
 .SS Requirements
 .IP \(bu 2
 .B ffmpeg
-built with VAAPI support
-.IP \(bu 2
-.B vainfo
-available (from
-.BR libva-utils )
+built with VAAPI support (VAAPI check is via
+.BR "ffmpeg \-hwaccels" )
 .IP \(bu 2
 .B ffprobe
 (for duration / progress)
@@ -435,7 +428,6 @@ Fallback VAAPI device when no node is auto-detected.
 .SH SEE ALSO
 .BR ffmpeg (1),
 .BR ffprobe (1),
-.BR vainfo (1),
 .BR ffmpeg-encode-av1 (1)
 .SH AUTHOR
 Written for local use with VAAPI on AMD RDNA4 (RX 9070 class).

@@ -1,0 +1,44 @@
+.TH PERSEPOLIS-RENAME 1 "2026-10-10" "persepolis-rename.py" "User Commands"
+.SH NAME
+persepolis-rename \- fix RFC 5987-encoded filenames from Persepolis downloads
+.SH SYNOPSIS
+.B persepolis-rename.py
+.SH DESCRIPTION
+.B persepolis-rename.py
+scans
+.I ~/Downloads/Persepolis
+and subfolders (Videos, Compressed, Audios, Documents, Others), decoding
+filenames stuck in the form
+.IR '"; filename*=UTF\-8\'\'<url\-encoded>' .
+.P
+Skips files still open (via
+.BR fuser (1)),
+files with an active
+.I .persepolis
+sidecar, and targets that already exist. On rename it also fixes the sidecar
+JSON
+.I file_name
+field and updates the Persepolis sqlite database. Takes no arguments.
+.SH OPTIONS
+None. Takes no flags or arguments.
+.SH EXAMPLES
+Clean up after a download batch:
+.IP
+.EX
+persepolis-rename.py
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Completed; prints how many files were renamed.
+.SH FILES
+.TP
+.I ~/Downloads/Persepolis
+Scan root.
+.TP
+.I ~/.config/persepolis_download_manager/persepolis.db
+Download database updated on each rename.
+.SH SEE ALSO
+.BR fuser (1)
+.SH AUTHOR
+Written for local use.

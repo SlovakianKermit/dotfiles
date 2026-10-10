@@ -1,0 +1,50 @@
+.TH SUNSHINE-GAMESCOPE-RUN 1 "2026-10-10" "sunshine-gamescope-run" "User Commands"
+.SH NAME
+sunshine-gamescope-run \- render a game in gamescope at the Sunshine client resolution
+.SH SYNOPSIS
+.B sunshine-gamescope-run
+[\fIGAMESCOPE\-FLAGS\fR] \fB\-\-\fR \fICOMMAND\fR...
+.SH DESCRIPTION
+.B sunshine-gamescope-run
+is a Sunshine wrapper: it renders a game at the client resolution inside
+.BR gamescope (1),
+scaled to fill the physical display (captured via KMS).
+.P
+Resolution and refresh come from the Sunshine client environment, falling back
+to 2560x1440@240 when unset. Extra gamescope flags may precede
+.B \-\-
+and are passed through; everything after
+.B \-\-
+is the game command.
+.SH ENVIRONMENT
+.TP
+.I SUNSHINE_CLIENT_WIDTH
+Output width. Default: 2560.
+.TP
+.I SUNSHINE_CLIENT_HEIGHT
+Output height. Default: 1440.
+.TP
+.I SUNSHINE_CLIENT_FPS
+Refresh rate. Default: 240.
+.SH EXAMPLES
+Used from a Sunshine command:
+.IP
+.EX
+sunshine-gamescope-run \-\- steam \-launch 1245620
+.EE
+.P
+Force a client size manually:
+.IP
+.EX
+SUNSHINE_CLIENT_WIDTH=1920 SUNSHINE_CLIENT_HEIGHT=1080 sunshine-gamescope-run \-\- mangoapp
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Gamescope exited normally; otherwise the game exit status is propagated via exec.
+.SH SEE ALSO
+.BR gamescope (1),
+.BR sunshine-stream-prep (1),
+.BR sunshine-stream-undo (1)
+.SH AUTHOR
+Written for local use.

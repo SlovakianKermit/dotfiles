@@ -1,0 +1,38 @@
+.TH NETMON 1 "2026-10-10" "netmon.sh" "User Commands"
+.SH NAME
+netmon \- take one WAN health sample for the netmon timer
+.SH SYNOPSIS
+.B netmon.sh
+.SH DESCRIPTION
+.B netmon.sh
+takes one WAN/mesh health sample and appends a TSV line to
+.IR ~/.cache/netmon.log .
+Normally run by a systemd user timer every 5 minutes; takes no arguments.
+.P
+Each run pings the gateway (192.168.0.1), Cloudflare (1.1.1.1), and Quad9
+(9.9.9.9) with 4 probes, then measures download speed against two Arch
+mirrors in parallel (8 s cap each) and logs loss/avg/max plus Mbps columns.
+Columns: ts gw_loss gw_avg gw_max cf_loss cf_avg cf_max q9_loss q9_avg q9_max
+spdA_mbps spdB_mbps agg_mbps.
+.SH OPTIONS
+None. Takes no flags or arguments.
+.SH EXAMPLES
+Take one manual sample:
+.IP
+.EX
+netmon.sh
+tail \-n 5 ~/.cache/netmon.log
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Sample appended (failed probes log as 100% loss, not as an error).
+.SH FILES
+.TP
+.I ~/.cache/netmon.log
+Append-only TSV log.
+.SH SEE ALSO
+.BR ping (8),
+.BR curl (1)
+.SH AUTHOR
+Written for local use.

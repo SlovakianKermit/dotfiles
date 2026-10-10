@@ -1,10 +1,11 @@
-.TH TRIM-CORRUPT 1 "2026-08-07" "trim_corrupt.sh" "User Commands"
+.TH TRIM-CORRUPT 1 "2026-10-10" "trim_corrupt.sh" "User Commands"
 .SH NAME
 trim_corrupt.sh \- trim .ts files whose audio runs past the video end
 .SH SYNOPSIS
 .B trim_corrupt.sh
 [\fIINPUT\fP]
 [\fIOUTPUT_DIR\fP]
+[\fIPARALLEL\fP]
 .SH DESCRIPTION
 .B trim_corrupt.sh
 fixes MPEG transport stream (
@@ -16,19 +17,18 @@ without re-encoding.
 .P
 For each
 .B .ts
-file, the end timestamp of the last video packet and the last audio packet
+file, the end timestamp of the last video packet of the first video stream
+and the last audio packet of the first audio stream
 are read with
 .BR ffprobe (1):
 .IP \(bu 2
 video end:
 .B last pts_time
-of stream
-.B v:0
+of the first video stream (by codec type).
 .IP \(bu 2
 audio end:
 .B last pts_time
-of stream
-.B a:0
+of the first audio stream (by codec type).
 .P
 If both timestamps can be read and the audio end is more than 5 seconds after
 the video end, the file is trimmed to the video end and the original is
@@ -61,6 +61,10 @@ Anything else prints an error and the script exits with status 1.
 Directory where trimmed copies are written. Defaults to
 .BR ./trimmed .
 Created if it does not exist.
+.TP
+.I PARALLEL
+Maximum concurrent files. Defaults to
+.BR nproc .
 .SH BEHAVIOUR
 .IP \(bu 2
 Trimming is performed with

@@ -1,0 +1,74 @@
+.TH ENCODE-BENCH 1 "2026-10-10" "encode-bench" "User Commands"
+.SH NAME
+encode-bench \- VMAF calibration bench for ffmpeg-encode
+.SH SYNOPSIS
+.B encode-bench
+[\fIOPTIONS\fR] \fIFILE\fR...
+.SH DESCRIPTION
+.B encode-bench
+encodes short samples of real files with a baseline (HEVC CQP) and a sweep of
+AV1 CQP qualities, scores each against the source with libvmaf, and reports
+size vs quality so you can pick the AV1 quality matching current HEVC output.
+.P
+VMAF runs with
+.I n_subsample
+(default 5): scoring every frame buffers the whole stream and peaks at several
+GB of RAM. It reuses
+.B ffmpeg-encode
+own command builder, so it measures the exact pipeline the TUI uses.
+Requires
+.BR ffmpeg (1)
+with libvmaf and a VAAPI device.
+.SH OPTIONS
+.TP
+.BI \-t ", " \-\-seconds " SECONDS"
+Sample length. Default: 30.
+.TP
+.BI \-s ", " \-\-offset " OFFSET"
+Sample start offset. Default: 5.
+.TP
+.BI \-\-hevc\-quality " N"
+HEVC baseline CQP quality. Default: 27.
+.TP
+.BI \-\-hevc\-values " N..."
+Extra HEVC \-qp values to sweep.
+.TP
+.BI \-\-av1\-values " N..."
+AV1 CQP \-global_quality values to sweep. Default:
+.BR 90 " " 95 " " 97 " " 100 " " 105 .
+.TP
+.BI \-\-tolerance " N"
+Allowed VMAF drop vs baseline. Default: 0.5.
+.TP
+.BI \-\-threads " N"
+libvmaf threads. Default: half the CPUs.
+.TP
+.BI \-\-n\-subsample " N"
+Score every Nth frame. Default: 5.
+.TP
+.B \-\-keep
+Keep encoded samples instead of deleting them.
+.SH EXAMPLES
+Calibrate AV1 against one file:
+.IP
+.EX
+encode-bench ~/Videos/sample.mkv
+.EE
+.P
+Sweep custom AV1 values, keep samples:
+.IP
+.EX
+encode-bench \-\-av1\-values 95 100 110 \-\-keep clip.mkv
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Completed.
+.TP
+.B 1
+No VAAPI device found, or a sample failed.
+.SH SEE ALSO
+.BR ffmpeg-encode (1),
+.BR ffmpeg (1)
+.SH AUTHOR
+Written for local use.

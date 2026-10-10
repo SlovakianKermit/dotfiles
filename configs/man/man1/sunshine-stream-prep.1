@@ -1,0 +1,46 @@
+.TH SUNSHINE-STREAM-PREP 1 "2026-10-10" "sunshine-stream-prep" "User Commands"
+.SH NAME
+sunshine-stream-prep \- set the display mode for a Sunshine stream
+.SH SYNOPSIS
+.B sunshine-stream-prep
+.SH DESCRIPTION
+.B sunshine-stream-prep
+sets output
+.B DP\-2
+to the best mode matching the Sunshine client resolution via
+.BR kscreen-doctor (1),
+then polls up to 30 seconds for the mode to apply.
+.P
+Takes no arguments. Target size comes from the Sunshine client environment
+(width/height/fps), defaulting to 2560x1440@240. Mode choice prefers an exact
+WxH match, else the closest aspect ratio, then the highest refresh at or below
+the target.
+.SH ENVIRONMENT
+.TP
+.I SUNSHINE_CLIENT_WIDTH
+Desired width. Default: 2560.
+.TP
+.I SUNSHINE_CLIENT_HEIGHT
+Desired height. Default: 1440.
+.TP
+.I SUNSHINE_CLIENT_FPS
+Desired refresh. Default: 240.
+.SH EXAMPLES
+Sunshine pre-stream hook:
+.IP
+.EX
+sunshine-stream-prep
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Target mode applied.
+.TP
+.B 1
+Mode did not apply within 30 s, or output not found.
+.SH SEE ALSO
+.BR sunshine-stream-undo (1),
+.BR sunshine-gamescope-run (1),
+.BR kscreen-doctor (1)
+.SH AUTHOR
+Written for local use.
