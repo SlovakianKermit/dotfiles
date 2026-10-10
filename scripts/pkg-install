@@ -24,7 +24,9 @@ pkg_names=$(
   pacman -Slq |
     awk -v installed="$installed_file" '
       BEGIN { while (getline < installed) pkgs[$1]=1 }
-      { if ($1 in pkgs) printf "★ %s\n", $1; else printf "○ %s\n", $1 }
+      !seen[$1]++ {
+        if ($1 in pkgs) printf "★ %s\n", $1; else printf "○ %s\n", $1
+      }
     ' |
     fzf "${fzf_args[@]}" |
     awk '{print $2}'

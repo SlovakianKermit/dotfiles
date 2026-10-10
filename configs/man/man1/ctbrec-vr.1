@@ -1,6 +1,6 @@
 .TH CTBREC-VR 1 "2026-10-10" "ctbrec-vr" "User Commands"
 .SH NAME
-ctbrec-vr \- move finished VR ctbrec recordings into a vr/ subfolder
+ctbrec-vr \- move finished VR ctbrec recordings into the VR destination folder
 .SH SYNOPSIS
 .B ctbrec-vr
 [\fIOPTIONS\fP]
@@ -9,9 +9,15 @@ ctbrec-vr \- move finished VR ctbrec recordings into a vr/ subfolder
 scans a ctbrec recordings tree (default
 .IR /mnt/pve/Data_Storage/ctbrec ),
 identifies recordings whose first video stream is larger than 1080p, and
-renames those that are no longer being written into a
+renames those that are no longer being written into the destination
+directory. The destination defaults to
+.IR /mnt/pve/Data_Storage/vr
+for the default recordings root, and to a
 .B vr
-subfolder of the recordings root.
+subfolder of
+.B \-\-dir
+for any other root; it can always be overridden with
+.BR \-\-dest .
 .P
 A recording is considered VR when its video height is greater than
 .B \-\-base\-height
@@ -68,6 +74,8 @@ Recordings root to scan. Default:
 .TP
 .BI \-\-dest " DIR"
 Destination directory. Default:
+.I /mnt/pve/Data_Storage/vr
+for the default recordings root, otherwise
 .IR DIR/vr .
 .TP
 .BI \-\-owner " USER"
@@ -218,7 +226,7 @@ Lock held for the duration of a run.
 .I /etc/systemd/system/ctbrec-vr.timer
 Systemd units that drive the recurring run.
 .TP
-.I /mnt/pve/Data_Storage/ctbrec/vr
+.I /mnt/pve/Data_Storage/vr
 Default destination for moved recordings.
 .SH SEE ALSO
 .BR ctbrec-vr-remote (1),

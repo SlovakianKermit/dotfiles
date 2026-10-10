@@ -5,8 +5,10 @@ A recording is treated as VR when its first video stream is larger than
 1080p (height > 1080 or width > 1920).  A recording is treated as finished
 when it is neither open for writing nor modified within --age seconds.
 Matching files are renamed (same filesystem, so instant and zero-copy) into
-<dir>/vr.  Files already known to be non-VR are remembered in a small cache
-so steady-state runs probe only genuinely new recordings.
+the destination directory: DEFAULT_DEST for the default recordings root,
+otherwise a vr/ subfolder of --dir.  Files already known to be non-VR are
+remembered in a small cache so steady-state runs probe only genuinely new
+recordings.
 """
 import argparse
 import fcntl
@@ -19,6 +21,8 @@ import time
 
 TS_EXTS = (".ts", ".mts")
 SKIP_DIRS = {"vr", ".merged_originals", "compressing"}
+DEFAULT_DIR = "/mnt/pve/Data_Storage/ctbrec"
+DEFAULT_DEST = "/mnt/pve/Data_Storage/vr"
 STATE = {"cache": set(), "cache_path": None, "lock_fd": None, "dirty": False}
 
 
@@ -271,7 +275,12 @@ def run(args):
     if not os.path.isdir(root):
         print(f"error: {root} is not a directory", file=sys.stderr)
         return 1
-    dest = os.path.abspath(args.dest) if args.dest else os.path.join(root, "vr")
+    if args.dest:
+        dest = os.path.abspath(args.dest)
+    elif root == DEFAULT_DIR:
+        dest = DEFAULT_DEST
+    else:
+        dest = os.path.join(root, "vr")
 
     if dest == root:
         print("error: destination equals source directory", file=sys.stderr)
@@ -367,10 +376,11 @@ def main():
         prog="ctbrec-vr",
         description="Move finished VR ctbrec recordings into a vr/ subfolder.",
     )
-    ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
-                    help="recordings root (default: /mnt/pve/Data_Storage/ctbrec)")
+    ap.add_argument("--dir", default=DEFAULT_DIR,
+                    help=f"recordings root (default: {DEFAULT_DIR})")
     ap.add_argument("--dest", default=None,
-                    help="destination directory (default: <dir>/vr)")
+                    help=f"destination directory (default: {DEFAULT_DEST} "
+                         f"for the default recordings root, else <dir>/vr)")
     ap.add_argument("--owner", default=None,
                     help="owner for --dest (name or uid; default: owner of --dir)")
     ap.add_argument("--group", default=None,

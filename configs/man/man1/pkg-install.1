@@ -1,4 +1,4 @@
-.TH PKG-INSTALL 1 "2026-08-07" "pkg-install" "User Commands"
+.TH PKG-INSTALL 1 "2026-10-10" "pkg-install" "User Commands"
 .SH NAME
 pkg-install \- interactive package installer (fzf TUI)
 .SH SYNOPSIS
@@ -13,8 +13,9 @@ fzf list and its preview pane.
 .P
 On start, the script snapshots the set of installed packages
 (\fBpacman \-Qq\fR) into a temporary lookup table and lists every package
-available in the configured repositories (\fBpacman \-Slq\fR). Each entry
-is prefixed with a state marker:
+available in the configured repositories (\fBpacman \-Slq\fR), de\-duplicated
+so a package present in more than one repository appears only once. Each
+entry is prefixed with a state marker:
 .IP \(bu 2
 \fB★\fR
 the package is already installed
