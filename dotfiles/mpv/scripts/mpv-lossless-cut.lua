@@ -6,6 +6,12 @@ local options = {
 	output_dir = ".",
 	multi_cut_mode = "separate",
 	ffmpeg_path = "ffmpeg",
+	verify = true,
+	verify_duration = true,
+	duration_tolerance = 2.0,
+	min_size_bytes = 1024,
+	ffprobe_path = "ffprobe",
+	notify = true,
 }
 
 require("mp.options").read_options(options, "mpv-lossless-cut")
@@ -244,6 +250,91 @@ local function run_ffmpeg(args)
 	return result.status == 0, result.stdout, result.stderr
 end
 
+local function probe_duration(path)
+	local result = utils.subprocess({
+		args = {
+			options.ffprobe_path,
+			"-v",
+			"error",
+			"-show_entries",
+			"format=duration",
+			"-of",
+			"default=noprint_wrappers=1:nokey=1",
+			path,
+		},
+		cancellable = false,
+		capture_stdout = true,
+	})
+
+	if not result or result.status ~= 0 then
+		return nil
+	end
+
+	return tonumber(result.stdout)
+end
+
+-- Cheap sanity check on a produced file: it exists and is non-trivially sized.
+-- Reads only filesystem metadata, never the media itself.
+local function verify_output(path)
+	if not options.verify then
+		return true
+	end
+
+	local info = utils.file_info(path)
+	if not info then
+		return false, "output file missing"
+	end
+	if info.is_dir then
+		return false, "output is a directory"
+	end
+	if info.size < options.min_size_bytes then
+		return false, string.format("output suspiciously small (%d bytes)", info.size)
+	end
+
+	return true
+end
+
+local function notify(summary, body, urgency)
+	if not options.notify then
+		return
+	end
+
+	local text = summary
+	if body and body ~= "" then
+		text = summary .. "\n" .. body
+	end
+
+	local args = { "notify-send", "-a", "mpv" }
+	if urgency then
+		table.insert(args, "-u")
+		table.insert(args, urgency)
+	end
+	table.insert(args, "mpv lossless cut")
+	table.insert(args, text)
+
+	-- fire and forget; don't block playback waiting on the notification daemon
+	mp.command_native_async({
+		name = "subprocess",
+		args = args,
+		playback_only = false,
+	}, function() end)
+end
+
+local function remove_dir(dir)
+	if not dir or dir == "" then
+		return
+	end
+
+	local args
+	if os_name == "windows" then
+		args = { "cmd", "/c", "rmdir", "/s", "/q", dir }
+	else
+		args = { "rm", "-rf", dir }
+	end
+
+	utils.subprocess({ args = args, cancellable = false })
+end
+
 local function render_cut(input, outpath, start, duration, input_mtime)
 	local args = {
 		-- seek to start before loading file (faster) https://trac.ffmpeg.org/wiki/Seeking#Inputseeking
@@ -419,50 +510,133 @@ local function cut_render()
 		return a.start_time < b.start_time
 	end)
 
-	local cut_paths = {}
+	local num_cuts = #cuts
+	local do_merge = num_cuts > 1 and options.multi_cut_mode == "merge"
+
+	-- outputs keep the source's own filename; merge segments go to a scratch
+	-- dir so they don't collide with the single final output name
+	local out_path = join_paths(outdir, filename_noext .. ext)
+
+	if out_path == input then
+		local err = "refusing to overwrite the source file"
+		log(err)
+		notify("Cut failed", err, "critical")
+		return
+	end
+
+	local seg_dir = outdir
+	if do_merge then
+		seg_dir = join_paths(outdir, ".mpv-cut-tmp")
+		if not ensure_directory_exists(seg_dir) then
+			local err = "failed to create temporary directory"
+			log(err)
+			notify("Cut failed", err, "critical")
+			return
+		end
+	end
+
+	local mtime = input_info and input_info.mtime or nil
+	local rendered = {}
 
 	for i, cut in ipairs(cuts) do
 		if cut.end_time then
 			local duration = cut.end_time - cut.start_time
 
-			local cut_name = string.format(
-				"(%s) %s (%s - %s)%s",
-				#cuts == 1 and "cut" or "cut" .. i,
-				filename_noext,
-				to_hms(cut.start_time),
-				to_hms(cut.end_time),
-				ext
-			)
+			local target
+			if num_cuts == 1 then
+				target = out_path
+			elseif do_merge then
+				target = join_paths(seg_dir, string.format("seg_%d%s", i, ext))
+			else
+				target = join_paths(outdir, string.format("%s_%d%s", filename_noext, i, ext))
+			end
 
-			local cut_path = join_paths(outdir, cut_name)
+			log(string.format("(%d/%d) Rendering cut to %s", i, num_cuts, target))
 
-			log(string.format("(%d/%d) Rendering cut to %s", i, #cuts, cut_path))
-
-			local mtime = input_info and input_info.mtime or nil
-			local success = render_cut(input, cut_path, cut.start_time - cache_offset, duration, mtime)
-			if success then
-				table.insert(cut_paths, cut_path)
-				log(string.format("(%d/%d) Rendered cut to %s", i, #cuts, cut_path))
+			if render_cut(input, target, cut.start_time - cache_offset, duration, mtime) then
+				table.insert(rendered, { path = target, duration = duration })
+				log(string.format("(%d/%d) Rendered cut to %s", i, num_cuts, target))
 			else
 				log("Failed to render cut " .. i)
 			end
 		end
 	end
 
-	if #cut_paths > 1 and options.multi_cut_mode == "merge" then
-		local merge_name = string.format("(%d merged cuts) %s%s", #cut_paths, filename_noext, ext)
+	local failure
 
-		local merge_path = join_paths(outdir, merge_name)
+	-- existence / size check on every produced piece
+	for _, seg in ipairs(rendered) do
+		local ok, reason = verify_output(seg.path)
+		if not ok then
+			failure = seg.path .. ": " .. reason
+			break
+		end
+	end
+
+	if not failure and #rendered < num_cuts then
+		failure = string.format("%d of %d segments failed to render", num_cuts - #rendered, num_cuts)
+	end
+
+	local success_path = nil
+	local final_duration = nil
+
+	if not failure and do_merge then
+		local seg_files = {}
+		local seg_duration = 0
+		for _, seg in ipairs(rendered) do
+			table.insert(seg_files, seg.path)
+			seg_duration = seg_duration + (probe_duration(seg.path) or 0)
+		end
 
 		log("Merging cuts...")
-		local mtime = input_info and input_info.mtime or nil
-		local success = merge_cuts(outdir, cut_paths, merge_path, mtime)
-
-		if success then
-			log("Successfully merged cuts")
+		if not merge_cuts(seg_dir, seg_files, out_path, mtime) then
+			failure = "merge failed"
 		else
-			log("Failed to merge cuts")
+			local ok, reason = verify_output(out_path)
+			local merged_duration = options.verify_duration and probe_duration(out_path) or nil
+
+			if not ok then
+				failure = out_path .. ": " .. reason
+			elseif
+				options.verify_duration
+				and seg_duration > 0
+				and merged_duration
+				and math.abs(merged_duration - seg_duration) > options.duration_tolerance
+			then
+				-- a healthy concat matches the sum of its parts; comparing to the
+				-- *requested* length would false-fail because lossless cuts snap
+				-- to keyframes
+				failure = string.format(
+					"%s: merge duration mismatch (got %.2fs, parts sum to %.2fs)",
+					out_path,
+					merged_duration,
+					seg_duration
+				)
+			else
+				success_path = out_path
+				final_duration = merged_duration
+			end
 		end
+	elseif not failure and num_cuts == 1 then
+		-- separate mode with one segment: already verified above
+		success_path = out_path
+		final_duration = options.verify_duration and probe_duration(out_path) or nil
+	end
+
+	if do_merge then
+		remove_dir(seg_dir)
+	end
+
+	if failure then
+		log("Cut failed: " .. failure)
+		notify("Cut failed", failure, "critical")
+	elseif success_path then
+		local message = success_path
+		if final_duration then
+			message = string.format("%s (%.1fs)", success_path, final_duration)
+		end
+		log("Cut complete: " .. message)
+		notify("Cut complete", message)
 	end
 
 	if is_stream then
