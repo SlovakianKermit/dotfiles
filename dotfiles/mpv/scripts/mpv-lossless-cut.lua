@@ -305,7 +305,7 @@ local function notify(summary, body, urgency)
 		text = summary .. "\n" .. body
 	end
 
-	local args = { "notify-send", "-a", "mpv" }
+	local args = { "notify-send", "-a", "mpv", "-h", "string:desktop-entry:mpv" }
 	if urgency then
 		table.insert(args, "-u")
 		table.insert(args, urgency)
