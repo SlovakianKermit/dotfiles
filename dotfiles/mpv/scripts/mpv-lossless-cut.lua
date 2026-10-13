@@ -12,6 +12,7 @@ local options = {
 	min_size_bytes = 1024,
 	ffprobe_path = "ffprobe",
 	notify = true,
+	delete_source = true,
 }
 
 require("mp.options").read_options(options, "mpv-lossless-cut")
@@ -312,12 +313,13 @@ local function notify(summary, body, urgency)
 	table.insert(args, "mpv lossless cut")
 	table.insert(args, text)
 
-	-- fire and forget; don't block playback waiting on the notification daemon
-	mp.command_native_async({
+	-- run synchronously so the notification is delivered before we potentially
+	-- close the current file / quit mpv
+	mp.command_native({
 		name = "subprocess",
 		args = args,
 		playback_only = false,
-	}, function() end)
+	})
 end
 
 local function remove_dir(dir)
@@ -333,6 +335,12 @@ local function remove_dir(dir)
 	end
 
 	utils.subprocess({ args = args, cancellable = false })
+end
+
+local function close_current_media()
+	-- unload the file that is currently playing (keeps the rest of the
+	-- playlist, if any; mpv quits if it was the only entry)
+	mp.commandv("playlist-remove", "current")
 end
 
 local function render_cut(input, outpath, start, duration, input_mtime)
@@ -637,6 +645,26 @@ local function cut_render()
 		end
 		log("Cut complete: " .. message)
 		notify("Cut complete", message)
+
+		-- once the output is verified, close the source in mpv and delete it
+		if options.delete_source and not is_stream then
+			local source = mp.get_property("path")
+			close_current_media()
+			if source and source ~= success_path then
+				if delete_file(source) then
+					log("Deleted source: " .. source)
+				else
+					-- some mounts won't unlink while the handle is still closing
+					mp.add_timeout(1.0, function()
+						if delete_file(source) then
+							log("Deleted source: " .. source)
+						else
+							msg.warn("Could not delete source: " .. source)
+						end
+					end)
+				end
+			end
+		end
 	end
 
 	if is_stream then
