@@ -12,6 +12,7 @@ local options = {
 	min_size_bytes = 1024,
 	ffprobe_path = "ffprobe",
 	notify = true,
+	notify_timeout = 1500,
 	delete_source = true,
 }
 
@@ -306,6 +307,10 @@ local function notify(summary, body, urgency)
 	end
 
 	local args = { "notify-send", "-a", "mpv", "-h", "string:desktop-entry:mpv" }
+	if options.notify_timeout and options.notify_timeout > 0 then
+		table.insert(args, "-t")
+		table.insert(args, tostring(options.notify_timeout))
+	end
 	if urgency then
 		table.insert(args, "-u")
 		table.insert(args, urgency)
