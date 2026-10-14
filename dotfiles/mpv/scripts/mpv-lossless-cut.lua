@@ -13,6 +13,7 @@ local options = {
 	ffprobe_path = "ffprobe",
 	notify = true,
 	notify_timeout = 1500,
+	notify_error_timeout = 15000,
 	delete_source = true,
 	quit_after_cut = true,
 }
@@ -307,10 +308,16 @@ local function notify(summary, body, urgency)
 		text = summary .. "\n" .. body
 	end
 
+	-- errors linger much longer than the routine completion popup
+	local timeout = options.notify_timeout
+	if urgency == "critical" and options.notify_error_timeout and options.notify_error_timeout > 0 then
+		timeout = options.notify_error_timeout
+	end
+
 	local args = { "notify-send", "-a", "mpv", "-h", "string:desktop-entry:mpv" }
-	if options.notify_timeout and options.notify_timeout > 0 then
+	if timeout and timeout > 0 then
 		table.insert(args, "-t")
-		table.insert(args, tostring(options.notify_timeout))
+		table.insert(args, tostring(timeout))
 	end
 	if urgency then
 		table.insert(args, "-u")
