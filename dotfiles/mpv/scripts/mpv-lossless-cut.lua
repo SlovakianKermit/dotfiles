@@ -14,6 +14,7 @@ local options = {
 	notify = true,
 	notify_timeout = 1500,
 	delete_source = true,
+	quit_after_cut = true,
 }
 
 require("mp.options").read_options(options, "mpv-lossless-cut")
@@ -342,10 +343,10 @@ local function remove_dir(dir)
 	utils.subprocess({ args = args, cancellable = false })
 end
 
-local function close_current_media()
-	-- unload the file that is currently playing (keeps the rest of the
-	-- playlist, if any; mpv quits if it was the only entry)
-	mp.commandv("playlist-remove", "current")
+local function quit_mpv()
+	-- close the whole player once the cut is done (rather than advancing
+	-- to the next item in the playlist)
+	mp.commandv("quit")
 end
 
 local function render_cut(input, outpath, start, duration, input_mtime)
@@ -651,23 +652,32 @@ local function cut_render()
 		log("Cut complete: " .. message)
 		notify("Cut complete", message)
 
-		-- once the output is verified, close the source in mpv and delete it
-		if options.delete_source and not is_stream then
+		-- once the output is verified: delete the source, then quit mpv
+		if not is_stream then
 			local source = mp.get_property("path")
-			close_current_media()
-			if source and source ~= success_path then
-				if delete_file(source) then
-					log("Deleted source: " .. source)
-				else
-					-- some mounts won't unlink while the handle is still closing
-					mp.add_timeout(1.0, function()
-						if delete_file(source) then
-							log("Deleted source: " .. source)
-						else
-							msg.warn("Could not delete source: " .. source)
-						end
-					end)
+			local do_delete = options.delete_source and source and source ~= success_path
+
+			local function finish()
+				if options.quit_after_cut then
+					quit_mpv()
 				end
+			end
+
+			if do_delete and not delete_file(source) then
+				-- some mounts won't unlink while the handle is still closing
+				mp.add_timeout(1.0, function()
+					if delete_file(source) then
+						log("Deleted source: " .. source)
+					else
+						msg.warn("Could not delete source: " .. source)
+					end
+					finish()
+				end)
+			else
+				if do_delete then
+					log("Deleted source: " .. source)
+				end
+				finish()
 			end
 		end
 	end
