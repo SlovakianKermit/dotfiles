@@ -1,4 +1,4 @@
-.TH FFMPEG-ENCODE 1 "2026-10-10" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-10-15" "ffmpeg-encode" "User Commands"
 .SH NAME
 ffmpeg-encode \- VAAPI HEVC/AV1 batch video encoder with curses TUI
 .SH SYNOPSIS
@@ -43,6 +43,14 @@ The
 command is a thin wrapper that runs
 .B ffmpeg-encode \-\-codec av1
 with the same arguments.
+.P
+Still-image sources such as animated WebP and PNG decode to RGB(A). These are
+converted to limited-range BT.709 and tagged with
+.B bt709
+matrix, primaries and transfer characteristics (instead of swscale's default
+BT.601 matrix and untagged primaries) before the VAAPI encode, so colours stay
+faithful in players that apply their own colour management. Video sources
+retain their existing colour metadata.
 .P
 By default it reads from
 .I /mnt/shared/Compressing

@@ -53,7 +53,14 @@ def extract_sample(fe, src, dest, offset, seconds):
     # (alpha dropped) so VMAF/SSIM/PSNR compare identical frames.
     if is_webp(src):
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
-               "-i", src, "-an", "-c:v", "ffv1", "-pix_fmt", "yuv420p",
+               "-i", src,
+               "-vf",
+               "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,"
+               "setparams=color_primaries=bt709:color_trc=bt709:"
+               "colorspace=bt709:range=tv",
+               "-an", "-c:v", "ffv1", "-pix_fmt", "yuv420p",
+               "-color_range", "tv", "-colorspace", "bt709",
+               "-color_primaries", "bt709", "-color_trc", "bt709",
                "-y", dest]
     else:
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",

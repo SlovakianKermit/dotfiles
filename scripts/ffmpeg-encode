@@ -153,6 +153,24 @@ def get_dimensions(path: str) -> Optional[Tuple[int, int]]:
     except Exception:
         return None
 
+def get_pix_fmt(path: str) -> str:
+    """Pixel format of the first video stream (empty string on failure)."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+def is_rgb_pix_fmt(pix_fmt: str) -> bool:
+    """True for RGB/RGBA/greyscale frames (still-image sources)."""
+    pf = (pix_fmt or "").lower()
+    return any(tag in pf for tag in ("rgb", "bgr", "gbr", "gray"))
+
 def collect_files(directory: str) -> List[str]:
     root = pathlib.Path(directory)
     if not root.is_dir():
@@ -286,7 +304,24 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
         cmd.extend(["-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL])
     cmd.extend(["-i", job.input_path])
     if sw_decode:
-        cmd.extend(["-vf", "format=nv12,hwupload"])
+        if is_rgb_pix_fmt(get_pix_fmt(job.input_path)):
+            # Animated WebP/PNG decode to RGB(A).  Left to itself, swscale
+            # picks the BT.601 matrix and leaves primaries/transfer untagged,
+            # which shifts skin tones once a player applies its own colour
+            # handling.  Convert RGB->YUV as full->limited BT.709 and tag the
+            # frame (VAAPI honours setparams, not the -color_* output opts).
+            cmd.extend([
+                "-vf",
+                "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,"
+                "setparams=color_primaries=bt709:color_trc=bt709:"
+                "colorspace=bt709:range=tv,format=nv12,hwupload",
+                "-color_range", "tv",
+                "-colorspace", "bt709",
+                "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+            ])
+        else:
+            cmd.extend(["-vf", "format=nv12,hwupload"])
     cmd.extend(_rate_control_args(codec, preset, quality))
     cmd.extend(_audio_args(copy_audio))
     cmd.extend(["-map", "0:v?", "-map", "0:a?"])

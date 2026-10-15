@@ -14,7 +14,9 @@ HEVC output.
 For ordinary video, a stream-copied segment is used as the reference. Animated
 WebP sources are handled specially: they cannot be stream-copied into Matroska,
 so the whole clip is decoded once to a lossless yuv420p reference (alpha
-dropped) and the encode jobs use software decode plus
+dropped, converted to limited-range BT.709 and tagged, matching what
+.B ffmpeg-encode
+produces for image sources) and the encode jobs use software decode plus
 .B hwupload
 because the VAAPI decoder cannot ingest WebP's argb/alpha format. The GPU still
 performs the encode.
