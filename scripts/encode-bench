@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""VMAF calibration bench for ffmpeg-encode.
+"""VMAF/SSIM/PSNR calibration bench for ffmpeg-encode.
 
 Encodes short samples of real files with a baseline (HEVC CQP) and a sweep of
-AV1 CQP qualities, scores each against the source with libvmaf, and reports
-size vs quality so you can pick the AV1 quality that matches your current HEVC
-output for the biggest size win.
+AV1 CQP qualities, scores each against the source with libvmaf, SSIM and PSNR,
+and reports size vs quality so you can pick the AV1 quality that matches your
+current HEVC output for the biggest size win.
+
+Handles animated WebP sources: those cannot be stream-copied, so the whole clip
+is decoded once to a lossless yuv420p reference, and jobs use software decode +
+hwupload (the VAAPI decoder cannot ingest WebP's argb/alpha).
 
 VMAF is run with n_subsample (default 5): scoring every frame of a 1080p clip
 makes libvmaf buffer the whole stream and peak at several GB of RAM.
@@ -38,33 +42,48 @@ def run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def is_webp(path):
+    return os.path.splitext(path)[1].lower() == ".webp"
+
+
 def extract_sample(fe, src, dest, offset, seconds):
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
-           "-ss", str(offset), "-i", src, "-t", str(seconds),
-           "-c", "copy", "-y", dest]
+    # Animated WebP is a still-image stream: it cannot be stream-copied into
+    # Matroska, and it decodes to argb (alpha), which VAAPI cannot ingest.
+    # Decode the whole clip once to a frame-exact lossless yuv420p reference
+    # (alpha dropped) so VMAF/SSIM/PSNR compare identical frames.
+    if is_webp(src):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-i", src, "-an", "-c:v", "ffv1", "-pix_fmt", "yuv420p",
+               "-y", dest]
+    else:
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+               "-ss", str(offset), "-i", src, "-t", str(seconds),
+               "-c", "copy", "-y", dest]
     r = run(cmd)
     if r.returncode != 0 or not os.path.exists(dest):
         raise RuntimeError(f"sample extract failed for {src}:\n{r.stderr}")
     return dest
 
 
-def old_hevc_cqp_cmd(fe, sample, quality, device, out):
-    return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
-        "-vaapi_device", device,
-        "-hwaccel", fe.HWACCEL, "-hwaccel_output_format", fe.HWACCEL,
-        "-i", sample,
-        "-c:v", "hevc_vaapi", "-b:v", "0", "-qp", str(quality),
-        "-c:a", "copy", "-map", "0:v?", "-map", "0:a?",
-        "-y", out,
-    ]
+def old_hevc_cqp_cmd(fe, sample, quality, device, out, sw_decode=False):
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-vaapi_device", device]
+    if sw_decode:
+        cmd += ["-i", sample, "-vf", "format=nv12,hwupload"]
+    else:
+        cmd += ["-hwaccel", fe.HWACCEL, "-hwaccel_output_format", fe.HWACCEL,
+                "-i", sample]
+    cmd += ["-c:v", "hevc_vaapi", "-b:v", "0", "-qp", str(quality),
+            "-c:a", "copy", "-map", "0:v?", "-map", "0:a?", "-y", out]
+    return cmd
 
 
-def new_cmd(fe, sample, codec, quality, device, out):
+def new_cmd(fe, sample, codec, quality, device, out, sw_decode=False):
     job = fe.Job(input_path=sample, output_path=out,
                  input_size=os.path.getsize(sample),
                  duration=fe.get_duration(sample))
-    return fe._build_ffmpeg_cmd(job, codec, "balanced", quality, device)
+    return fe._build_ffmpeg_cmd(job, codec, "balanced", quality, device,
+                                sw_decode=sw_decode)
 
 
 def vmaf(encoded, reference, n_threads, n_subsample):
@@ -90,6 +109,43 @@ def vmaf(encoded, reference, n_threads, n_subsample):
             os.remove(log)
 
 
+def _metric(encoded, reference, filt, key):
+    """Run a VV->V filter (ssim/psnr with stats_file) and return the pooled
+    mean from its final summary line (e.g. 'All:0.977' or 'psnr_avg:41.9')."""
+    fd, log = tempfile.mkstemp(suffix=f".{filt}")
+    os.close(fd)
+    try:
+        cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", encoded, "-i", reference,
+            "-lavfi",
+            f"[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];"
+            f"[a][b]{filt}=stats_file={log}",
+            "-f", "null", "-",
+        ]
+        r = run(cmd)
+        if r.returncode != 0:
+            raise RuntimeError(f"{filt} failed:\n{r.stderr}")
+        with open(log) as fh:
+            last = [ln for ln in fh if ln.strip()][-1]
+        for tok in last.split():
+            k, _, v = tok.partition(":")
+            if k == key:
+                return float(v)
+        raise RuntimeError(f"{key} not found in {filt} log: {last!r}")
+    finally:
+        if os.path.exists(log):
+            os.remove(log)
+
+
+def ssim(encoded, reference):
+    return _metric(encoded, reference, "ssim", "All")
+
+
+def psnr(encoded, reference):
+    return _metric(encoded, reference, "psnr", "psnr_avg")
+
+
 def fmt_size(n):
     return f"{n/1e6:8.2f} MB"
 
@@ -98,9 +154,14 @@ def bench_file(fe, src, args, device, tmp):
     name = os.path.basename(src)
     sample = os.path.join(tmp, f"sample_{os.getpid()}.mkv")
     extract_sample(fe, src, sample, args.offset, args.seconds)
-    src_size = os.path.getsize(sample)
+    # WebP decodes to argb (alpha), which the VAAPI decoder cannot ingest; the
+    # GPU still encodes, so force software decode + hwupload for these jobs.
+    sw = is_webp(src)
+    # For WebP the reference is a lossless re-decode, so report the real source
+    # size rather than the (much larger) intermediate.
+    src_size = os.path.getsize(src) if sw else os.path.getsize(sample)
 
-    results = []  # (label, codec, quality, size, vmaf)
+    results = []  # (label, codec, quality, size, vmaf, ssim, psnr)
 
     def measure(label, codec, quality, cmd, out):
         r = run(cmd)
@@ -109,35 +170,41 @@ def bench_file(fe, src, args, device, tmp):
             return
         size = os.path.getsize(out)
         score = vmaf(out, sample, args.threads, args.n_subsample)
-        results.append((label, codec, quality, size, score))
+        s = ssim(out, sample)
+        p = psnr(out, sample)
+        results.append((label, codec, quality, size, score, s, p))
         if not args.keep:
             os.remove(out)
-        print(f"  {label:22s} {fmt_size(size)}  vmaf {score:6.2f}")
+        print(f"  {label:22s} {fmt_size(size)}  vmaf {score:6.2f}  "
+              f"ssim {s:.5f}  psnr {p:6.2f}")
 
-    print(f"\n=== {name}  (sample {args.seconds}s @ {args.offset}s, "
-          f"{src_size/1e6:.1f} MB) ===")
+    kind = ("webp (full clip, decoded reference)" if sw
+            else f"sample {args.seconds}s @ {args.offset}s")
+    print(f"\n=== {name}  ({kind}, {src_size/1e6:.1f} MB) ===")
     print("  encoding baseline + candidates...")
     out = os.path.join(tmp, "base.mkv")
     measure(f"HEVC CQP q{args.hevc_quality}", "hevc-cqp", args.hevc_quality,
-            old_hevc_cqp_cmd(fe, sample, args.hevc_quality, device, out), out)
+            old_hevc_cqp_cmd(fe, sample, args.hevc_quality, device, out, sw),
+            out)
     for q in args.hevc_values:
         out = os.path.join(tmp, f"hq_{q}.mkv")
         measure(f"HEVC CQP q{q}", "hevc", q,
-                new_cmd(fe, sample, "hevc", q, device, out), out)
+                new_cmd(fe, sample, "hevc", q, device, out, sw), out)
     for q in args.av1_values:
         out = os.path.join(tmp, f"av1_{q}.mkv")
         measure(f"AV1 CQP q{q}", "av1", q,
-                new_cmd(fe, sample, "av1", q, device, out), out)
+                new_cmd(fe, sample, "av1", q, device, out, sw), out)
 
     if not results:
         print("  no successful encodes")
         return
     baseline = next((r for r in results if r[1] == "hevc-cqp"), None)
-    print(f"\n  {'setting':22s} {'size':>10s} {'vs base':>8s} {'vmaf':>7s} {'vs base':>8s}")
-    for label, codec, q, size, score in results:
+    print(f"\n  {'setting':22s} {'size':>10s} {'vs base':>8s} "
+          f"{'vmaf':>7s} {'ssim':>8s} {'psnr':>7s}")
+    for label, codec, q, size, score, s, p in results:
         dsize = f"{size/baseline[3]*100:6.1f}%" if baseline else "   -  "
-        dvmaf = f"{score-baseline[4]:+6.2f}" if baseline else "   -  "
-        print(f"  {label:22s} {fmt_size(size)} {dsize:>8s} {score:7.2f} {dvmaf:>8s}")
+        print(f"  {label:22s} {fmt_size(size)} {dsize:>8s} "
+              f"{score:7.2f} {s:8.5f} {p:7.2f}")
 
     if baseline:
         tol = args.tolerance

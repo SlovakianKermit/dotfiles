@@ -159,7 +159,6 @@ pavucontrol
 perl
 perl-io-compress-brotli
 persepolis
-phonon-qt6-vlc
 pipewire-alsa
 pipewire-jack
 pipewire-pulse
@@ -231,8 +230,6 @@ usb_modeswitch
 usbutils
 vim
 vkmark
-vlc
-vlc-plugins-all
 wget
 which
 whisper-cpp

@@ -1,19 +1,28 @@
-.TH ENCODE-BENCH 1 "2026-10-10" "encode-bench" "User Commands"
+.TH ENCODE-BENCH 1 "2026-10-15" "encode-bench" "User Commands"
 .SH NAME
-encode-bench \- VMAF calibration bench for ffmpeg-encode
+encode-bench \- VMAF/SSIM/PSNR calibration bench for ffmpeg-encode
 .SH SYNOPSIS
 .B encode-bench
 [\fIOPTIONS\fR] \fIFILE\fR...
 .SH DESCRIPTION
 .B encode-bench
 encodes short samples of real files with a baseline (HEVC CQP) and a sweep of
-AV1 CQP qualities, scores each against the source with libvmaf, and reports
-size vs quality so you can pick the AV1 quality matching current HEVC output.
+AV1 CQP qualities, scores each against the source with libvmaf, SSIM and PSNR,
+and reports size vs quality so you can pick the AV1 quality matching current
+HEVC output.
+.P
+For ordinary video, a stream-copied segment is used as the reference. Animated
+WebP sources are handled specially: they cannot be stream-copied into Matroska,
+so the whole clip is decoded once to a lossless yuv420p reference (alpha
+dropped) and the encode jobs use software decode plus
+.B hwupload
+because the VAAPI decoder cannot ingest WebP's argb/alpha format. The GPU still
+performs the encode.
 .P
 VMAF runs with
 .I n_subsample
 (default 5): scoring every frame buffers the whole stream and peaks at several
-GB of RAM. It reuses
+GB of RAM. The tool reuses
 .B ffmpeg-encode
 own command builder, so it measures the exact pipeline the TUI uses.
 Requires
@@ -22,10 +31,10 @@ with libvmaf and a VAAPI device.
 .SH OPTIONS
 .TP
 .BI \-t ", " \-\-seconds " SECONDS"
-Sample length. Default: 30.
+Sample length. Default: 30. Ignored for WebP, which always uses the whole clip.
 .TP
 .BI \-s ", " \-\-offset " OFFSET"
-Sample start offset. Default: 5.
+Sample start offset. Default: 5. Ignored for WebP.
 .TP
 .BI \-\-hevc\-quality " N"
 HEVC baseline CQP quality. Default: 27.
@@ -55,11 +64,16 @@ Calibrate AV1 against one file:
 encode-bench ~/Videos/sample.mkv
 .EE
 .P
-Sweep custom AV1 values, keep samples:
+Bench an animated WebP, sweeping both codecs:
 .IP
 .EX
-encode-bench \-\-av1\-values 95 100 110 \-\-keep clip.mkv
+encode-bench clip.webp \-\-hevc\-values 21 24 30 33 \\
+    \-\-av1\-values 80 90 97 105 115 125
 .EE
+.P
+Note that
+.BR \-\-hevc\-values " and " \-\-av1\-values
+consume all following integers, so list the files before the options.
 .SH EXIT STATUS
 .TP
 .B 0
