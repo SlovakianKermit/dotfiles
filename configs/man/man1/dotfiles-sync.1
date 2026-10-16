@@ -223,6 +223,22 @@ Machine-specific runtime state such as
 is kept out through the repository
 .IR .gitignore .
 .TP
+.I Script source excludes
+The scripts sync from
+.I ~/.local/bin
+additionally skips large portable application bundles that must never
+enter the repository: the glob
+.B VR*CyberDeck*
+(the VR CyberDeck portable app and its
+.I VRCyberDeck.ini
+state file) and
+.BR *.AppImage .
+Because exclude patterns are word-split, they must not contain spaces.
+As with the global excludes, any matching files already mirrored into
+.I scripts/
+are purged by
+.BR \-\-delete\-excluded .
+.TP
 .I ~/dotfiles/packages/failed.txt
 Packages that failed to install on pull (one per line).
 .TP
