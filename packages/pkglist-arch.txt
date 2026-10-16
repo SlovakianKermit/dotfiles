@@ -155,6 +155,7 @@ opencode
 openssh
 os-prober
 partitionmanager
+passt
 pavucontrol
 perl
 perl-io-compress-brotli
@@ -173,12 +174,13 @@ plasma-systemmonitor
 plasma-thunderbolt
 plocate
 plymouth-kcm
+podman
+podman-compose
 poppler-glib
 powerdevil
 prismlauncher
 profile-sync-daemon
 protontricks
-proton-vpn-gtk-app
 pv
 python
 python-defusedxml
@@ -196,6 +198,7 @@ rocm-smi-lib
 rsync
 scrcpy
 sg3_utils
+slirp4netns
 smartmontools
 smplayer
 s-nail

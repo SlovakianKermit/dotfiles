@@ -1,0 +1,17 @@
+[Unit]
+Description=SearXNG (rootless Podman)
+Documentation=https://docs.searxng.org/
+
+[Container]
+Image=docker.io/searxng/searxng:latest
+ContainerName=searxng
+PublishPort=127.0.0.1:8888:8080
+Volume=%h/.local/share/opencode-searchxng/docker/config:/etc/searxng:rw
+Volume=%h/.local/share/opencode-searchxng/docker/data:/var/cache/searxng:rw
+Environment=SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

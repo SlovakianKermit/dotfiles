@@ -53,6 +53,7 @@ SYMLINKS=(
   "${HOME}/.config/xnviewmp:dotfiles/xnviewmp"
   "${HOME}/.config/QOwnNotes:dotfiles/QOwnNotes"
   "${HOME}/.config/ripgrep:dotfiles/ripgrep"
+  "${HOME}/.config/containers:dotfiles/containers"
 )
 
 # ============================================================
