@@ -27,6 +27,10 @@ GITHUB_REPO="https://github.com/SlovakianKermit/dotfiles.git"
 declare -A RSYNC_EXCLUDES=(
   ["dotfiles/qBittorrent"]="BT_backup/ logs/ rss/ search/ GeoIP/ qBittorrent.conf qBittorrent-data.conf"
   ["configs/opencode"]="node_modules/ package.json package-lock.json bun.lock .gitignore"
+  # ~/.local/bin is the scripts source; large portable apps (e.g. VR CyberDeck,
+  # run from this dir) must never be swept into the repo. NB: patterns cannot
+  # contain spaces (the list is word-split), hence the glob.
+  ["scripts"]="VR*CyberDeck* *.AppImage"
 )
 
 # Patterns excluded from every rsync: local backups and runtime caches that
