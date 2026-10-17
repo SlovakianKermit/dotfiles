@@ -84,7 +84,6 @@ inetutils
 iperf3
 iwd
 jdk21-openjdk
-jellyfin-mpv-shim
 jfsutils
 kate
 kcalc

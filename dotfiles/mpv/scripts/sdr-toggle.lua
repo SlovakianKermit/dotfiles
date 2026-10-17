@@ -1,16 +1,19 @@
--- Toggle SDR output (bt.709 / sRGB) vs HDR passthrough.
+-- Manual override for SDR / HDR output.
 -- Key: Shift+Ctrl+S
 --
--- Why: with KWin's HDR compositing enabled, mpv adopts the compositor's
--- preferred HDR description and up-converts SDR content (SDR->PQ/BT.2020),
--- which tints near-white content (e.g. pale skin looks yellow). Forcing SDR
--- output makes KWin treat the surface as plain sRGB and it matches the source.
+-- mpv.conf now selects output automatically per file:
+--   SDR sources -> target-colorspace-hint=no (bt.709 / sRGB, matches KWin)
+--   HDR sources -> [hdr-passthrough] profile (PQ/HLG -> true HDR passthrough)
+--
+-- This key is only needed when auto-detection is wrong, e.g. an HDR file with
+-- missing/incorrect colour tags (untagged HDR plays as SDR), or SDR content
+-- tagged as HDR. It starts in the SDR state, matching the config default, so
+-- the first press forces HDR passthrough.
 --
 -- SDR  -> target-colorspace-hint=no  target-prim=bt.709  target-trc=srgb
--- HDR  -> target-colorspace-hint=yes target-prim=auto     target-trc=auto
---         (i.e. back to the mpv.conf defaults)
+-- HDR  -> target-colorspace-hint=yes target-prim=auto    target-trc=auto
 
-local sdr = false
+local sdr = true
 
 local function set_prop(name, value)
     local ok, err = pcall(mp.set_property, name, value)
@@ -31,5 +34,5 @@ mp.add_key_binding("Shift+Ctrl+s", "toggle-sdr", function()
         set_prop("target-prim", "auto")
         set_prop("target-trc", "auto")
     end
-    mp.osd_message("Output: " .. (sdr and "SDR  (bt.709 / sRGB)" or "HDR passthrough"), 2)
+    mp.osd_message("Output: " .. (sdr and "SDR  (bt.709 / sRGB)" or "HDR passthrough (forced)"), 2)
 end)
