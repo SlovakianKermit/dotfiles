@@ -13,5 +13,6 @@ Environment=SEARXNG_SETTINGS_PATH=/etc/searxng/settings.yml
 [Service]
 Restart=always
 
-[Install]
-WantedBy=default.target
+# No [Install] section on purpose: Quadlet auto-applies it during generation,
+# which would start this container on every boot. It is started/stopped on
+# demand by the `opencode` fish function instead.

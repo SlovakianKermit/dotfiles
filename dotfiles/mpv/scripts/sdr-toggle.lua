@@ -11,7 +11,9 @@
 -- the first press forces HDR passthrough.
 --
 -- SDR  -> target-colorspace-hint=no  target-prim=bt.709  target-trc=srgb
+--         saturation=0
 -- HDR  -> target-colorspace-hint=yes target-prim=auto    target-trc=auto
+--         saturation=20
 
 local sdr = true
 
@@ -29,10 +31,12 @@ mp.add_key_binding("Shift+Ctrl+s", "toggle-sdr", function()
         set_prop("target-colorspace-hint", "no")
         set_prop("target-prim", "bt.709")
         set_prop("target-trc", "srgb")
+        set_prop("saturation", 0)
     else
         set_prop("target-colorspace-hint", "yes")
         set_prop("target-prim", "auto")
         set_prop("target-trc", "auto")
+        set_prop("saturation", 20)
     end
     mp.osd_message("Output: " .. (sdr and "SDR  (bt.709 / sRGB)" or "HDR passthrough (forced)"), 2)
 end)
