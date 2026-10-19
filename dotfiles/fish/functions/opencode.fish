@@ -6,8 +6,10 @@ function opencode
     /usr/bin/opencode $argv
 
     # Count only interactive clients. The persistent `opencode serve --service`
-    # daemon must not count, or the cleanup below would never run.
-    set -l clients (pgrep -fa '/usr/bin/opencode' | grep -v -- '--service')
+    # daemon must not count, or the cleanup below would never run. Stopped
+    # (Ctrl+Z / T-state) clients are ignored too: they are not in use and would
+    # otherwise keep the services alive forever.
+    set -l clients (pgrep -r R,S -fa '/usr/bin/opencode' | grep -v -- '--service')
     if test (count $clients) -eq 0
         # Stop the shared background server (and any MCP children it owns).
         /usr/bin/opencode service stop 2>/dev/null
