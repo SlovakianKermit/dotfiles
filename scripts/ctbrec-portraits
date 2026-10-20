@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Extract model names and portrait images from a ctbrec "models" file.
+
+ctbrec (ctbrec-remote / Camrec) keeps its model list in a single JSON document
+named ``models``.  The document has four top-level keys::
+
+    {"models": [...], "notes": {...}, "portraits": [...], "groups": [...]}
+
+Each entry of ``portraits`` is::
+
+    {"data": "<base64 jpeg>", "id": "<uuid>", "url": "https://chaturbate.com/<name>/"}
+
+The image bytes are stored as a base64 string (no ``data:`` prefix), almost
+always JPEG.  The URL is the only link back to a model, so this script joins
+portraits to ``models[*].url`` and names each file after the model.
+
+Written for ctbrec 2.x chaturbate records; other sites work as long as the
+portrait carries a URL that also appears in the model list.
+"""
+import argparse
+import base64
+import binascii
+import json
+import os
+import re
+import sys
+
+SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+MAGIC = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+)
+
+
+def sniff_ext(raw):
+    """Return a file extension based on the leading bytes of *raw*."""
+    for magic, ext in MAGIC:
+        if raw.startswith(magic):
+            return ext
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ".webp"
+    return ".bin"
+
+
+def model_name_from_url(url):
+    """Fallback name: last non-empty path segment of *url*."""
+    path = url.split("?", 1)[0].rstrip("/")
+    last = path.rsplit("/", 1)[-1]
+    return SAFE_RE.sub("_", last) or "unnamed"
+
+
+def safe_name(name):
+    name = SAFE_RE.sub("_", name.strip())
+    name = name.strip("._")
+    return name or "unnamed"
+
+
+def decode_b64(data):
+    """Decode base64, tolerating data-URI prefixes and embedded whitespace."""
+    if data.startswith("data:"):
+        _, _, data = data.partition(",")
+    data = re.sub(r"\s+", "", data)
+    data += "=" * (-len(data) % 4)
+    return base64.b64decode(data, validate=False)
+
+
+def load(path):
+    try:
+        with open(path, "rb") as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        sys.exit(f"{path}: {exc}")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{path}: not valid JSON: {exc}")
+
+    if not isinstance(doc, dict):
+        sys.exit(f"{path}: unexpected top level {type(doc).__name__}")
+
+    models = doc.get("models") or []
+    portraits = doc.get("portraits") or []
+    if not isinstance(portraits, list):
+        sys.exit(f"{path}: 'portraits' is {type(portraits).__name__}, not a list")
+    return models, portraits
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Extract model names and portrait images from a ctbrec 'models' file."
+    )
+    ap.add_argument("file", help="path to the ctbrec 'models' JSON file")
+    ap.add_argument(
+        "-o", "--out", metavar="DIR",
+        help="output directory (default: <file>-portraits)",
+    )
+    ap.add_argument(
+        "-l", "--list", action="store_true",
+        help="list what would be written, without writing anything",
+    )
+    ap.add_argument(
+        "-f", "--force", action="store_true",
+        help="overwrite images that already exist",
+    )
+    ap.add_argument(
+        "-m", "--manifest", metavar="PATH",
+        help="also write a TSV manifest of name, url, file, bytes",
+    )
+    ap.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="name the models that have no portrait",
+    )
+    args = ap.parse_args()
+
+    models, portraits = load(args.file)
+    outdir = args.out or (os.path.splitext(args.file)[0] + "-portraits")
+
+    by_url = {}
+    for m in models:
+        url = m.get("url")
+        if not url:
+            continue
+        name = m.get("name") or m.get("displayName") or model_name_from_url(url)
+        by_url.setdefault(url, safe_name(name))
+
+    if not args.list:
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except OSError as exc:
+            sys.exit(f"{outdir}: {exc}")
+
+    written = skipped = failed = 0
+    total_bytes = 0
+    seen = set()
+    rows = []
+
+    for p in portraits:
+        if not isinstance(p, dict):
+            continue
+        data = p.get("data")
+        url = p.get("url") or ""
+        if not data:
+            print(f"warning: portrait {p.get('id', '?')} has no data", file=sys.stderr)
+            failed += 1
+            continue
+
+        name = by_url.get(url) or model_name_from_url(url)
+        try:
+            raw = decode_b64(data)
+        except (binascii.Error, ValueError) as exc:
+            print(f"warning: {name}: bad base64 ({exc})", file=sys.stderr)
+            failed += 1
+            continue
+
+        filename = name + sniff_ext(raw)
+        n = 1
+        while filename in seen:
+            n += 1
+            filename = f"{name}-{n}{os.path.splitext(filename)[1]}"
+        seen.add(filename)
+
+        path = os.path.join(outdir, filename)
+        rows.append((name, url, filename, str(len(raw))))
+
+        if args.list:
+            print(f"{name}\t{filename}\t{url}\t{len(raw)}")
+            continue
+
+        if os.path.exists(path) and not args.force:
+            skipped += 1
+            continue
+
+        try:
+            with open(path, "wb") as fh:
+                fh.write(raw)
+        except OSError as exc:
+            print(f"warning: {path}: {exc}", file=sys.stderr)
+            failed += 1
+            continue
+
+        written += 1
+        total_bytes += len(raw)
+
+    if args.manifest:
+        try:
+            with open(args.manifest, "w", encoding="utf-8") as fh:
+                fh.write("name\turl\tfile\tbytes\n")
+                for row in rows:
+                    fh.write("\t".join(row) + "\n")
+        except OSError as exc:
+            print(f"warning: {args.manifest}: {exc}", file=sys.stderr)
+
+    if args.list:
+        print(
+            f"# {len(rows)} portraits, {len(models)} models",
+            file=sys.stderr,
+        )
+        return 0
+
+    portrait_urls = {p.get("url") for p in portraits if isinstance(p, dict)}
+    missing = [
+        safe_name(m.get("name") or m.get("displayName") or model_name_from_url(m.get("url", "")))
+        for m in models
+        if (m.get("url") or "") not in portrait_urls
+    ]
+
+    print(
+        f"{written} written, {skipped} skipped, {failed} failed "
+        f"({total_bytes / 1024:.0f} KiB) -> {outdir}"
+    )
+    if missing:
+        listed = ", ".join(missing[:10]) + ("..." if len(missing) > 10 else "")
+        print(f"{len(missing)} model(s) have no portrait: {listed}")
+        if not args.verbose:
+            print("(use --verbose for the full list)")
+        elif len(missing) > 10:
+            print("full list: " + ", ".join(missing))
+
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

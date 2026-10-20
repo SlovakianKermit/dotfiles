@@ -167,6 +167,7 @@ pkgstats
 plasma-browser-integration
 plasma-desktop
 plasma-firewall
+plasma-login-manager
 plasma-nm
 plasma-pa
 plasma-systemmonitor

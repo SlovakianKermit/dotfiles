@@ -53,7 +53,6 @@ opencl-mesa
 pacman-contrib
 parsec-bin
 paru
-plasma-login-manager
 plymouth
 power-profiles-daemon
 proton-cachyos-native

@@ -1,0 +1,139 @@
+.TH CTBREC-PORTRAITS 1 "2026-10-20" "ctbrec-portraits" "User Commands"
+.SH NAME
+ctbrec-portraits \- extract model names and portrait images from a ctbrec models file
+.SH SYNOPSIS
+.B ctbrec-portraits
+[\fIOPTIONS\fP]
+\fIFILE\fP
+.SH DESCRIPTION
+.B ctbrec-portraits
+reads a ctbrec (camrec) model database and writes one image per model,
+named after the model.
+.P
+The database is a single JSON document with four top-level keys:
+.B models
+(the model list, with
+.B name
+and
+.B url
+for each entry),
+.BR notes ,
+.B portraits
+and
+.BR groups .
+Each portrait entry holds the image as a base64 string in its
+.B data
+field plus the model
+.B url
+it belongs to; the encoding is usually JPEG, without a
+.B data:
+prefix. The portrait URL is the only link back to a model, so the script
+joins it against
+.B models[*].url
+to recover the name. If a URL is not found in the model list, the last path
+segment of the URL is used instead.
+.P
+The file extension is chosen from the decoded image's magic bytes
+(JPEG, PNG, GIF, BMP, WebP); anything else is written as
+.BR .bin .
+Existing files are left alone unless
+.B \-\-force
+is given, so re-running the script is cheap and safe. Files that would
+collide inside one run get a
+.B \-2
+style suffix.
+.P
+The whole file is parsed with the Python standard library; no network access
+and no external programs are used. A database of a few megabytes parses
+instantly.
+.SH OPTIONS
+.TP
+.BI \-o ", " \-\-out " DIR"
+Write images to
+.IR DIR .
+Default: the input file's own name with
+.B \-portraits
+appended, next to the input file, e.g.\&
+.I models-portraits
+for
+.IR models .
+.TP
+.BI \-l ", " \-\-list
+Print
+.IR name ,
+.IR filename ,
+.IR url
+and byte size for every portrait as tab-separated text, and write nothing.
+.TP
+.BI \-f ", " \-\-force
+Overwrite images that already exist.
+.TP
+.BI \-m ", " \-\-manifest " PATH
+Also write a TSV manifest with the header
+.BR "name url file bytes" .
+.TP
+.BI \-v ", " \-\-verbose
+Print the full list of models that have no portrait, rather than the first
+ten.
+.SH BEHAVIOUR
+.SS Output
+.IP \(bu 2
+One image per portrait, named after the model: a portrait whose URL is
+.I https://chaturbate.com/keix_moon/
+is written as
+.IR keix_moon.jpg .
+.IP \(bu 2
+Names are reduced to
+.BR [A-Za-z0-9._-] ;
+other characters become underscores.
+.IP \(bu 2
+A summary line reports how many images were written, skipped and failed, the
+total size, and the output directory.
+.IP \(bu 2
+Models present in the model list but without a portrait are counted and
+named at the end; they produce no file.
+.SS Errors
+.IP \(bu 2
+A portrait with missing or undecodable base64 data is reported on standard
+error and counted as failed; the rest of the file is still processed.
+.IP \(bu 2
+Unreadable or invalid JSON is fatal.
+.SH EXAMPLES
+Extract into
+.IR models-portraits
+next to the database:
+.IP
+.EX
+ctbrec-portraits ~/Documents/models
+.EE
+.P
+Extract somewhere else with a manifest:
+.IP
+.EX
+ctbrec-portraits \-o ~/Pictures/ctbrec \-m ~/Pictures/ctbrec/index.tsv ~/Documents/models
+.EE
+.P
+See the names and URLs without writing any files:
+.IP
+.EX
+ctbrec-portraits \-\-list ~/Documents/models
+.EE
+.P
+Refresh every image in place:
+.IP
+.EX
+ctbrec-portraits \-\-force \-o ~/Pictures/ctbrec ~/Documents/models
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including runs where some files were skipped because they already
+existed.
+.TP
+.B 1
+One or more portraits could not be written or decoded.
+.SH SEE ALSO
+.BR ctbrec-merge (1),
+.BR ctbrec-vr (1)
+.SH AUTHOR
+Written for local use.
