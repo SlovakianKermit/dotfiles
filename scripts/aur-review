@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+# aur-review - triage pending AUR packaging changes with an LLM before building.
+#
+# Diffs the last-built commit of each pending AUR package against its current
+# upstream, sends the result to an OpenAI-compatible chat endpoint (DeepSeek by
+# default), and prints a clean / review / danger verdict.
+#
+# Exit: 0 clear, 1 danger found, 2 could not scan.
+
+set -uo pipefail
+
+PROG=${0##*/}
+
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/aur-review
+KEY_FILE=${AUR_REVIEW_KEY_FILE:-$CONFIG_DIR/key}
+BASE_URL=${AUR_REVIEW_BASE_URL:-https://api.deepseek.com/v1}
+MODEL=${AUR_REVIEW_MODEL:-deepseek-flash}
+MAX_DIFF=${AUR_REVIEW_MAX_DIFF:-40000}
+TIMEOUT=${AUR_REVIEW_TIMEOUT:-90}
+CLONE_ROOT=${AUR_REVIEW_CLONE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/paru/clone}
+
+DRY_RUN=0
+QUIET=0
+VERBOSE=0
+ONLY_PKGS=()
+DANGER=()
+CAUTION=()
+SCANNED=0
+
+if [ -t 2 ]; then
+  C_RED=$'\033[31m'; C_YEL=$'\033[33m'; C_GRN=$'\033[32m'
+  C_DIM=$'\033[2m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+  C_RED=; C_YEL=; C_GRN=; C_DIM=; C_BLD=; C_OFF=
+fi
+
+usage() {
+  cat <<EOF
+usage: $PROG [-n] [-v] [-q] [-m MODEL] [-p PKG]...
+
+Triage pending AUR packaging changes with an LLM before paru builds them.
+Compares the last-built commit of each package against its upstream, sends
+the PKGBUILD/.install diff to $MODEL and prints a verdict.
+
+options:
+  -p, --pkg NAME     review only NAME (repeatable). default: all pending upgrades
+  -m, --model MODEL  model name (default: $MODEL)
+  -n, --dry-run      show the prompt instead of calling the API
+  -v, --verbose      also show the model's summary for clean packages
+  -q, --quiet        only report problems
+  -h, --help         this message
+
+exit status: 0 clear or review-only, 1 danger found, 2 could not scan
+
+key file:  $KEY_FILE
+model:     $MODEL
+endpoint:  $BASE_URL
+EOF
+}
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
+note() { printf '%s\n' "$*" >&2; }
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    -p|--pkg)   [ $# -ge 2 ] || die "$1 needs an argument"; ONLY_PKGS+=("$2"); shift 2 ;;
+    -m|--model) [ $# -ge 2 ] || die "$1 needs an argument"; MODEL=$2; shift 2 ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -q|--quiet)   QUIET=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; break ;;
+    -*)           die "unknown option: $1 (try --help)" ;;
+    *)            ONLY_PKGS+=("$1"); shift ;;
+  esac
+done
+
+command -v git  >/dev/null || die "git is required"
+command -v jq   >/dev/null || die "jq is required"
+command -v curl >/dev/null || die "curl is required"
+
+# ---------------------------------------------------------------- API key
+
+load_key() {
+  if [ -n "${AUR_REVIEW_API_KEY:-}" ]; then
+    printf '%s' "$AUR_REVIEW_API_KEY"; return 0
+  fi
+  if [ -r "$KEY_FILE" ]; then
+    tr -d '[:space:]' < "$KEY_FILE"; return 0
+  fi
+  return 1
+}
+
+if [ "$DRY_RUN" -eq 0 ]; then
+  KEY=$(load_key) || die "no API key. Put your DeepSeek key in $KEY_FILE (chmod 600) or set AUR_REVIEW_API_KEY"
+  [ -n "$KEY" ] || die "API key in $KEY_FILE is empty"
+fi
+
+# ---------------------------------------------------------------- heuristics
+
+# pattern@@label@@severity
+HEURISTICS=(
+  '(curl|wget|aria2c|fetch)[^|]*\|[[:space:]]*(ba|da|z)?sh@@pipes a download into a shell@@danger'
+  'base64[[:space:]]+(-d|--decode)@@decodes a base64 payload@@danger'
+  'authorized_keys@@writes SSH authorized_keys@@danger'
+  'xmrig|minerd|cryptonight|stratum\+tcp@@crypto miner@@danger'
+  'pastebin\.com|0x0\.st|transfer\.sh|file\.io|termbin|hastebin|discord(app)?\.com/api/webhooks|tinyurl|bit\.ly|ngrok\.io@@fetches from a paste/file-drop host@@danger'
+  '/dev/tcp/@@opens a raw TCP socket@@danger'
+  '(curl|wget)[^|]*--data-binary@@uploads data during build@@danger'
+  '(^|[^[:alnum:]_])nc[[:space:]]+-[a-z]*[ec]@@reverse shell via nc@@danger'
+  'rm[[:space:]]+-r[a-z]*[[:space:]]+/($|[[:space:]])@@recursive delete of /@@danger'
+  'sudo[[:space:]]@@invokes sudo at build time@@review'
+  'chmod[[:space:]]+[0-7]?777@@sets world-writable permissions@@review'
+  'systemctl[[:space:]]+(enable|start)@@installs a systemd service@@review'
+  'crontab@@installs a cron job@@review'
+  '(^|[^[:alnum:]_])eval[[:space:]]@@uses eval@@review'
+  'sha256sums=\([^)]*SKIP@@uses SKIP instead of checksums@@review'
+  '\.bashrc|\.zshrc|config\.fish|\.profile|\.bash_profile@@modifies shell startup files@@review'
+  'ssh-keygen|gpg[[:space:]]+--@@touches SSH/GPG keys@@review'
+  'pip[[:space:]]+install|npm[[:space:]]+install|(^|[^[:alnum:]_])gem[[:space:]]+install@@installs packages at build time@@review'
+)
+
+check_heuristics() {
+  # $1 = added lines; sets HITS (array) and HSEV (warning|danger)
+  HITS=(); HSEV=warning
+  local added=$1 entry pat label sev
+  [ -z "$added" ] && return 0
+  for entry in "${HEURISTICS[@]}"; do
+    pat=${entry%%@@*}; entry=${entry#*@@}
+    label=${entry%%@@*}; sev=${entry#*@@}
+    if printf '%s\n' "$added" | grep -Eq -- "$pat"; then
+      HITS+=("$label")
+      [ "$sev" = danger ] && HSEV=danger
+    fi
+  done
+}
+
+# ---------------------------------------------------------------- prompt
+
+SYSTEM_PROMPT='You are a security reviewer for AUR (Arch User Repository) PKGBUILD changes. You receive the diff of a package'"'"'s packaging files between the commit that was last built locally and the new upstream commit, plus the commit log and some automated grep hits.
+
+Decide whether the change introduces anything malicious, deceptive, or dangerous at build time. Look for:
+- source= or url= pointing anywhere other than the project'"'"'s official upstream (pastebins, file drops, raw IPs, webhooks, shorteners)
+- piping downloads into a shell, base64-decoded payloads, eval of remote content
+- new or changed .install scriptlets (pre_install/post_install/pre_upgrade) doing arbitrary work
+- checksums replaced with SKIP, or new files added without sums
+- maintainer or ownership changes, account-takeover signals
+- persistence: systemd units, cron, shell rc files, ~/.ssh writes
+- privilege escalation: sudo, setuid, chmod 777
+- pkgver()/prepare()/build() doing network or repo operations
+- obfuscation: long base64/hex blobs, meaningless identifiers, minified shell
+- crypto miners, credential or wallet access
+
+Rules:
+- Judge only the diff shown. The upstream tarball is NOT reviewed; mention it only as residual risk.
+- Ignore style, version bumps, dependency changes, and checksum updates that follow a source= change to the same official host.
+- Be conservative: if a change can execute arbitrary code at build time and you cannot justify it, choose review or danger.
+- danger = clearly malicious or clearly unacceptable. review = suspicious or unfamiliar code a human must read. clean = nothing security-relevant changed.
+- Reasons must be short, concrete, and quote the relevant line where possible.
+
+Output ONLY JSON: {"verdict":"clean|review|danger","summary":"one sentence","reasons":["..."]}'
+
+ask_model() {
+  # $1 = user content, $2 = output file. Returns 0 on success.
+  local content=$1 out=$2 payload=$TMP/payload.json body=$TMP/body.json
+  jq -n --arg model "$MODEL" --arg s "$SYSTEM_PROMPT" --arg u "$content" \
+    '{model:$model,temperature:0,stream:false,response_format:{type:"json_object"},
+      messages:[{role:"system",content:$s},{role:"user",content:$u}]}' > "$payload" \
+    || return 1
+
+  local url=$BASE_URL/chat/completions
+  curl -sS --max-time "$TIMEOUT" -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' -d @"$payload" "$url" > "$body" || return 1
+
+  # Some models reject response_format; retry once without it.
+  if jq -e '.error' "$body" >/dev/null 2>&1; then
+    if jq -e '.error.message // "" | test("response_format|json"; "i")' "$body" >/dev/null 2>&1; then
+      jq 'del(.response_format)' "$payload" > "$payload.nr" || return 1
+      curl -sS --max-time "$TIMEOUT" -H "Authorization: Bearer $KEY" \
+        -H 'Content-Type: application/json' -d @"$payload.nr" "$url" > "$body" || return 1
+    fi
+  fi
+
+  if jq -e '.error' "$body" >/dev/null 2>&1; then
+    note "  ${C_RED}api error${C_OFF}: $(jq -r '.error.message // (.error|tostring)' "$body" | head -2)"
+    return 1
+  fi
+
+  local text
+  text=$(jq -r '.choices[0].message.content // empty' "$body") || return 1
+  [ -n "$text" ] || return 1
+  printf '%s' "$text" | sed -e 's/^```[a-zA-Z]*//' -e 's/```$//' | tr -d '\r' > "$out.raw"
+  jq -e . "$out.raw" > "$out" 2>/dev/null || return 1
+  jq -e '.verdict' "$out" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# ---------------------------------------------------------------- one package
+
+review_one() {
+  # $1 name, $2 oldver, $3 newver
+  local name=$1 oldver=$2 newver=$3
+  local dir=$CLONE_ROOT/$name
+  local diff commits added upstream hits_txt verdict summary risk
+  local -a reasons
+
+  if [ ! -d "$dir/.git" ]; then
+    CAUTION+=("$name|no local checkout in $CLONE_ROOT/$name - paru will show the full PKGBUILD")
+    printf '  %-24s %sREVIEW%s  no local checkout, diff unavailable\n' "$name" "$C_YEL" "$C_OFF"
+    return 0
+  fi
+
+  git -C "$dir" fetch --quiet --all --prune 2>/dev/null
+  upstream=$(git -C "$dir" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)
+  if [ -z "$upstream" ]; then
+    local cand
+    for cand in origin/master origin/main FETCH_HEAD; do
+      if git -C "$dir" rev-parse --verify -q "$cand" >/dev/null 2>&1; then upstream=$cand; break; fi
+    done
+  fi
+  if [ -z "$upstream" ]; then
+    CAUTION+=("$name|could not determine upstream ref for $dir")
+    printf '  %-24s %sREVIEW%s  no upstream ref, diff unavailable\n' "$name" "$C_YEL" "$C_OFF"
+    return 0
+  fi
+
+  if [ "$newver" = "newer" ]; then
+    local nv
+    nv=$(git -C "$dir" show "$upstream:PKGBUILD" 2>/dev/null \
+      | awk -F= '/^pkgver=/{v=$2} /^pkgrel=/{r=$2} END{if(v)print v"-"r}')
+    [ -n "$nv" ] && newver=$nv
+  fi
+
+  diff=$(git -C "$dir" diff --no-color "HEAD..$upstream" -- \
+           PKGBUILD '*.install' '*.patch' '*.diff' '*.sh' 2>/dev/null)
+  commits=$(git -C "$dir" log --no-merges --format='%h %an <%ae> %ad %s' \
+              --date=short "HEAD..$upstream" 2>/dev/null | head -20)
+  added=$(printf '%s\n' "$diff" | sed -n 's/^+//p')
+  check_heuristics "$added"
+
+  SCANNED=$((SCANNED + 1))
+
+  if [ -z "$diff" ]; then
+    printf '  %-24s %sCLEAN%s   %s no packaging changes\n' \
+      "$name" "$C_GRN" "$C_OFF" "$oldver -> $newver"
+    return 0
+  fi
+
+  # deterministic signals independent of the model
+  local hard=0 soft=("${HITS[@]}")
+  [ "$HSEV" = danger ] && hard=1
+
+  local old_maint new_maint
+  old_maint=$(git -C "$dir" show "HEAD:PKGBUILD" 2>/dev/null | grep -m1 '^# Maintainer')
+  new_maint=$(git -C "$dir" show "$upstream:PKGBUILD" 2>/dev/null | grep -m1 '^# Maintainer')
+  if [ -n "$old_maint" ] && [ -n "$new_maint" ] && [ "$old_maint" != "$new_maint" ]; then
+    soft+=("maintainer line changed: ${new_maint#\# Maintainer: }")
+  fi
+
+  hits_txt=$(printf '%s\n' "${soft[@]}" | sed '/^$/d' | sed 's/^/- /')
+  local content
+  content=$(cat <<EOF
+Package: $name
+Version: $oldver -> $newver
+Repository: AUR
+Local path: $dir
+
+Automated grep hits on added lines:
+${hits_txt:-none}
+
+Commits in range:
+$commits
+
+Packaging diff (HEAD..$upstream):
+$diff
+EOF
+)
+
+  if [ "${#content}" -gt "$MAX_DIFF" ]; then
+    local head_n=$((MAX_DIFF * 6 / 10)) tail_n=$((MAX_DIFF - head_n - 120))
+    content="${content:0:$head_n}
+[... diff truncated: $((${#content} - MAX_DIFF)) bytes omitted ...]
+${content: -$tail_n}"
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf '  %-24s %sDRY%s     %s -> %s (would send %d bytes)\n' \
+      "$name" "$C_DIM" "$C_OFF" "$oldver" "$newver" "${#content}"
+    printf '%s\n' "$content" | sed 's/^/    | /' | head -80
+    return 0
+  fi
+
+  if ! ask_model "$content" "$TMP/verdict.json"; then
+    CAUTION+=("$name|model call failed - packaging diff could not be reviewed")
+    printf '  %-24s %sREVIEW%s  model unavailable, diff not reviewed\n' "$name" "$C_YEL" "$C_OFF"
+    return 0
+  fi
+
+  verdict=$(jq -r '.verdict // "review"' "$TMP/verdict.json" | tr '[:upper:]' '[:lower:]')
+  summary=$(jq -r '.summary // ""' "$TMP/verdict.json")
+  mapfile -t reasons < <(jq -r '.reasons[]? // empty' "$TMP/verdict.json" 2>/dev/null | head -8)
+
+  case $verdict in
+    clean) risk=0 ;;
+    danger) risk=2 ;;
+    *) verdict=review; risk=1 ;;
+  esac
+  [ "$hard" -eq 1 ] && risk=2 && verdict=danger
+
+  case $risk in
+    0)
+      [ "$QUIET" -eq 0 ] && printf '  %-24s %sCLEAN%s   %s -> %s  %s%s\n' \
+        "$name" "$C_GRN" "$C_OFF" "$oldver" "$newver" "$C_DIM" "$summary$C_OFF"
+      if [ "$VERBOSE" -eq 1 ] && [ ${#reasons[@]} -gt 0 ]; then
+        local r; for r in "${reasons[@]}"; do printf '    %s%s%s\n' "$C_DIM" "$r" "$C_OFF"; done
+      fi
+      ;;
+    1)
+      printf '  %-24s %sREVIEW%s  %s -> %s  %s\n' \
+        "$name" "$C_YEL" "$C_OFF" "$oldver" "$newver" "$summary"
+      local r; for r in "${reasons[@]}"; do printf '    %s- %s%s\n' "$C_YEL" "$r" "$C_OFF"; done
+      CAUTION+=("$name|$summary")
+      ;;
+    2)
+      printf '  %-24s %sDANGER%s  %s -> %s  %s\n' \
+        "$name" "$C_RED$C_BLD" "$C_OFF" "$oldver" "$newver" "$summary"
+      local r; for r in "${reasons[@]}"; do printf '    %s- %s%s\n' "$C_RED" "$r" "$C_OFF"; done
+      if [ "$hard" -eq 1 ]; then
+        printf '    %s- automated check matched a known-bad pattern%s\n' "$C_RED" "$C_OFF"
+        printf '    %s  %s%s\n' "$C_DIM" "$(printf '%s\n' "${soft[@]}" | sed '/^$/d' | paste -sd ';' -)" "$C_OFF"
+      fi
+      DANGER+=("$name|$summary")
+      ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- main
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/aur-review.XXXXXX") || die "mktemp failed"
+trap 'rm -rf "$TMP"' EXIT
+
+if [ ${#ONLY_PKGS[@]} -gt 0 ]; then
+  [ "$QUIET" -eq 0 ] && printf '%saur-review%s  explicit: %s (model: %s)\n\n' \
+    "$C_BLD" "$C_OFF" "${ONLY_PKGS[*]}" "$MODEL"
+  for pkg in "${ONLY_PKGS[@]}"; do
+    oldver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}')
+    [ -n "$oldver" ] || oldver="?"
+    review_one "$pkg" "$oldver" "newer"
+  done
+else
+  command -v paru >/dev/null || die "paru is required to list pending AUR upgrades"
+  pending=$(paru -Qua 2>/dev/null)
+  if [ -z "$pending" ]; then
+    [ "$QUIET" -eq 0 ] && printf '%saur-review%s  no pending AUR updates\n' "$C_BLD" "$C_OFF"
+    exit 0
+  fi
+  [ "$QUIET" -eq 0 ] && printf '%saur-review%s  reviewing %d pending AUR package(s) with %s\n\n' \
+    "$C_BLD" "$C_OFF" "$(printf '%s\n' "$pending" | wc -l)" "$MODEL"
+
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    case $line in *'[ignored]'*) continue ;; esac
+    name=${line%% *}
+    rest=${line#* }
+    oldver=$(printf '%s' "$rest" | awk '{print $1}')
+    newver=$(printf '%s' "$rest" | awk '{print $3}')
+    [ -n "$newver" ] || newver="?"
+    review_one "$name" "$oldver" "$newver"
+  done <<< "$pending"
+fi
+
+printf '\n'
+if [ ${#DANGER[@]} -eq 0 ] && [ ${#CAUTION[@]} -eq 0 ]; then
+  printf '%s%s%s  %d package(s) scanned, nothing to flag\n' "$C_GRN" "OK" "$C_OFF" "$SCANNED"
+  exit 0
+fi
+
+if [ ${#CAUTION[@]} -gt 0 ]; then
+  printf '%sREVIEW%s  worth reading before you build:\n' "$C_YEL" "$C_OFF"
+  local_ifs=$IFS; IFS=$'\n'
+  for entry in "${CAUTION[@]}"; do
+    printf '  %s- %s: %s%s\n' "$C_YEL" "${entry%%|*}" "${entry#*|}" "$C_OFF"
+  done
+  IFS=$local_ifs
+fi
+
+if [ ${#DANGER[@]} -gt 0 ]; then
+  printf '\n%sABORT%s  refusing to build:\n' "$C_RED$C_BLD" "$C_OFF"
+  for entry in "${DANGER[@]}"; do
+    printf '  %s- %s: %s%s\n' "$C_RED" "${entry%%|*}" "${entry#*|}" "$C_OFF"
+  done
+  printf '\nRead the diff yourself:  git -C %s/<pkg> diff HEAD..@{u}\n' "$CLONE_ROOT"
+  exit 1
+fi
+
+exit 0

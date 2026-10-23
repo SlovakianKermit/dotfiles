@@ -1,0 +1,209 @@
+.TH AUR-REVIEW 1 "2026-10-23" "aur-review" "User Commands"
+.SH NAME
+aur-review \- triage pending AUR packaging changes with an LLM before building
+.SH SYNOPSIS
+.B aur-review
+[\fIOPTIONS\fR]
+.P
+.B aur-review
+.B \-p
+\fIPKG\fR [\fB\-p\fR \fIPKG\fR]...
+.SH DESCRIPTION
+.B aur-review
+lists the AUR packages with pending upgrades, and for each one diffs the
+packaging files at the commit that was last built locally against the current
+upstream commit in the paru clone directory.
+The diff, the commit log for the range, and a set of automated grep hits are
+sent to an OpenAI-compatible chat endpoint (DeepSeek by default) which returns
+a verdict of
+.BR clean ,
+.B review ,
+or
+.BR danger .
+.P
+Before the model is consulted, added lines are matched against a fixed list of
+known-bad patterns (downloads piped into a shell, base64 payloads, paste and
+file-drop hosts, SSH key writes, miners, \fBsudo\fR, world-writable modes,
+\fBSKIP\fR checksums, shell rc edits, and so on) and against the
+\fI# Maintainer\fR line of the old and new PKGBUILD.
+A match in the high-severity group forces a
+.B danger
+verdict regardless of what the model says.
+.P
+The script reads only; it never builds, installs, or modifies a package.
+It is called by the
+.B update
+fish function, which aborts the whole upgrade when the exit status is non-zero.
+.P
+Requirements:
+.BR git ,
+.BR jq ,
+.BR curl ,
+and the paru clone cache left by previous builds. Without that cache a package
+cannot be diffed and is reported as
+.B review
+instead.
+.SH OPTIONS
+.TP
+.BI \-p " PKG"
+Review only
+.IR PKG ,
+ignoring
+.BR "paru \-Qua" .
+May be repeated. Useful for a single package before installing it.
+.TP
+.BI \-m " MODEL"
+Model name sent to the endpoint. Default:
+.IR deepseek-flash .
+.TP
+.B \-n
+Dry run. Print the prompt that would be sent, with a byte count, and make no
+API call. Requires no key.
+.TP
+.B \-v
+Also print the model's reasons for packages it marked clean.
+.TP
+.B \-q
+Only report problems; suppress the header and the clean lines.
+.TP
+.B \-h
+Show usage and exit.
+.SH BEHAVIOUR
+.SS What gets diffed
+.IP \(bu 2
+\fIPKGBUILD\fR, \fI*.install\fR, \fI*.patch\fR, \fI*.diff\fR and \fI*.sh\fR
+in \fB~/.cache/paru/clone/\fI<pkg>\fR.
+.IP \(bu 2
+The range is \fBHEAD\fR (last built) to the tracking branch, after a
+\fBgit fetch\fR. If no upstream is configured, \fIorigin/master\fR,
+\fIorigin/main\fR, then \fIFETCH_HEAD\fR are tried.
+.IP \(bu 2
+An empty recipe diff is reported as clean without calling the API.
+.IP \(bu 2
+Prompts larger than \fBAUR_REVIEW_MAX_DIFF\fR bytes keep the first 60 percent
+and the last part of the diff, with the omitted byte count marked inline.
+.SS Verdicts
+.IP \(bu 2
+.B clean
+\- nothing security-relevant changed. The upgrade proceeds.
+.IP \(bu 2
+.B review
+\- suspicious or unfamiliar code. The upgrade still proceeds; the reasons
+are printed so they can be read, which matters because the
+.B update
+function runs paru with
+.BR \-\-skipreview .
+.IP \(bu 2
+.B danger
+\- malicious or clearly unacceptable. Exit status 1, and
+.B update
+stops before touching any package.
+.SS Requirements
+.IP \(bu 2
+.BR git ,
+.BR jq ,
+.BR curl .
+.IP \(bu 2
+A key in
+.I ~/.config/aur-review/key
+(mode 0600) or in
+.BR AUR_REVIEW_API_KEY .
+.IP \(bu 2
+.B paru
+for the default package list, unless
+.B \-p
+is given.
+.SH ENVIRONMENT
+.TP
+.B AUR_REVIEW_API_KEY
+Key, overriding the key file.
+.TP
+.B AUR_REVIEW_KEY_FILE
+Alternative key file path.
+.TP
+.B AUR_REVIEW_BASE_URL
+API root, default \fIhttps://api.deepseek.com/v1\fR.
+.TP
+.B AUR_REVIEW_MODEL
+Default model name.
+.TP
+.B AUR_REVIEW_CLONE_DIR
+paru clone directory, default \fI~/.cache/paru/clone\fR.
+.TP
+.B AUR_REVIEW_MAX_DIFF
+Prompt size ceiling in bytes, default 40000.
+.TP
+.B AUR_REVIEW_TIMEOUT
+Per-request curl timeout in seconds, default 90.
+.SH EXAMPLES
+Review everything paru would build:
+.IP
+.EX
+aur-review
+.EE
+.P
+Read the verdicts but keep going with the update anyway:
+.IP
+.EX
+aur-review; paru \-Syu
+.EE
+.P
+Check one package before installing it:
+.IP
+.EX
+aur-review \-p some\-git\-package
+.EE
+.P
+See exactly what would be sent, without spending tokens:
+.IP
+.EX
+aur-review \-n \-p some\-package
+.EE
+.P
+Inspect a flagged diff yourself:
+.IP
+.EX
+git \-C ~/.cache/paru/clone/<pkg> diff HEAD..@{u}
+.EE
+.P
+Upgrade without the review step:
+.IP
+.EX
+update \-\-skip\-ai
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Nothing flagged, or only
+.B review
+verdicts.
+.TP
+.B 1
+At least one
+.B danger
+verdict.
+.TP
+.B 2
+Could not scan: missing key, missing dependency, or no pending list.
+.SH FILES
+.TP
+.I ~/.config/aur-review/key
+API key, one line, mode 0600.
+.TP
+.I ~/.cache/paru/clone/
+Per-package git checkouts used for the diff.
+.SH SEE ALSO
+.BR paru (8),
+.BR pacman (8),
+.BR flatpak (1),
+.BR git (1)
+.SH BUGS
+The upstream source tarball is not inspected; only the packaging recipe is.
+A clean verdict is not a statement about the code that gets compiled.
+The diff is taken against the last commit paru checked out, which can be newer
+than the installed version if a build was previously skipped or failed, so a
+change may be reviewed twice.
+Devel packages (\fI\-git\fR and friends) always show changes and will often be
+flagged for reading.
+.SH AUTHOR
+Written for local use.
