@@ -113,6 +113,12 @@ anything.
 .IP \(bu 2
 Verifies every name in the Arch and CachyOS lists exists in a configured
 repository, catching renamed or dropped packages.
+When the CachyOS repositories are not configured (a plain Arch box before the
+first
+.BR pull ),
+its packages are reported as not verified instead of as missing, since
+.B pull
+adds those repositories before installing anything.
 .IP \(bu 2
 Reports AUR entries that a repository already provides, where the repo build
 wins and

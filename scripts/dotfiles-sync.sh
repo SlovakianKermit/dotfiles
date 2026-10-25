@@ -630,10 +630,25 @@ cmd_check() {
 
   [[ -s "${arch_list}" ]] || die "Missing or empty: ${arch_list}"
 
-  local official=() p
+  local official=() p cachy_skipped=0
   while read -r p; do
     [[ -n "${p}" ]] && official+=("${p}")
-  done < <(cat "${arch_list}" "${cachy_list}" 2>/dev/null)
+  done <"${arch_list}"
+
+  # CachyOS packages can only be resolved where that repo is configured *and*
+  # synced. pull adds the repo before installing, so report these as "not
+  # checked" rather than as missing packages.
+  if [[ -s "${cachy_list}" ]]; then
+    if pacman -Slq cachyos &>/dev/null; then
+      while read -r p; do
+        [[ -n "${p}" ]] && official+=("${p}")
+      done <"${cachy_list}"
+    else
+      cachy_skipped="$(grep -c '[^[:space:]]' "${cachy_list}" || true)"
+      warn "CachyOS repositories are not available on this machine."
+      warn "  Skipping ${cachy_skipped} CachyOS package(s); 'pull' adds the repo before installing."
+    fi
+  fi
   [[ ${#official[@]} -gt 0 ]] || die "No official packages listed."
 
   CHECK_TMP="$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-check.XXXXXX")" ||
@@ -695,9 +710,13 @@ cmd_check() {
       ok "Transaction resolves: ${#official[@]} requested, ${total} packages on a clean system."
     else
       warn "The transaction does not resolve:"
-      sed 's/^/         /' "${CHECK_TMP}/resolve.err" | grep -v '^error: target not found' || true
-      grep -q 'target not found' "${CHECK_TMP}/resolve.err" &&
-        warn "  (unresolved names are listed above and in the name check)"
+      head -15 "${CHECK_TMP}/resolve.err" | sed 's/^/         /' || true
+      local err_lines
+      err_lines="$(wc -l <"${CHECK_TMP}/resolve.err")"
+      [[ ${err_lines} -gt 15 ]] && warn "         ... (${err_lines} lines total)"
+      if grep -qE 'could not find database|database file for .* does not exist' "${CHECK_TMP}/resolve.err"; then
+        warn "A repository database is missing; run 'sudo pacman -Sy' and check again."
+      fi
       problems=$((problems + 1))
     fi
 
@@ -755,6 +774,11 @@ cmd_check() {
 
       # A conflict only counts when its version constraint is actually met by
       # the package in the transaction, and when it is not a Replaces swap.
+      local have_vercmp=true
+      command -v vercmp &>/dev/null || {
+        have_vercmp=false
+        warn "vercmp (pacman-contrib) not found; version-constrained conflicts cannot be evaluated."
+      }
       local conflicts=0
       while IFS=$'\t' read -r kind pkg tok; do
         [[ "${kind}" == "C" ]] || continue
@@ -777,6 +801,9 @@ cmd_check() {
         [[ "${other}" == "${pkg}" ]] && continue
 
         if [[ -n "${op}" && -n "${otherver}" && -n "${cver}" ]]; then
+          if ! $have_vercmp; then
+            continue
+          fi
           cmp="$(vercmp "${otherver}" "${cver}" 2>/dev/null || echo 0)"
           local hit=false
           case "${op}" in
@@ -879,6 +906,9 @@ PY
   [[ ${hw} -gt 0 ]] && log "Note: ${hw} hardware-specific package(s) in the transaction will be skipped on pull."
 
   echo
+  if [[ "${cachy_skipped}" -gt 0 ]]; then
+    warn "${cachy_skipped} CachyOS package(s) were not verified (repo not configured here)."
+  fi
   if [[ ${problems} -gt 0 ]]; then
     warn "${problems} problem(s) found -- a clean install would fail or conflict. Nothing was installed."
     exit 2

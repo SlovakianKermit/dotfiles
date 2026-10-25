@@ -125,6 +125,10 @@ host sync databases are read through a symlink in a temp root and the script
 verifies the local database is untouched afterwards. Exit code 2 means it found
 problems.
 
+On a plain Arch box the CachyOS repo doesn't exist yet, so those 67 packages are
+reported as *not verified* rather than missing — `pull` adds that repo first.
+The Arch half is still fully resolved (1353 packages on a bare Arch system).
+
 ---
 
 ## What is synced
