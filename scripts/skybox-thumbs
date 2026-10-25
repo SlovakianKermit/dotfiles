@@ -145,7 +145,10 @@ def process(video, args):
         return video, err
 
     try:
-        os.chmod(tmp, (src.st_mode & 0o777) | 0o020)
+        try:
+            os.chmod(tmp, (src.st_mode & 0o777) | 0o020)
+        except OSError:
+            pass  # NTFS/exFAT and similar mounts may not support chmod
         if os.geteuid() == 0:
             os.chown(tmp, src.st_uid, src.st_gid)
         os.replace(tmp, sidecar)

@@ -58,7 +58,11 @@ The script is normally run on the Proxmox host; from a workstation use
 On the Proxmox host a systemd timer
 .RI ( skybox-thumbs.timer )
 runs the script every three hours (00:00, 03:00, and so on) with a randomised
-delay of up to 10 minutes. The service processes one video at a time at idle
+delay of up to 10 minutes. A systemd user timer of the same name does the same
+on the workstation for
+.IR /mnt/shared/VR ,
+which is an NTFS disk that only exists there; that timer passes the path
+explicitly. The service processes one video at a time at idle
 I/O priority and low CPU weight. It checks for an existing sidecar before
 doing anything else and skips that video, so a run with nothing new only lists
 directories and calls
@@ -218,6 +222,13 @@ Three-hourly schedule on the Proxmox host (00:00, 03:00, ... with up to 10 minut
 .TP
 .I /etc/systemd/system/skybox-thumbs.service
 One-shot service running this script with idle I/O priority.
+.TP
+.I ~/.config/systemd/user/skybox-thumbs.timer
+Three-hourly user timer on the workstation for
+.IR /mnt/shared/VR .
+.TP
+.I ~/.config/systemd/user/skybox-thumbs.service
+User service invoked by that timer.
 .SH SEE ALSO
 .BR skybox-thumbs-remote (1),
 .BR ctbrec-vr (1),
