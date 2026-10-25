@@ -598,6 +598,295 @@ cmd_pull() {
 }
 
 # ============================================================
+# CHECK (resolve the install transaction without touching anything)
+# ============================================================
+
+# Runs `pacman -S --print` against a throwaway root whose local database is
+# empty, so the transaction is resolved exactly as it would be on a fresh
+# system. The host's sync databases are only read (symlinked), never written:
+# no -y is ever passed, nothing is installed, and everything lives under a
+# mktemp directory that is removed on exit.
+
+CHECK_TMP=""
+
+check_cleanup() {
+  local d="${CHECK_TMP}"
+  [[ -n "${d}" && -d "${d}" ]] || return 0
+  # Only ever remove a directory this script created.
+  if [[ "${d}" == */dotfiles-check.* ]]; then
+    rm -rf -- "${d}" 2>/dev/null || true
+  else
+    warn "Refusing to remove unexpected path: ${d}"
+  fi
+}
+
+cmd_check() {
+  require pacman
+  [[ -d "${REPO_DIR}/.git" ]] || die "Repo not found at ${REPO_DIR}. Run setup first."
+
+  local arch_list="${REPO_DIR}/packages/pkglist-arch.txt"
+  local cachy_list="${REPO_DIR}/packages/pkglist-cachyos.txt"
+  local aur_list="${REPO_DIR}/packages/pkglist-aur.txt"
+
+  [[ -s "${arch_list}" ]] || die "Missing or empty: ${arch_list}"
+
+  local official=() p
+  while read -r p; do
+    [[ -n "${p}" ]] && official+=("${p}")
+  done < <(cat "${arch_list}" "${cachy_list}" 2>/dev/null)
+  [[ ${#official[@]} -gt 0 ]] || die "No official packages listed."
+
+  CHECK_TMP="$(mktemp -d "${TMPDIR:-/tmp}/dotfiles-check.XXXXXX")" ||
+    die "Could not create a temporary directory"
+  trap check_cleanup EXIT
+
+  local problems=0
+  local hostdb_before
+  hostdb_before="$(stat -c '%Y:%s' /var/lib/pacman/local 2>/dev/null || echo none)"
+
+  # ----------------------------------------------------------
+  # 1. Every listed name must exist in a configured repository
+  # ----------------------------------------------------------
+  log "Checking ${#official[@]} official package names..."
+  pacman -Si "${official[@]}" >/dev/null 2>"${CHECK_TMP}/si.err" || true
+  sed -n "s/.*package '\([^']*\)'.*/\1/p" "${CHECK_TMP}/si.err" | sort -u >"${CHECK_TMP}/missing.txt"
+  if [[ -s "${CHECK_TMP}/missing.txt" ]]; then
+    while read -r p; do
+      warn "Not in any configured repo: ${p}"
+      problems=$((problems + 1))
+    done <"${CHECK_TMP}/missing.txt"
+  else
+    ok "All official package names resolve."
+  fi
+
+  # ----------------------------------------------------------
+  # 2. AUR entries that a repo already provides (repo wins)
+  # ----------------------------------------------------------
+  if [[ -s "${aur_list}" ]]; then
+    pacman -Slq 2>/dev/null | sort -u >"${CHECK_TMP}/repo-names.txt" || true
+    local shadowed=0
+    while read -r p; do
+      [[ -n "${p}" ]] || continue
+      if grep -qxF "${p}" "${CHECK_TMP}/repo-names.txt"; then
+        warn "AUR entry '${p}' is also in a configured repo; the repo build wins and paru will skip it."
+        shadowed=$((shadowed + 1))
+      fi
+    done <"${aur_list}"
+    [[ ${shadowed} -eq 0 ]] && ok "No AUR entry shadows a repo package."
+  fi
+
+  # ----------------------------------------------------------
+  # 3. Resolve the whole transaction against an empty local DB
+  # ----------------------------------------------------------
+  if [[ ! -r /var/lib/pacman/sync ]]; then
+    warn "Cannot read /var/lib/pacman/sync; run 'sudo pacman -Sy' and retry for a full check."
+    problems=$((problems + 1))
+  else
+    local root="${CHECK_TMP}/root"
+    mkdir -p "${root}/var/lib/pacman/local"
+    ln -s /var/lib/pacman/sync "${root}/var/lib/pacman/sync"
+
+    log "Resolving a clean-system transaction (no downloads, no installs)..."
+    if pacman -r "${root}" --dbpath "${root}/var/lib/pacman" \
+      -S --print --print-format '%n' --needed "${official[@]}" \
+      >"${CHECK_TMP}/resolved.txt" 2>"${CHECK_TMP}/resolve.err"; then
+      local total
+      total="$(wc -l <"${CHECK_TMP}/resolved.txt")"
+      ok "Transaction resolves: ${#official[@]} requested, ${total} packages on a clean system."
+    else
+      warn "The transaction does not resolve:"
+      sed 's/^/         /' "${CHECK_TMP}/resolve.err" | grep -v '^error: target not found' || true
+      grep -q 'target not found' "${CHECK_TMP}/resolve.err" &&
+        warn "  (unresolved names are listed above and in the name check)"
+      problems=$((problems + 1))
+    fi
+
+    # --------------------------------------------------------
+    # 4. Conflicts inside the resolved set (including deps)
+    # --------------------------------------------------------
+    if [[ -s "${CHECK_TMP}/resolved.txt" ]]; then
+      log "Scanning the resolved set for package conflicts..."
+      # shellcheck disable=SC2046 # names were validated above, one per line
+      pacman -Si $(cat "${CHECK_TMP}/resolved.txt") 2>/dev/null >"${CHECK_TMP}/meta.raw" || true
+
+      awk '
+        {
+          i = index($0, ":")
+          if (i == 0) next
+          label = substr($0, 1, i - 1); gsub(/[[:space:]]+$/, "", label)
+          val   = substr($0, i + 1);    gsub(/^[[:space:]]+/, "", val)
+          if (label == "Name") name = val
+          else if (label == "Version") print "V\t" name "\t" val
+          else if (label == "Provides" && val != "None") {
+            n = split(val, a, " ")
+            for (k = 1; k <= n; k++) print "P\t" name "\t" a[k]
+          } else if (label == "Replaces" && val != "None") {
+            n = split(val, a, " ")
+            for (k = 1; k <= n; k++) print "R\t" name "\t" a[k]
+          } else if (label == "Conflicts With" && val != "None") {
+            n = split(val, a, " ")
+            for (k = 1; k <= n; k++) print "C\t" name "\t" a[k]
+          }
+        }
+      ' "${CHECK_TMP}/meta.raw" >"${CHECK_TMP}/meta.tsv"
+
+      # in_set: every package in the transaction
+      # prov_of/provver: what each package provides (e.g. zlib, X-ABI-...)
+      # repl_of: which package replaces which (pacman swaps these silently)
+      declare -A in_set=() pkgver=() prov_of=() provver=() repl_of=() seen=()
+      local kind pkg tok name op cver other otherver key cmp
+      while IFS=$'\t' read -r p; do
+        [[ -n "${p}" ]] && in_set["${p}"]=1
+      done <"${CHECK_TMP}/resolved.txt"
+
+      while IFS=$'\t' read -r kind pkg tok; do
+        case "${kind}" in
+          V) pkgver["${pkg}"]="${tok}" ;;
+          P)
+            name="${tok%%[<>=]*}"
+            if [[ -z "${prov_of[${name}]:-}" ]]; then
+              prov_of["${name}"]="${pkg}"
+              [[ "${tok}" == *=* ]] && provver["${name}"]="${tok#*=}"
+            fi
+            ;;
+          R) repl_of["${tok%%[<>=]*}"]="${pkg}" ;;
+        esac
+      done <"${CHECK_TMP}/meta.tsv"
+
+      # A conflict only counts when its version constraint is actually met by
+      # the package in the transaction, and when it is not a Replaces swap.
+      local conflicts=0
+      while IFS=$'\t' read -r kind pkg tok; do
+        [[ "${kind}" == "C" ]] || continue
+
+        name="${tok}"; op=""; cver=""
+        if [[ "${tok}" == *"<"* || "${tok}" == *">"* || "${tok}" == *"="* ]]; then
+          name="${tok%%[<>=]*}"
+          op="${tok#"${name}"}"; op="${op%%[0-9]*}"
+          cver="${tok#"${name}${op}"}"
+        fi
+
+        other=""; otherver=""
+        if [[ -n "${in_set[${name}]:-}" ]]; then
+          other="${name}"; otherver="${pkgver[${name}]:-}"
+        elif [[ -n "${prov_of[${name}]:-}" ]]; then
+          other="${prov_of[${name}]}"
+          otherver="${provver[${name}]:-${pkgver[${other}]:-}}"
+        fi
+        [[ -n "${other}" ]] || continue
+        [[ "${other}" == "${pkg}" ]] && continue
+
+        if [[ -n "${op}" && -n "${otherver}" && -n "${cver}" ]]; then
+          cmp="$(vercmp "${otherver}" "${cver}" 2>/dev/null || echo 0)"
+          local hit=false
+          case "${op}" in
+            "<")  if (( cmp < 0 ));  then hit=true; fi ;;
+            "<=") if (( cmp <= 0 )); then hit=true; fi ;;
+            ">")  if (( cmp > 0 ));  then hit=true; fi ;;
+            ">=") if (( cmp >= 0 )); then hit=true; fi ;;
+            "=")  if (( cmp == 0 )); then hit=true; fi ;;
+          esac
+          $hit || continue
+        fi
+
+        if [[ "${repl_of[${pkg}]:-}" == "${other}" || "${repl_of[${other}]:-}" == "${pkg}" ]]; then
+          continue
+        fi
+
+        key="$(printf '%s\n%s\n' "${pkg}" "${other}" | sort | paste -sd'|')"
+        [[ -n "${seen[${key}]:-}" ]] && continue
+        seen["${key}"]=1
+        warn "Conflict: ${pkg} <-> ${other}"
+        conflicts=$((conflicts + 1))
+      done <"${CHECK_TMP}/meta.tsv"
+
+      if [[ ${conflicts} -eq 0 ]]; then
+        ok "No conflicting packages in the resolved set."
+      else
+        problems=$((problems + conflicts))
+      fi
+    fi
+  fi
+
+  # ----------------------------------------------------------
+  # 5. AUR: existence + declared conflicts (metadata only)
+  # ----------------------------------------------------------
+  if [[ -s "${aur_list}" && "${CHECK_NO_AUR}" == false ]]; then
+    if ! command -v curl &>/dev/null; then
+      warn "--no-aur implied: curl not found, AUR metadata not checked."
+    elif ! command -v python3 &>/dev/null; then
+      warn "python3 not found; skipping AUR metadata check."
+    else
+      log "Querying AUR metadata for $(wc -l <"${aur_list}") packages..."
+      local args
+      args="$(sed 's/^/arg[]=/' "${aur_list}" | paste -sd'&')"
+      if curl -fsS -m 25 "https://aur.archlinux.org/rpc/v5/info?${args}" \
+        -o "${CHECK_TMP}/aur.json" 2>/dev/null; then
+        python3 - "${CHECK_TMP}/aur.json" "${CHECK_TMP}/resolved.txt" "${aur_list}" \
+          >"${CHECK_TMP}/aur.issues" 2>/dev/null <<'PY'
+import json, sys
+data, resolved_file, list_file = sys.argv[1:4]
+res = {line.strip() for line in open(resolved_file) if line.strip()}
+want = [line.strip() for line in open(list_file) if line.strip()]
+rpc = json.load(open(data))["results"]
+have = {r["Name"] for r in rpc}
+for name in want:
+    if name not in have:
+        print(f"MISSING\t{name}\t")
+for r in rpc:
+    for tok in r.get("Conflicts") or []:
+        base = tok.split("<")[0].split(">")[0].split("=")[0]
+        if base in res and base != r["Name"]:
+            print(f"CONFLICT\t{r['Name']}\t{base}")
+PY
+        local aur_problems=0 ak ap at
+        if [[ -s "${CHECK_TMP}/aur.issues" ]]; then
+          while IFS=$'\t' read -r ak ap at; do
+            case "${ak}" in
+              MISSING)  warn "AUR package no longer exists: ${ap}" ;;
+              CONFLICT) warn "AUR conflict: ${ap} <-> ${at}" ;;
+            esac
+            aur_problems=$((aur_problems + 1))
+          done <"${CHECK_TMP}/aur.issues"
+        fi
+        if [[ ${aur_problems} -eq 0 ]]; then
+          ok "AUR metadata clean: all entries exist, no declared conflicts."
+        else
+          problems=$((problems + aur_problems))
+        fi
+      else
+        warn "Could not reach the AUR RPC; skipping AUR metadata check."
+      fi
+    fi
+  fi
+
+  # ----------------------------------------------------------
+  # 6. Prove the host was not modified
+  # ----------------------------------------------------------
+  local hostdb_after
+  hostdb_after="$(stat -c '%Y:%s' /var/lib/pacman/local 2>/dev/null || echo none)"
+  if [[ "${hostdb_before}" != "${hostdb_after}" ]]; then
+    warn "Host pacman database changed during the check -- investigate immediately."
+    problems=$((problems + 1))
+  else
+    ok "Host pacman database untouched."
+  fi
+
+  local hw=0
+  for p in "${HARDWARE_EXCLUDES[@]}"; do
+    grep -qxF "${p}" "${CHECK_TMP}/resolved.txt" 2>/dev/null && hw=$((hw + 1))
+  done
+  [[ ${hw} -gt 0 ]] && log "Note: ${hw} hardware-specific package(s) in the transaction will be skipped on pull."
+
+  echo
+  if [[ ${problems} -gt 0 ]]; then
+    warn "${problems} problem(s) found -- a clean install would fail or conflict. Nothing was installed."
+    exit 2
+  fi
+  ok "Check passed: no missing packages, unresolvable dependencies, or conflicts."
+}
+
+# ============================================================
 # SETUP
 # ============================================================
 
@@ -627,6 +916,7 @@ cmd_setup() {
 
 DRY_RUN=false
 SKIP_CACHYOS=false
+CHECK_NO_AUR=false
 subcommand=""
 commit_msg=""
 
@@ -634,6 +924,7 @@ for arg in "$@"; do
   case "$arg" in
     --dry-run)       DRY_RUN=true ;;
     --skip-cachyos)  SKIP_CACHYOS=true ;;
+    --no-aur)        CHECK_NO_AUR=true ;;
     *)
       if [[ -z "$subcommand" ]]; then
         subcommand="$arg"
@@ -647,16 +938,21 @@ done
 case "${subcommand}" in
   push) cmd_push "${commit_msg}" ;;
   pull) cmd_pull ;;
+  check) cmd_check ;;
   setup) cmd_setup ;;
   *)
-    echo "Usage: $(basename "$0") [--dry-run] [--skip-cachyos] <push|pull|setup> [commit message]"
+    echo "Usage: $(basename "$0") [--dry-run] [--skip-cachyos] [--no-aur] <push|pull|check|setup> [commit message]"
     echo ""
     echo "  setup           Clone the repo and prepare the directory structure"
     echo "  push [msg]      Sync everything to GitHub (optional commit message)"
     echo "  pull            Pull from GitHub, install packages, restore configs"
+    echo "  check           Resolve the package install as if on a clean system;"
+    echo "                  reports missing packages, unresolvable deps and conflicts."
+    echo "                  Installs nothing and changes nothing outside a temp dir."
     echo ""
     echo "  --dry-run       Show what would happen, don't change anything"
     echo "  --skip-cachyos  Don't add CachyOS repos; skip its packages on pull"
+    echo "  --no-aur        (check) Skip the AUR metadata lookup"
     exit 1
     ;;
 esac

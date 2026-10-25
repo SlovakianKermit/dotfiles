@@ -11,6 +11,9 @@ dotfiles-sync \- push and pull dotfiles, configs, scripts, and packages via Git
 .B dotfiles-sync.sh pull
 [\fB\-\-dry\-run\fR]
 [\fB\-\-skip\-cachyos\fR]
+.P
+.B dotfiles-sync.sh check
+[\fB\-\-no\-aur\fR]
 .SH DESCRIPTION
 .B dotfiles-sync.sh
 mirrors your configuration between machines through a Git repository.
@@ -39,6 +42,11 @@ Packages in
 .I pkglist-cachyos.txt
 are skipped and logged to
 .IR skipped-cachyos.txt .
+.TP
+.B \-\-no\-aur
+(Only meaningful for
+.BR check .)
+Skip the AUR metadata lookup, leaving only local analysis.
 .SH SUBCOMMANDS
 .TP
 .B setup
@@ -96,6 +104,53 @@ Commits with the supplied message (default:
 before pushing, so a commit made on another machine can never leave the
 sync half-applied. An unmergeable divergence aborts with an error instead
 of pushing.
+.RE
+.TP
+.B check " [\fB\-\-no\-aur\fR]"
+Answer "would this install work on a clean machine?" without installing
+anything.
+.RS
+.IP \(bu 2
+Verifies every name in the Arch and CachyOS lists exists in a configured
+repository, catching renamed or dropped packages.
+.IP \(bu 2
+Reports AUR entries that a repository already provides, where the repo build
+wins and
+.B paru
+silently skips the AUR package.
+.IP \(bu 2
+Resolves the complete transaction with
+.BR "pacman \-S \-\-print"
+against a temporary root whose local database is empty, so dependencies are
+computed exactly as on a fresh system. Package files are not downloaded.
+.IP \(bu 2
+Scans the resolved set (typically ~1600 packages) for
+.B Conflicts With
+entries, honouring version constraints with
+.BR vercmp (8)
+and ignoring
+.B Replaces
+swaps and self-conflicts. This is what
+.B \-\-print
+does not check by itself.
+.IP \(bu 2
+Queries the AUR RPC for existence and declared conflicts unless
+.B \-\-no\-aur
+is given.
+.IP \(bu 2
+Lists how many hardware-specific packages in the transaction
+.B pull
+would skip.
+.P
+The check never runs
+.BR \-y ,
+never installs, and never writes to
+.IR /var/lib/pacman :
+the host sync databases are only read through a symlink, and the script
+verifies afterwards that the local database is byte-for-byte untouched.
+Everything else lives in a
+.B mktemp
+directory that is removed on exit.
 .RE
 .TP
 .B pull " [\fIflags\fR]"
@@ -459,11 +514,18 @@ Success (or nothing to commit, or dry run completed).
 .TP
 .B 1
 Fatal error (missing required command, repo not found, etc.).
+.TP
+.B 2
+.B check
+found problems: missing packages, unresolvable dependencies, or conflicts.
+Nothing was installed.
+.P
 Individual package install failures do
 .I not
 cause a non-zero exit; they are logged instead.
 .SH SEE ALSO
 .BR pacman (8),
+.BR vercmp (8),
 .BR paru (1),
 .BR rsync (1),
 .BR git (1),

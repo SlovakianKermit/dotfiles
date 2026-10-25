@@ -106,6 +106,25 @@ on another machine and pushing back can't leave you with a non-fast-forward.
 dotfiles-sync pull
 ```
 
+### Check the install before trusting it
+
+```bash
+dotfiles-sync check
+```
+
+Answers "would this install work on a clean machine?" in about three seconds
+without installing anything. It verifies every package name still exists,
+catches AUR entries that a repo now provides, resolves the full transaction
+(~1600 packages including dependencies) against an empty database, and scans
+that set for real conflicts — honouring version constraints, so
+`cryptsetup conflicts mkinitcpio<38-1` is not reported against mkinitcpio 42.
+`--no-aur` skips the AUR lookup.
+
+It never runs `-y`, never installs, and never writes to `/var/lib/pacman`; the
+host sync databases are read through a symlink in a temp root and the script
+verifies the local database is untouched afterwards. Exit code 2 means it found
+problems.
+
 ---
 
 ## What is synced
