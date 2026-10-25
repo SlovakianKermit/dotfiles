@@ -330,6 +330,13 @@ lockfiles.
 .I configs/micro
 \(en
 .BR syntax/ ", " buffers/ .
+.IP \(bu 2
+.I configs/man
+\(en
+.IR index.db ,
+the binary
+.B mandb
+cache, which is rebuilt on pull.
 .RE
 .TP
 .I ~/.config/gallery-dl/
@@ -396,6 +403,16 @@ entry.
 \(en never synced. Keep a sanitized
 .I config.example
 in the repo by hand if you want the host layout backed up.
+.P
+Because
+.I ~/.config/systemd
+is synced wholesale, user units must never embed credentials in
+.B Environment=
+lines. Put them in
+.RB ( %h/.config/supermemory/env
+for example), mode 600, and reference the file with
+.BR EnvironmentFile= .
+That path is outside every sync list and outside the repository.
 .P
 Not affected by the above: the synced
 .I ~/.local/share/man
