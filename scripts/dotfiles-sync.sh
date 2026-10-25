@@ -38,6 +38,8 @@ declare -A RSYNC_EXCLUDES=(
   ["configs/applications"]="wine/ wine-*.desktop discord-*.desktop mimeinfo.cache mimeapps.list"
   # micro ships 650K of upstream syntax files; only the user config matters.
   ["configs/micro"]="syntax/ buffers/"
+  # mandb writes a binary index next to the pages; it is rebuilt on pull.
+  ["configs/man"]="index.db"
   # Jellyfin mpv shim stores server credentials here.
   ["configs/jellyfin-mpv-shim"]="cred.json"
   # Electron apps: only settings/Prefs are worth keeping, not the caches.

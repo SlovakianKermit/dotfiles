@@ -5,7 +5,8 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=OPENAI_BASE_URL=https://api.deepseek.com/v1
-Environment=OPENAI_API_KEY=REDACTED_ROTATE_ME
+# The API key lives outside the unit so this file can be synced to the repo.
+EnvironmentFile=%h/.config/supermemory/env
 Environment=OPENAI_MODEL=deepseek-v4-flash
 # Listen on all interfaces so the laptop can reach it over Tailscale.
 # Access is limited to the tailnet by the ufw rule for port 6767.
