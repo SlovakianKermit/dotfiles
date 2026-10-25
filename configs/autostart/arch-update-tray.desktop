@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Cachy-Update Systray Applet
+Comment=Disable system-wide Cachy-Update tray autostart
+Type=Application
+Exec=/bin/sh -c "sleep 3 && arch-update --tray"
+Hidden=true

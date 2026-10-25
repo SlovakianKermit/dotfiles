@@ -1,4 +1,4 @@
-.TH DOTFILES-SYNC 1 "2026-10-16" "dotfiles-sync" "User Commands"
+.TH DOTFILES-SYNC 1 "2026-10-25" "dotfiles-sync" "User Commands"
 .SH NAME
 dotfiles-sync \- push and pull dotfiles, configs, scripts, and packages via Git
 .SH SYNOPSIS
@@ -82,11 +82,20 @@ with
 Some noisy subdirectories are excluded (see
 .BR FILES ).
 .IP \(bu 2
-Copies copy-only configs (Electron apps, KDE globals) into
-.IR configs/ .
+Copies copy-only configs (Electron apps, KDE, systemd user units,
+autostart entries, desktop launchers, theming, audio) into
+.IR configs/ ,
+and the single-file home dotfiles
+.RB ( .gitconfig ", " .bashrc ", " .zshrc ", " .gtkrc\-2.0 )
+into
+.IR dotfiles/home/ .
 .IP \(bu 2
 Commits with the supplied message (default:
-"chore: sync dotfiles YYYY-MM-DD HH:MM") and pushes to the remote.
+"chore: sync dotfiles YYYY-MM-DD HH:MM"), then runs
+.B git pull \-\-rebase
+before pushing, so a commit made on another machine can never leave the
+sync half-applied. An unmergeable divergence aborts with an error instead
+of pushing.
 .RE
 .TP
 .B pull " [\fIflags\fR]"
@@ -125,14 +134,22 @@ are skipped automatically and logged to
 .IR skipped-hardware.txt .
 .IP \(bu 2
 Restores scripts to
-.IR ~/.local/bin .
+.I ~/.local/bin
+with
+.BR "rsync \-\-delete" ,
+so a script deleted from the repo is also removed from the live directory.
+Scripts are made executable with
+.BR find
+on regular files only. Excluded paths
+.RB ( VR*CyberDeck* ", " *.AppImage )
+are shielded from deletion, so the portable app survives a pull.
 .IP \(bu 2
 Creates symlinks for all dotfile targets, backing up any existing
 real file or directory to a timestamped
 .IB name .bak.YYYYMMDD-HHMMSS .
 .IP \(bu 2
 Copies copy-only configs back to their original locations (same backup
-behaviour as symlinks).
+behaviour as symlinks), merging directory contents rather than nesting them.
 .IP \(bu 2
 Runs
 .B mandb \-u ~/.local/share/man
@@ -176,14 +193,67 @@ Git working tree with the following layout:
 .RS
 .TP
 .I dotfiles/
-Symlink targets (Alacritty, fish, Ghostty, Neovim, qBittorrent, Podman/Quadlet
-units, etc.)
+Symlink targets (Alacritty, btop, container/Quadlet units, fastfetch, fish,
+Ghostty, Haruna, MangoHud, mpv, Neovim, qBittorrent, XnView MP, etc.)
+.TP
+.I dotfiles/home/
+Single-file home dotfiles restored to
+.IR "$HOME" :
+.BR .gitconfig ", " .bashrc ", " .bash_profile ", " .bash_logout ", "
+.BR .zshrc ", " .gtkrc\-2.0 .
 .TP
 .I configs/
-Copied configs (Brave, Discord, Dolphin, easyeffects, KDE, Obsidian, Sunshine)
+Copied configs. KDE and per-app configs live in subdirectories; individual
+files such as
+.I dolphinrc
+and
+.I katerc
+sit at the top.
 .TP
 .I configs/kde/
-Individual KDE config files
+Individual KDE config files:
+.BR kdeglobals ", " kglobalshortcutsrc ", " kwinrc ", " kwinrulesrc ", "
+.BR kcminputrc ", " kscreenlockerrc ", " powerdevilrc ", "
+.BR powermanagementprofilesrc ", " mimeapps.list .
+.TP
+.I configs/autostart/
+Session autostart entries from
+.IR ~/.config/autostart .
+.TP
+.I configs/systemd/
+User units and timers from
+.IR ~/.config/systemd/user ,
+including
+.I *.wants
+enablement symlinks.
+.TP
+.I configs/applications/
+Hand-written desktop launchers from
+.IR ~/.local/share/applications .
+Wine-generated entries and
+.I mimeinfo.cache
+are excluded.
+.TP
+.I configs/color-schemes/
+KDE colour schemes referenced by
+.IR kdeglobals .
+.TP
+.I configs/gtk\-3.0/ ", " configs/gtk\-4.0/
+GTK theme CSS written by the KDE GTK-configurator.
+.TP
+.I configs/pipewire/ ", " configs/wireplumber/
+PipeWire and WirePlumber drop-in configs (EQ, Bluetooth codec policy).
+.TP
+.I configs/micro/
+micro settings and keybindings only; the 650K upstream
+.I syntax/
+tree is excluded.
+.TP
+.I configs/obsidian/
+Only
+.IR obsidian.json ,
+the vault list. The rest of that directory is Electron state and is
+no longer mirrored.
 .TP
 .I configs/man/
 Custom man pages from
@@ -211,17 +281,59 @@ Every
 skips
 \fB*.bak\fR,
 \fB*.bak.*\fR,
+\fB*.bak\-*\fR,
+\fB*.asar\fR,
 \fB__pycache__/\fR
 and
 \fB*.pyc\fR.
-The scripts sync also uses
+On the push mirror this is combined with
 .B \-\-delete\-excluded
-to purge such files from an already-mirrored
-.IR scripts/ .
+so previously mirrored copies are purged from the repository. The pull
+restore deliberately omits
+.B \-\-delete\-excluded
+(it uses plain
+.BR \-\-delete ),
+which protects excluded paths on the live side.
 Machine-specific runtime state such as
 .I dotfiles/mpv/window-state.json
 is kept out through the repository
 .IR .gitignore .
+.TP
+.I Per-path excludes
+The following paths carry their own exclude list on top of the globals:
+.RS
+.IP \(bu 2
+.I dotfiles/xnviewmp
+\(en
+.BR Thumb.db ", " XnView.db ", " XnView\-*.db ,
+SQLite sidecars. The thumbnail cache alone is several gigabytes.
+.IP \(bu 2
+.I configs/copyparty ", " configs/kdeconnect ", " configs/jellyfin\-mpv\-shim
+\(en keys, salts, session state and server credentials (see
+.BR SECRETS ).
+.IP \(bu 2
+.I configs/vesktop ", " configs/legcord ", " configs/discord ", " configs/brave
+\(en Electron
+.BR Cache/ ", " Code*Cache/ ", " GPUCache/ ", " Service*Worker/ ", "
+.BR Local*Storage/ ", " sessionData/ ;
+only settings and preferences are kept.
+.IP \(bu 2
+.I configs/applications
+\(en
+.BR wine/ ", " wine\-*.desktop ", " discord\-*.desktop ", " mimeinfo.cache .
+.IP \(bu 2
+.I configs/opencode
+\(en
+.BR node_modules/ ", " auth.json ,
+lockfiles.
+.IP \(bu 2
+.I configs/micro
+\(en
+.BR syntax/ ", " buffers/ .
+.RE
+.TP
+.I ~/.config/gallery-dl/
+Not synced at all: its config carries a session cookie for Pixiv.
 .TP
 .I Script source excludes
 The scripts sync from
@@ -254,6 +366,42 @@ is used.
 On push, the following are excluded and do not reach the repo:
 .BR BT_backup/ ", " logs/ ", " rss/ ", " search/ ", " GeoIP/ ", "
 .BR qBittorrent.conf ", " qBittorrent-data.conf .
+.SH SECRETS
+The repository is private but is still treated as untrusted. These are never
+committed, enforced twice: by an
+.B rsync
+exclude and by a matching
+.I .gitignore
+entry.
+.IP \(bu 2
+.I configs/copyparty/cert.pem
+\(en TLS private key.
+.IP \(bu 2
+.IR configs/copyparty/{ah,dk,fk}\-salt.txt ", " iphash ", " sessions.db
+\(en password salts and live sessions.
+.IP \(bu 2
+.IR configs/kdeconnect/{certificate,privateKey}.pem
+\(en device identity; regenerate per machine by pairing again.
+.IP \(bu 2
+.I configs/jellyfin\-mpv\-shim/cred.json
+\(en Jellyfin server token.
+.IP \(bu 2
+.I configs/opencode/auth.json
+\(en provider API credentials.
+.IP \(bu 2
+.I ~/.config/aur\-review/key
+\(en reviewer API key; that path is not part of any sync list.
+.IP \(bu 2
+.I ~/.ssh/
+\(en never synced. Keep a sanitized
+.I config.example
+in the repo by hand if you want the host layout backed up.
+.P
+Not affected by the above: the synced
+.I ~/.local/share/man
+tree and
+.I ~/.config/opencode
+skills contain documentation only, no keys.
 .SH EXAMPLES
 .TP
 dotfiles-sync.sh setup

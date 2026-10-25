@@ -1,25 +1,46 @@
+# ---------------------------------------------------------------------------
+# Never commit these — local backups, caches, and application state
+# ---------------------------------------------------------------------------
+*.bak
+*.bak.*
+*.bak-*
+*.pyc
+__pycache__/
+*.asar
+dotfiles/mpv/window-state.json
+
+# ---------------------------------------------------------------------------
+# Secrets: keys, salts, session tokens, credentials
+# ---------------------------------------------------------------------------
+configs/copyparty/cert.pem
+configs/copyparty/*-salt.txt
+configs/copyparty/iphash
+configs/copyparty/sessions.db
+configs/copyparty/sessions.db.lock
+configs/kdeconnect/certificate.pem
+configs/kdeconnect/privateKey.pem
+configs/opencode/auth.json
+configs/jellyfin-mpv-shim/cred.json
+configs/gallery-dl/
+dotfiles/home/ssh/
+
+# ---------------------------------------------------------------------------
+# Electron apps: only the small hand-editable config is synced
+# ---------------------------------------------------------------------------
 configs/brave/
 configs/discord/
 configs/legcord/
 configs/vesktop/
 configs/sunshine/
 configs/BraveSoftware/
-dotfiles/xnviewmp/Thumb.db
-dotfiles/xnviewmp/XnView.db
-dotfiles/qBittorrent/lockfile
-configs/obsidian/IndexedDB/
-configs/obsidian/Cache/
-configs/obsidian/Code Cache/
-configs/obsidian/GPUCache/
-configs/obsidian/DawnGraphiteCache/
-configs/obsidian/DawnWebGPUCache/
-configs/obsidian/Session Storage/
-configs/obsidian/Local Storage/
-dotfiles/xnviewmp/XnView-*.db
 
-# Local backups and runtime caches (never sync these)
-*.bak
-*.bak.*
-*.pyc
-__pycache__/
-dotfiles/mpv/window-state.json
+# Obsidian: obsidian.json (vault list) only — the rest is Electron state
+configs/obsidian/*
+!configs/obsidian/obsidian.json
+
+# ---------------------------------------------------------------------------
+# Large generated databases / caches
+# ---------------------------------------------------------------------------
+dotfiles/xnviewmp/Thumb.db
+dotfiles/xnviewmp/*.db
+dotfiles/qBittorrent/lockfile

@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=pkg-install
+Exec=ghostty -e bash $HOME/.local/bin/pkg-install
+Type=Application

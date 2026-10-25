@@ -1,0 +1,6 @@
+[Unit]
+Description=netmon WAN/mesh sample
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/netmon.sh

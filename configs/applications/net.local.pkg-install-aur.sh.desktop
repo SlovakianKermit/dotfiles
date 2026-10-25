@@ -1,0 +1,7 @@
+[Desktop Entry]
+Exec=/home/killian/.local/bin/pkg-install-aur.sh
+Name=pkg-install-aur
+NoDisplay=true
+StartupNotify=false
+Type=Application
+X-KDE-GlobalAccel-CommandShortcut=true

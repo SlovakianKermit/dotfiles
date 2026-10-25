@@ -1,0 +1,6 @@
+[Unit]
+Description=Rename finished persepolis downloads
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/persepolis-rename.py

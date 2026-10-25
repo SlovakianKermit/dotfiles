@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Risk of Rain 2
+Comment=Play this game on Steam
+Exec=steam steam://rungameid/632360
+Icon=steam_icon_632360
+Terminal=false
+Type=Application
+Categories=Game;

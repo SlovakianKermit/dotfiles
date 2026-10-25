@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Deadlock Mod Manager
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/dlmm;x-scheme-handler/deadlock-modmanager;x-scheme-handler/deadlock-mod-manager
+Exec="/usr/bin/deadlock-modmanager" %u

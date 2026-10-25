@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the shared NTFS trash for changes
+StartLimitIntervalSec=0
+
+[Path]
+PathChanged=/mnt/shared/.Trash-1000/info
+
+[Install]
+WantedBy=default.target

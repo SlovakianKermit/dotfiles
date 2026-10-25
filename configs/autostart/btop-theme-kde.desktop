@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=btop theme sync
+Comment=Regenerate btop theme from active KDE color scheme
+Exec=/home/killian/.local/bin/btop-theme-kde
+X-KDE-autostart-phase=1
+Terminal=false

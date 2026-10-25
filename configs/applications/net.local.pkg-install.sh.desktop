@@ -1,0 +1,7 @@
+[Desktop Entry]
+Exec=/home/killian/.local/bin/pkg-install.sh
+Name=pkg-install
+NoDisplay=true
+StartupNotify=false
+Type=Application
+X-KDE-GlobalAccel-CommandShortcut=true

@@ -1,0 +1,8 @@
+[Keyboard]
+RepeatDelay=280
+RepeatRate=50
+
+[Libinput][13652][62933][CX 2.4G Wireless Receiver Mouse]
+PointerAcceleration=-0.600
+ScrollFactor=1
+ScrollMethod=4

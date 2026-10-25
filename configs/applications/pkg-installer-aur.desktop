@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=pkg-install-aur
+Exec=ghostty -e bash $HOME/.local/bin/pkg-install-aur
+Type=Application

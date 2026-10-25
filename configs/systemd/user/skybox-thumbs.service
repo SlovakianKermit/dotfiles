@@ -1,0 +1,11 @@
+[Unit]
+Description=Generate SKYBOX sidecar thumbnails for /mnt/shared/VR
+ConditionPathIsDirectory=/mnt/shared/VR
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/skybox-thumbs --quiet -j 1 --timeout 180 /mnt/shared/VR
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+TimeoutStartSec=2h

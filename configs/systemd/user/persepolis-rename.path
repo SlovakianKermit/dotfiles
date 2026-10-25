@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch persepolis download dirs for finished files
+
+[Path]
+PathChanged=/home/killian/Downloads/Persepolis
+PathChanged=/home/killian/Downloads/Persepolis/Videos
+PathChanged=/home/killian/Downloads/Persepolis/Compressed
+PathChanged=/home/killian/Downloads/Persepolis/Audios
+PathChanged=/home/killian/Downloads/Persepolis/Documents
+PathChanged=/home/killian/Downloads/Persepolis/Others
+
+[Install]
+WantedBy=default.target

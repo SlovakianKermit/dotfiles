@@ -26,7 +26,26 @@ GITHUB_REPO="https://github.com/SlovakianKermit/dotfiles.git"
 
 declare -A RSYNC_EXCLUDES=(
   ["dotfiles/qBittorrent"]="BT_backup/ logs/ rss/ search/ GeoIP/ qBittorrent.conf qBittorrent-data.conf"
-  ["configs/opencode"]="node_modules/ package.json package-lock.json bun.lock .gitignore"
+  # XnView MP keeps a multi-gigabyte thumbnail cache and databases in this dir.
+  ["dotfiles/xnviewmp"]="Thumb.db XnView.db XnView-*.db *.db-wal *.db-shm"
+  # auth.json holds provider credentials; never commit it.
+  ["configs/opencode"]="node_modules/ package.json package-lock.json bun.lock .gitignore auth.json"
+  # Copyparty: TLS private key, password salts and session state.
+  ["configs/copyparty"]="cert.pem *-salt.txt iphash sessions.db sessions.db.lock"
+  # KDE Connect: device identity, must be regenerated per machine.
+  ["configs/kdeconnect"]="certificate.pem privateKey.pem"
+  # Custom launchers: wine registration noise and generated caches.
+  ["configs/applications"]="wine/ wine-*.desktop discord-*.desktop mimeinfo.cache mimeapps.list"
+  # micro ships 650K of upstream syntax files; only the user config matters.
+  ["configs/micro"]="syntax/ buffers/"
+  # Jellyfin mpv shim stores server credentials here.
+  ["configs/jellyfin-mpv-shim"]="cred.json"
+  # Electron apps: only settings/Prefs are worth keeping, not the caches.
+  # NB: patterns are word-split on spaces, so multi-word dirs use a glob.
+  ["configs/vesktop"]="sessionData/ Cache/ Code*Cache/ GPUCache/ DawnGraphiteCache/ DawnWebGPUCache/ Crashpad/ logs/ Service*Worker/ Local*Storage/ IndexedDB/ blob_storage/"
+  ["configs/legcord"]="sessionData/ Cache/ Code*Cache/ GPUCache/ DawnGraphiteCache/ DawnWebGPUCache/ Crashpad/ logs/ Service*Worker/ Local*Storage/ IndexedDB/ blob_storage/"
+  ["configs/discord"]="Cache/ Code*Cache/ GPUCache/ DawnGraphiteCache/ DawnWebGPUCache/ Crashpad/ logs/ Service*Worker/ Local*Storage/ IndexedDB/ blob_storage/"
+  ["configs/brave"]="component_crx_cache/ Safe*/ OnDevice*/ ShaderCache/ GrShaderCache/ GraphiteDawnCache/ Default/Cache/ Default/Code*Cache/ Default/GPUCache/ Default/Service*Worker/ Default/Extensions/ Default/IndexedDB/ Default/Local*Storage/"
   # ~/.local/bin is the scripts source; large portable apps (e.g. VR CyberDeck,
   # run from this dir) must never be swept into the repo. NB: patterns cannot
   # contain spaces (the list is word-split), hence the glob.
@@ -38,6 +57,7 @@ declare -A RSYNC_EXCLUDES=(
 GLOBAL_EXCLUDES=(
   "*.bak"
   "*.bak.*"
+  "*.bak-*"
   "__pycache__/"
   "*.pyc"
 )
@@ -52,11 +72,8 @@ SYMLINKS=(
   "${HOME}/.config/MangoHud:dotfiles/MangoHud"
   "${HOME}/.config/mpv:dotfiles/mpv"
   "${HOME}/.config/qBittorrent:dotfiles/qBittorrent"
-  "${HOME}/.config/yt-dlp:dotfiles/yt-dlp"
   "${HOME}/.config/fish:dotfiles/fish"
   "${HOME}/.config/xnviewmp:dotfiles/xnviewmp"
-  "${HOME}/.config/QOwnNotes:dotfiles/QOwnNotes"
-  "${HOME}/.config/ripgrep:dotfiles/ripgrep"
   "${HOME}/.config/containers:dotfiles/containers"
 )
 
@@ -67,23 +84,54 @@ SYMLINKS=(
 # ============================================================
 
 COPIES=(
+  # --- home dotfiles (single files) ---
+  "${HOME}/.gitconfig:dotfiles/home/gitconfig"
+  "${HOME}/.bashrc:dotfiles/home/bashrc"
+  "${HOME}/.bash_profile:dotfiles/home/bash_profile"
+  "${HOME}/.bash_logout:dotfiles/home/bash_logout"
+  "${HOME}/.zshrc:dotfiles/home/zshrc"
+  "${HOME}/.gtkrc-2.0:dotfiles/home/gtkrc-2.0"
+  # --- KDE ---
+  "${HOME}/.config/kdeglobals:configs/kde/kdeglobals"
+  "${HOME}/.config/kglobalshortcutsrc:configs/kde/kglobalshortcutsrc"
+  "${HOME}/.config/kwinrc:configs/kde/kwinrc"
+  "${HOME}/.config/kwinrulesrc:configs/kde/kwinrulesrc"
+  "${HOME}/.config/kcminputrc:configs/kde/kcminputrc"
+  "${HOME}/.config/kscreenlockerrc:configs/kde/kscreenlockerrc"
+  "${HOME}/.config/powerdevilrc:configs/kde/powerdevilrc"
+  "${HOME}/.config/powermanagementprofilesrc:configs/kde/powermanagementprofilesrc"
+  "${HOME}/.config/mimeapps.list:configs/kde/mimeapps.list"
+  # --- session / autostart / user services ---
+  "${HOME}/.config/autostart:configs/autostart"
+  "${HOME}/.config/systemd:configs/systemd"
+  "${HOME}/.local/share/applications:configs/applications"
+  # --- theming and audio ---
+  "${HOME}/.local/share/color-schemes:configs/color-schemes"
+  "${HOME}/.config/gtk-3.0:configs/gtk-3.0"
+  "${HOME}/.config/gtk-4.0:configs/gtk-4.0"
+  "${HOME}/.config/pipewire:configs/pipewire"
+  "${HOME}/.config/wireplumber:configs/wireplumber"
+  # --- app configs ---
   "${HOME}/.config/easyeffects:configs/easyeffects"
   "${HOME}/.config/dolphinrc:configs/dolphinrc"
   "${HOME}/.config/katerc:configs/katerc"
   "${HOME}/.local/share/konsole:configs/konsole"
-  "${HOME}/.config/obsidian:configs/obsidian"
+  "${HOME}/.config/obsidian/obsidian.json:configs/obsidian/obsidian.json"
   "${HOME}/.config/kdeconnect:configs/kdeconnect"
   "${HOME}/.config/sunshine:configs/sunshine"
   "${HOME}/.config/copyparty:configs/copyparty"
-  "${HOME}/.config/kdeglobals:configs/kde/kdeglobals"
-  "${HOME}/.config/kglobalshortcutsrc:configs/kde/kglobalshortcutsrc"
+  "${HOME}/.config/aria2:configs/aria2"
+  "${HOME}/.config/jellyfin-mpv-shim:configs/jellyfin-mpv-shim"
+  "${HOME}/.config/micro:configs/micro"
   "${HOME}/.local/share/man:configs/man"
   "${HOME}/.config/opencode:configs/opencode"
 )
 
 ELECTRON_COPIES=(
-  "${HOME}/.config/discord:configs/discord"
-  "${HOME}/.config/legcord:configs/legcord"
+  # Discord and Legcord are not installed on this machine; uncomment when they
+  # are (nothing is pushed for a missing source anyway).
+  # "${HOME}/.config/discord:configs/discord"
+  # "${HOME}/.config/legcord:configs/legcord"
   "${HOME}/.config/vesktop:configs/vesktop"
   "${HOME}/.config/BraveSoftware:configs/brave"
 )
@@ -123,8 +171,6 @@ die()   { echo -e "\033[1;31m[error]\033[0m $*" >&2; exit 1; }
 require() {
   command -v "$1" &>/dev/null || die "Required command not found: $1"
 }
-
-is_dry_run()  { $DRY_RUN; }
 
 # Build the rsync --exclude arguments for a repo-relative destination path:
 # the global backups/caches list plus any path-specific patterns.
@@ -297,6 +343,7 @@ cmd_push() {
 
   require git
   require pacman
+  require rsync
 
   [[ -d "${REPO_DIR}/.git" ]] || die "Repo not found at ${REPO_DIR}. Run setup first."
 
@@ -330,11 +377,11 @@ cmd_push() {
     script_excludes="$(rsync_exclude_args scripts)"
     if $DRY_RUN; then
       log "Would rsync: ~/.local/bin/ -> scripts/${script_excludes}"
-    elif rsync -a --delete --delete-excluded ${script_excludes} "${HOME}/.local/bin/" "${REPO_DIR}/scripts/" 2>/dev/null; then
+    elif rsync -a --delete --delete-excluded ${script_excludes} "${HOME}/.local/bin/" "${REPO_DIR}/scripts/"; then
       ok "Scripts synced."
     else
       warn "rsync failed, falling back to cp: ~/.local/bin"
-      cp -r "${HOME}/.local/bin/." "${REPO_DIR}/scripts/" 2>/dev/null || true
+      cp -a "${HOME}/.local/bin/." "${REPO_DIR}/scripts/" 2>/dev/null || true
       ok "Scripts copied (fallback)."
     fi
   else
@@ -355,11 +402,11 @@ cmd_push() {
       rsync_excludes="$(rsync_exclude_args "${entry##*:}")"
       if $DRY_RUN; then
         log "Would rsync: ${src} -> ${dest}${rsync_excludes}"
-      elif rsync -a --delete ${rsync_excludes} "${src%/}/" "${dest}/" 2>/dev/null; then
+      elif rsync -a --delete --delete-excluded ${rsync_excludes} "${src%/}/" "${dest}/"; then
         ok "Synced: ${src}"
       else
         warn "rsync failed, falling back to cp: ${src}"
-        cp -r "${src}" "${dest}"
+        cp -a "${src%/}/." "${dest}/"
         ok "Copied: ${src} (fallback)"
       fi
     else
@@ -381,10 +428,10 @@ cmd_push() {
       local rsync_excludes
       rsync_excludes="$(rsync_exclude_args "${entry##*:}")"
       if [[ -d "${src}" ]]; then
-        rsync -a --delete ${rsync_excludes} "${src%/}/" "${dest}/" 2>/dev/null ||
-          cp -r "${src}" "${dest}"
+        rsync -a --delete --delete-excluded ${rsync_excludes} "${src%/}/" "${dest}/" ||
+          cp -a "${src%/}/." "${dest}/"
       else
-        cp "${src}" "${dest}"
+        cp -a "${src}" "${dest}"
       fi
       ok "Copied: ${src}"
     else
@@ -405,9 +452,14 @@ cmd_push() {
     ok "Nothing to commit, already up to date."
   else
     git commit -m "${msg}"
-    git push
-    ok "Pushed to GitHub."
   fi
+  # Rebase onto anything pushed from another machine before pushing, so a
+  # non-fast-forward can never leave the sync half-applied.
+  if ! git pull --rebase --no-edit --quiet; then
+    git rebase --abort 2>/dev/null || true
+    die "Could not rebase onto origin; resolve the divergence in ${REPO_DIR} and re-run push."
+  fi
+  git push && ok "Pushed to GitHub."
 }
 
 # ============================================================
@@ -416,6 +468,7 @@ cmd_push() {
 
 cmd_pull() {
   require git
+  require rsync
 
   [[ -d "${REPO_DIR}/.git" ]] || die "Repo not found at ${REPO_DIR}. Run setup first."
 
@@ -457,11 +510,15 @@ cmd_pull() {
   log "Restoring scripts..."
   if [[ -d "${REPO_DIR}/scripts" ]]; then
     mkdir -p "${HOME}/.local/bin"
+    local restore_excludes
+    restore_excludes="$(rsync_exclude_args scripts)"
     if $DRY_RUN; then
-      log "Would restore scripts to ~/.local/bin/"
+      log "Would rsync: scripts/ -> ~/.local/bin/ (pruning removed scripts)${restore_excludes}"
     else
-      cp -r "${REPO_DIR}/scripts/." "${HOME}/.local/bin/"
-      chmod +x "${HOME}/.local/bin/"* 2>/dev/null || true
+      # Plain --delete (not --delete-excluded): excluded paths such as the VR
+      # CyberDeck portable app are protected from deletion on the live side.
+      rsync -a --delete ${restore_excludes} "${REPO_DIR}/scripts/" "${HOME}/.local/bin/"
+      find "${HOME}/.local/bin" -maxdepth 1 -type f -exec chmod +x {} +
       ok "Scripts restored to ~/.local/bin/"
     fi
   else
@@ -510,9 +567,12 @@ cmd_pull() {
 
     mkdir -p "$(dirname "${src}")"
     if [[ -d "${dest}" ]]; then
-      cp -r "${dest}" "${src}"
+      # Merge into the live dir in place: cp -a SRC/. DEST/ avoids the
+      # "dest/name/" nesting that `cp -r SRC DEST` produces on re-runs.
+      mkdir -p "${src}"
+      cp -a "${dest%/}/." "${src}/"
     else
-      cp "${dest}" "${src}"
+      cp -a "${dest}" "${src}"
     fi
     ok "Restored: ${src}"
   done

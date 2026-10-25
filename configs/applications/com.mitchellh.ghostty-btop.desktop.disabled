@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Ghostty (btop)
+GenericName=Terminal (btop)
+Comment=Ghostty running btop, maximized
+Exec=/usr/bin/ghostty --maximize=true --gtk-single-instance=false -e btop
+Icon=com.mitchellh.ghostty
+Terminal=false
+Categories=System;TerminalEmulator;Monitor;
+Keywords=btop;terminal;tty;system;monitor;resources;
+StartupNotify=true
+StartupWMClass=com.mitchellh.ghostty

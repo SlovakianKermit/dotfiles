@@ -1,0 +1,32 @@
+[Unit]
+Description=Supermemory self-hosted memory server
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=OPENAI_BASE_URL=https://api.deepseek.com/v1
+Environment=OPENAI_API_KEY=REDACTED_ROTATE_ME
+Environment=OPENAI_MODEL=deepseek-v4-flash
+# Listen on all interfaces so the laptop can reach it over Tailscale.
+# Access is limited to the tailnet by the ufw rule for port 6767.
+Environment=SUPERMEMORY_HOST=0.0.0.0
+Environment=SUPERMEMORY_EMBEDDING_RAM_LIMIT=512mb
+Environment=SUPERMEMORY_SKIP_EMBEDDING_PREWARM=true
+# Make mimalloc (bundled in the Bun runtime) return freed pages to the OS
+# eagerly instead of holding them at the high-water mark.
+Environment=MIMALLOC_PURGE_DELAY=0
+ExecStart=/home/killian/.supermemory/bin/supermemory-server
+Restart=on-failure
+RestartSec=5
+
+# The on-disk store (~90 MB) is only a small share of the footprint; the bulk is
+# the Bun/JSC + PGlite(WASM) + ONNX runtime, whose memory is grow-only. Apply
+# reclaim pressure above 2G and kill/restart as a safety net above 3G.
+MemoryHigh=2G
+MemoryMax=3G
+# Periodically restart so the retained high-water mark is released. The data
+# lives on disk, so this is lossless and makes RSS track the current need again.
+RuntimeMaxSec=6h
+
+[Install]
+WantedBy=default.target

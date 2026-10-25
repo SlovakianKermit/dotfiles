@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=VR CyberDeck
+Exec="/home/killian/.local/bin/vr-cyberdeck-1.8.7-x86_64.AppImage" --no-sandbox %U
+Terminal=false
+Type=Application
+Icon=vr-cyberdeck-1.8.7-x86_64
+StartupWMClass=VR CyberDeck
+X-AppImage-Version=1.8.7
+Comment=An Electron application with React and TypeScript
+Categories=Utility;
+
+TryExec=/home/killian/.local/bin/vr-cyberdeck-1.8.7-x86_64.AppImage

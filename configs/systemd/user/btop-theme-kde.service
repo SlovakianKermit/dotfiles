@@ -1,0 +1,6 @@
+[Unit]
+Description=Regenerate btop theme from KDE color scheme
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/btop-theme-kde

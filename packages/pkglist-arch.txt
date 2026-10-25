@@ -65,6 +65,7 @@ ggml-vulkan
 ghostty
 gimp
 git
+git-filter-repo
 glances
 glmark2
 gopls

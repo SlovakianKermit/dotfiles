@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Blueman Applet
+Comment=Disable system-wide Blueman applet autostart
+Type=Application
+Exec=blueman-applet
+Hidden=true

@@ -1,0 +1,4 @@
+[Desktop Entry]
+Name=pkg-remove
+Exec=ghostty -e bash $HOME/.local/bin/pkg-remove.sh
+Type=Application

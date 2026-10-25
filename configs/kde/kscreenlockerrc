@@ -1,0 +1,8 @@
+[Daemon]
+LockGrace=900
+
+[Greeter][Wallpaper][org.kde.image][General]
+DynamicMode=2
+Image=file:///usr/share/wallpapers/cachyos-wallpapers/Liquid.png
+PreviewImage=file:///usr/share/wallpapers/cachyos-wallpapers/Liquid.png
+SlidePaths=/home/killian/.local/share/wallpapers/,/usr/share/wallpapers/

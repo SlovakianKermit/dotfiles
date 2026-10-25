@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ghostty (btop)
+Comment=Open Ghostty running btop, maximized, as a normal Ghostty window
+Exec=sh -c "sleep 2; exec /usr/bin/ghostty --maximize=true --gtk-single-instance=false -e btop"
+Icon=com.mitchellh.ghostty
+Terminal=false
+StartupNotify=false
+X-KDE-autostart-phase=2

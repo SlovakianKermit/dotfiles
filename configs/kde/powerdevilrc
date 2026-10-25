@@ -1,0 +1,14 @@
+[AC][Display]
+DimDisplayIdleTimeoutSec=120
+TurnOffDisplayIdleTimeoutSec=300
+TurnOffDisplayIdleTimeoutWhenLockedSec=20
+
+[AC][RunScript]
+RunScriptIdleTimeoutSec=360000
+
+[AC][SuspendAndShutdown]
+AutoSuspendAction=0
+PowerButtonAction=8
+
+[Inhibitions]
+BlockedInhibitions=vlc:Playing some media.

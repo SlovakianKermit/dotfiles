@@ -1,0 +1,7 @@
+[Unit]
+Description=Sync KDE trashrc Empty flag with the real trash state
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/trashsync
