@@ -134,8 +134,9 @@ ELECTRON_COPIES=(
   # are (nothing is pushed for a missing source anyway).
   # "${HOME}/.config/discord:configs/discord"
   # "${HOME}/.config/legcord:configs/legcord"
+  # Vesktop settings only: sessionData/ and the caches are excluded, leaving
+  # settings.json, state.json and themes/ (about 30K).
   "${HOME}/.config/vesktop:configs/vesktop"
-  "${HOME}/.config/BraveSoftware:configs/brave"
 )
 
 # ============================================================

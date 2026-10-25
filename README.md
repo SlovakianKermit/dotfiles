@@ -161,16 +161,15 @@ dotfiles-sync pull
 | `~/.config/aria2/` | aria2 downloader |
 | `~/.config/jellyfin-mpv-shim/` | Jellyfin mpv shim (credentials excluded) |
 | `~/.config/micro/` | micro settings and keybindings |
-| `~/.config/vesktop/` | Vesktop settings (caches excluded) |
-| `~/.config/BraveSoftware/` | Brave profile (caches excluded) |
+| `~/.config/vesktop/` | Vesktop settings, themes and custom CSS (session/caches excluded) |
 
 ### Not synced on purpose
 
 `plasma-org.kde.plasma.desktop-appletsrc` (panel layout — faster to redo than to
 debug), `kwinoutputconfig.json` (monitor EDID/layout), Klipper clipboard history,
-`~/.ssh/`, `~/.config/gallery-dl/` (contains a Pixiv session cookie), and every
-`.bak` of anything. `~/.config/sunshine/` is rsynced but gitignored, so it stays
-local.
+`~/.ssh/`, `~/.config/gallery-dl/` (contains a Pixiv session cookie), the Brave
+and Discord profiles (browser/messenger state, not config), and every `.bak` of
+anything. `~/.config/sunshine/` is rsynced but gitignored, so it stays local.
 
 ### Secrets are never committed
 

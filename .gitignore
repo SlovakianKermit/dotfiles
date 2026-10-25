@@ -30,9 +30,7 @@ dotfiles/home/ssh/
 configs/brave/
 configs/discord/
 configs/legcord/
-configs/vesktop/
 configs/sunshine/
-configs/BraveSoftware/
 
 # Obsidian: obsidian.json (vault list) only — the rest is Electron state
 configs/obsidian/*
