@@ -20,6 +20,16 @@ from the first video stream, not from the file name or extension, so a
 that actually contains H.264 is detected correctly and a mislabelled container
 is not mistaken for H.264.
 .P
+Probing an MPEG\-TS over a network mount costs about a second, so the scan is
+deliberately not per file. Captures from one model always share a codec, and
+the model is readable from the file name, so
+.B h264\-sort
+groups the candidates by model, probes at most one file per model in parallel,
+and caches the answer in
+.BR ~/.cache/h264\-sort/codecs.tsv .
+A later run over the same models probes nothing and only moves files. Deleting
+that cache file is always safe; it is rebuilt on demand.
+.P
 Files are moved, never copied, and an existing destination file is never
 overwritten: a numeric suffix
 .RI ( name.1.ext )
@@ -33,6 +43,9 @@ as reported by
 .BR ffprobe (1)
 (default:
 .BR h264 ).
+The cache stores every codec it sees, so switching
+.B \-c
+costs no new probes.
 .TP
 .BI \-t ", " \-\-target " NAME"
 Use
@@ -50,8 +63,18 @@ Also search subdirectories. Each directory that contains matches gets its own
 target subdirectory; the target directories themselves are pruned and never
 searched.
 .TP
+.BI \-j ", " \-\-jobs " N"
+Probe
+.I N
+models concurrently (default: 4). Only matters on a cold cache.
+.TP
+.BR \-R ", " \-\-refresh
+Probe every model found in this run again and update the cache, ignoring what
+is already stored. Cached models that are not part of this run are kept.
+.TP
 .BR \-n ", " \-\-dry\-run
-Print what would be moved without changing anything on disk.
+Print what would be moved without changing anything on disk. New probe results
+are still cached.
 .TP
 .BR \-h ", " \-\-help
 Show usage and exit.
@@ -76,18 +99,41 @@ Only these extensions are considered, case\-insensitively:
 Without
 .B \-r
 only the top level of each directory is scanned.
+.SS Model grouping
+A model is the file name prefix in front of the capture timestamp,
+.IR _YYYY-MM-DD_HH-MM-SS_mmm .
+Model names may contain underscores and the separator may be one or two of
+them, so the timestamp is matched rather than splitting on
+.BR _ :
+.B maye_wells__2026-10-22_18-45-04_225.ts
+and
+.B nikoru_sp_2026-10-23_13-06-41_790.ts
+group as
+.B maye_wells
+and
+.BR nikoru_sp .
+A file without a recognisable timestamp is its own group and is probed
+individually.
 .SS Detection
-Each candidate is probed once with
+The representative file of each unprobed model is run through
 .BR ffprobe (1)
-using
+with
 .B \-select_streams v:0
 and
 .BR \-show_entries stream=codec_name .
 Files with no video stream, unreadable files, and files whose codec does not
-match are counted as skipped and left untouched.
+match are counted as skipped and left untouched. Probe results are written as
+the run proceeds, so interrupting with
+.B Ctrl\-C
+does not lose the models already probed.
 .SS Requirements
 .IP \(bu 2
 .BR ffprobe (1)
+.SH FILES
+.TP
+.B ~/.cache/h264\-sort/codecs.tsv
+Model to codec cache, tab\-separated. Honours
+.BR XDG_CACHE_HOME .
 .SH EXAMPLES
 Preview what would be moved in a media folder:
 .IP
@@ -108,10 +154,17 @@ h264\-sort \-r /mnt/data_storage/Good
 .EE
 .P
 Gather HEVC files instead, into a folder named
-.BR hevc :
+.BR hevc ,
+probing eight models at a time:
 .IP
 .EX
-h264\-sort \-c hevc \-t hevc \-r /mnt/data_storage/Good
+h264\-sort \-c hevc \-t hevc \-r \-j 8 /mnt/data_storage/Good
+.EE
+.P
+Re-probe everything, for example after a model changed codec:
+.IP
+.EX
+h264\-sort \-R \-n /mnt/data_storage/vr
 .EE
 .SH EXIT STATUS
 .TP
@@ -123,7 +176,8 @@ failures.
 At least one move failed.
 .TP
 .B 2
-Bad usage (no directory or file given).
+Bad usage (no directory or file given, invalid
+.BR \-j ).
 .SH SEE ALSO
 .BR ts2mkv (1),
 .BR ffmpeg (1),
