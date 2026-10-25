@@ -194,7 +194,7 @@ Git working tree with the following layout:
 .TP
 .I dotfiles/
 Symlink targets (Alacritty, btop, container/Quadlet units, fastfetch, fish,
-Ghostty, Haruna, MangoHud, mpv, Neovim, qBittorrent, XnView MP, etc.)
+Ghostty, Haruna, MangoHud, mpv, Neovim, qBittorrent, etc.)
 .TP
 .I dotfiles/home/
 Single-file home dotfiles restored to
@@ -303,10 +303,13 @@ is kept out through the repository
 The following paths carry their own exclude list on top of the globals:
 .RS
 .IP \(bu 2
-.I dotfiles/xnviewmp
+.I configs/xnviewmp
 \(en
-.BR Thumb.db ", " XnView.db ", " XnView\-*.db ,
-SQLite sidecars. The thumbnail cache alone is several gigabytes.
+.BR Thumb.db ", " *.db ,
+SQLite sidecars. The thumbnail cache is several gigabytes and the image
+database is user data, so only the ini/layout files are synced. This is why
+XnView MP is copied rather than symlinked: a symlink would make the application
+write its cache straight into the Git working tree.
 .IP \(bu 2
 .I configs/copyparty ", " configs/kdeconnect ", " configs/jellyfin\-mpv\-shim
 \(en keys, salts, session state and server credentials (see

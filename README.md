@@ -123,7 +123,6 @@ dotfiles-sync pull
 | `~/.config/MangoHud/` | MangoHud overlay |
 | `~/.config/mpv/` | mpv media player |
 | `~/.config/qBittorrent/` | qBittorrent |
-| `~/.config/xnviewmp/` | XnView MP image browser |
 | `~/.config/haruna/` | Haruna media player |
 | `~/.config/containers/` | Podman / Quadlet units |
 
@@ -153,6 +152,7 @@ dotfiles-sync pull
 | `~/.config/easyeffects/` | EasyEffects EQ profiles |
 | `~/.config/dolphinrc` | Dolphin file manager |
 | `~/.config/katerc` | Kate editor |
+| `~/.config/xnviewmp/` | XnView MP settings, layouts and key map (thumbnail cache and image DB stay local) |
 | `~/.local/share/konsole/` | Konsole profiles |
 | `~/.config/obsidian/obsidian.json` | Obsidian vault list (nothing else) |
 | `~/.config/kdeconnect/` | KDE Connect (device keys excluded) |
@@ -168,11 +168,12 @@ dotfiles-sync pull
 `plasma-org.kde.plasma.desktop-appletsrc` (panel layout — faster to redo than to
 debug), `kwinoutputconfig.json` (monitor EDID/layout), Klipper clipboard history,
 `~/.ssh/`, `~/.config/gallery-dl/` (contains a Pixiv session cookie), the Brave
-and Discord profiles (browser/messenger state, not config), and every `.bak` of
-anything. `~/.config/sunshine/` is rsynced but gitignored, so it stays local.
+and Discord profiles (browser/messenger state, not config), XnView's
+`Thumb.db` (6 GB thumbnail cache) and `XnView.db` (image categories/ratings),
+and every `.bak` of anything. `~/.config/sunshine/` is rsynced but gitignored,
+so it stays local.
 
 ### Secrets are never committed
-
 `rsync` excludes **and** `.gitignore` both block: the Copyparty TLS key, salts,
 `iphash` and session DB; the KDE Connect certificate and private key; Jellyfin
 `cred.json`; opencode `auth.json`. `~/.config/aur-review/key` is outside every
