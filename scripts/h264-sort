@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# h264-sort — move H.264/AVC videos in a directory into an "h.264" subdirectory.
+#
+# Codec detection uses ffprobe on the first video stream, so it does not trust
+# file extensions (a .mkv can hold either codec). Files are moved, not copied.
+set -euo pipefail
+
+CODEC="h264"
+TARGET=""
+RECURSE=0
+DRY=0
+declare -a args=()
+
+EXTS=(mkv mp4 mov m4v avi ts mts m2ts webm flv wmv mpg mpeg ogv 3gp)
+
+die() { printf 'h264-sort: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+Usage: h264-sort [OPTIONS] DIR|FILE...
+
+Move every H.264/AVC video found in each directory into a subdirectory of that
+directory (default: h.264). Detection is by ffprobe on the first video stream,
+not by file extension, so mislabelled containers are handled correctly.
+
+Options:
+  -c, --codec CODEC   ffprobe codec_name to collect (default: h264)
+  -t, --target NAME   Subdirectory name (default: h.264, or CODEC if -c given)
+  -r, --recursive     Also search subdirectories (target dir itself is skipped)
+  -n, --dry-run       Print what would be moved, change nothing
+  -h, --help          Show this help and exit
+
+Existing files are never overwritten: a numeric suffix is added instead.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--codec)    [[ $# -ge 2 ]] || die "-c needs an argument"; CODEC="$2"; shift 2 ;;
+    -t|--target)   [[ $# -ge 2 ]] || die "-t needs an argument"; TARGET="$2"; shift 2 ;;
+    -r|--recursive) RECURSE=1; shift ;;
+    -n|--dry-run)  DRY=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    --)            shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
+    -*)            usage >&2; die "unknown option: $1" ;;
+    *)             args+=("$1"); shift ;;
+  esac
+done
+
+[[ ${#args[@]} -gt 0 ]] || { usage >&2; exit 2; }
+command -v ffprobe >/dev/null 2>&1 || die "ffprobe not found"
+
+# Default target name: "h.264" for H.264, otherwise the codec name itself.
+if [[ -z "$TARGET" ]]; then
+  if [[ "$CODEC" == "h264" ]]; then TARGET="h.264"; else TARGET="$CODEC"; fi
+fi
+
+probe_codec() {
+  ffprobe -v error -select_streams v:0 \
+    -show_entries stream=codec_name -of default=nw=1:nk=1 \
+    -- "$1" 2>/dev/null | head -n1 || true
+}
+
+# find(1) expression matching our extensions, built once.
+declare -a ext_expr=()
+for e in "${EXTS[@]}"; do
+  [[ ${#ext_expr[@]} -gt 0 ]] && ext_expr+=(-o)
+  ext_expr+=(-iname "*.$e")
+done
+
+# Build the candidate file list.
+declare -a files=()
+for a in "${args[@]}"; do
+  if [[ -d "$a" ]]; then
+    if [[ $RECURSE -eq 1 ]]; then
+      while IFS= read -r -d '' p; do files+=("$p"); done < <(
+        find "$a" -mindepth 1 \
+          \( -type d -name "$TARGET" -prune \) -o \
+          -type f \( "${ext_expr[@]}" \) -print0
+      )
+    else
+      while IFS= read -r -d '' p; do files+=("$p"); done < <(
+        find "$a" -mindepth 1 -maxdepth 1 -type f \( "${ext_expr[@]}" \) -print0
+      )
+    fi
+  elif [[ -f "$a" ]]; then
+    files+=("$a")
+  else
+    printf 'h264-sort: skipping (not found): %s\n' "$a" >&2
+  fi
+done
+
+[[ ${#files[@]} -gt 0 ]] || { printf 'h264-sort: no video files found\n'; exit 0; }
+
+moved=0; skipped=0; failed=0
+
+for f in "${files[@]}"; do
+  codec="$(probe_codec "$f")"
+  if [[ "$codec" != "$CODEC" ]]; then
+    skipped=$((skipped+1)); continue
+  fi
+
+  dir="$(dirname "$f")"
+  destdir="$dir/$TARGET"
+  dest="$destdir/$(basename "$f")"
+
+  if [[ -e "$dest" ]]; then
+    stem="${f##*/}"; stem="${stem%.*}"; ext="${f##*/}"; ext="${ext##*.}"
+    n=1
+    while [[ -e "$destdir/$stem.$n.$ext" ]]; do n=$((n+1)); done
+    dest="$destdir/$stem.$n.$ext"
+  fi
+
+  if [[ $DRY -eq 1 ]]; then
+    printf 'would move: %s -> %s\n' "$f" "$dest"
+    moved=$((moved+1)); continue
+  fi
+
+  if [[ ! -d "$destdir" ]]; then
+    mkdir -p "$destdir" || { printf 'FAILED (mkdir): %s\n' "$destdir" >&2; failed=$((failed+1)); continue; }
+  fi
+
+  if mv -f -- "$f" "$dest"; then
+    printf 'moved: %s -> %s\n' "$f" "$dest"
+    moved=$((moved+1))
+  else
+    printf 'FAILED: %s\n' "$f" >&2
+    failed=$((failed+1))
+  fi
+done
+
+printf '\nh264-sort: %d %s, %d not %s, %d failed\n' \
+  "$moved" "$([[ $DRY -eq 1 ]] && echo "to move" || echo moved)" "$skipped" "$CODEC" "$failed"
+[[ $failed -eq 0 ]]

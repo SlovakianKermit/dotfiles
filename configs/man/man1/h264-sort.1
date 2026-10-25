@@ -1,0 +1,132 @@
+.TH H264\-SORT 1 "2026-10-25" "h264-sort" "User Commands"
+.SH NAME
+h264\-sort \- move H.264/AVC videos into an h.264 subdirectory
+.SH SYNOPSIS
+.B h264\-sort
+[\fIOPTIONS\fR] \fIDIR\fR|\fIFILE\fR...
+.SH DESCRIPTION
+.B h264\-sort
+examines the video files in the given directories and moves every file whose
+first video stream is H.264/AVC into a subdirectory of the same directory,
+named
+.B h.264
+by default. Files with any other codec (HEVC, AV1, MPEG\-2, ...) are left where
+they are.
+.P
+The codec is determined with
+.BR ffprobe (1)
+from the first video stream, not from the file name or extension, so a
+.B .mkv
+that actually contains H.264 is detected correctly and a mislabelled container
+is not mistaken for H.264.
+.P
+Files are moved, never copied, and an existing destination file is never
+overwritten: a numeric suffix
+.RI ( name.1.ext )
+is used instead.
+.SH OPTIONS
+.TP
+.BI \-c ", " \-\-codec " CODEC"
+Collect files whose first video stream is
+.I CODEC
+as reported by
+.BR ffprobe (1)
+(default:
+.BR h264 ).
+.TP
+.BI \-t ", " \-\-target " NAME"
+Use
+.I NAME
+as the destination subdirectory instead of
+.BR h.264 .
+The name defaults to
+.B h.264
+when the codec is
+.BR h264 ,
+and to the codec name otherwise.
+.TP
+.BR \-r ", " \-\-recursive
+Also search subdirectories. Each directory that contains matches gets its own
+target subdirectory; the target directories themselves are pruned and never
+searched.
+.TP
+.BR \-n ", " \-\-dry\-run
+Print what would be moved without changing anything on disk.
+.TP
+.BR \-h ", " \-\-help
+Show usage and exit.
+.SH BEHAVIOUR
+.SS Candidate files
+Only these extensions are considered, case\-insensitively:
+.BR mkv ,
+.BR mp4 ,
+.BR mov ,
+.BR m4v ,
+.BR avi ,
+.BR ts ,
+.BR mts ,
+.BR m2ts ,
+.BR webm ,
+.BR flv ,
+.BR wmv ,
+.BR mpg ,
+.BR mpeg ,
+.BR ogv ,
+.BR 3gp .
+Without
+.B \-r
+only the top level of each directory is scanned.
+.SS Detection
+Each candidate is probed once with
+.BR ffprobe (1)
+using
+.B \-select_streams v:0
+and
+.BR \-show_entries stream=codec_name .
+Files with no video stream, unreadable files, and files whose codec does not
+match are counted as skipped and left untouched.
+.SS Requirements
+.IP \(bu 2
+.BR ffprobe (1)
+.SH EXAMPLES
+Preview what would be moved in a media folder:
+.IP
+.EX
+h264\-sort \-n /mnt/data_storage/vr
+.EE
+.P
+Move the H.264 files, leaving HEVC where it is:
+.IP
+.EX
+h264\-sort /mnt/data_storage/vr
+.EE
+.P
+Handle a folder tree, including nested captures:
+.IP
+.EX
+h264\-sort \-r /mnt/data_storage/Good
+.EE
+.P
+Gather HEVC files instead, into a folder named
+.BR hevc :
+.IP
+.EX
+h264\-sort \-c hevc \-t hevc \-r /mnt/data_storage/Good
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+No move failed. Skipped files (not the requested codec) do not count as
+failures.
+.TP
+.B 1
+At least one move failed.
+.TP
+.B 2
+Bad usage (no directory or file given).
+.SH SEE ALSO
+.BR ts2mkv (1),
+.BR ffmpeg (1),
+.BR ffprobe (1)
+.SH AUTHOR
+Written for local use.
