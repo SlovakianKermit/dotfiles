@@ -52,16 +52,16 @@ under the first existing of
 .I /mnt/pve/Data_Storage
 (the Proxmox host, where the files are local) and
 .IR /mnt/data_storage .
-The script is normally run on the Proxmox host; from a workstation use
+The script is normally run on the Proxmox host; from another machine use
 .BR skybox-thumbs-remote (1).
 .P
 On the Proxmox host a systemd timer
 .RI ( skybox-thumbs.timer )
 runs the script every three hours (00:00, 03:00, and so on) with a randomised
 delay of up to 10 minutes. A systemd user timer of the same name does the same
-on the workstation for
+on this desktop for
 .IR /mnt/shared/VR ,
-which is an NTFS disk that only exists there; that timer passes the path
+which is a local NTFS disk attached to this machine; that timer passes the path
 explicitly. The service processes one video at a time at idle
 I/O priority and low CPU weight. It checks for an existing sidecar before
 doing anything else and skips that video, so a run with nothing new only lists
@@ -192,7 +192,7 @@ Regenerate everything in two folders in parallel:
 skybox-thumbs \-\-force \-j 3 /mnt/pve/Data_Storage/vr /mnt/pve/Data_Storage/Good
 .EE
 .P
-Same, from a workstation, over SSH:
+Same, from another machine, over SSH:
 .IP
 .EX
 skybox-thumbs-remote \-\-force \-j 3
@@ -224,7 +224,7 @@ Three-hourly schedule on the Proxmox host (00:00, 03:00, ... with up to 10 minut
 One-shot service running this script with idle I/O priority.
 .TP
 .I ~/.config/systemd/user/skybox-thumbs.timer
-Three-hourly user timer on the workstation for
+Three-hourly user timer on this desktop for
 .IR /mnt/shared/VR .
 .TP
 .I ~/.config/systemd/user/skybox-thumbs.service
