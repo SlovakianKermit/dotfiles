@@ -26,8 +26,9 @@ GITHUB_REPO="https://github.com/SlovakianKermit/dotfiles.git"
 
 declare -A RSYNC_EXCLUDES=(
   ["dotfiles/qBittorrent"]="BT_backup/ logs/ rss/ search/ GeoIP/ qBittorrent.conf qBittorrent-data.conf"
-  # XnView MP keeps a multi-gigabyte thumbnail cache and databases in this dir.
-  ["dotfiles/xnviewmp"]="Thumb.db XnView.db XnView-*.db *.db-wal *.db-shm"
+  # XnView MP: only ini/layout files are config. Thumb.db is a multi-gigabyte
+  # thumbnail cache and XnView.db is user data — both stay on this machine.
+  ["configs/xnviewmp"]="Thumb.db *.db *.db-wal *.db-shm"
   # auth.json holds provider credentials; never commit it.
   ["configs/opencode"]="node_modules/ package.json package-lock.json bun.lock .gitignore auth.json"
   # Copyparty: TLS private key, password salts and session state.
@@ -75,7 +76,6 @@ SYMLINKS=(
   "${HOME}/.config/mpv:dotfiles/mpv"
   "${HOME}/.config/qBittorrent:dotfiles/qBittorrent"
   "${HOME}/.config/fish:dotfiles/fish"
-  "${HOME}/.config/xnviewmp:dotfiles/xnviewmp"
   "${HOME}/.config/containers:dotfiles/containers"
 )
 
@@ -118,6 +118,7 @@ COPIES=(
   "${HOME}/.config/dolphinrc:configs/dolphinrc"
   "${HOME}/.config/katerc:configs/katerc"
   "${HOME}/.local/share/konsole:configs/konsole"
+  "${HOME}/.config/xnviewmp:configs/xnviewmp"
   "${HOME}/.config/obsidian/obsidian.json:configs/obsidian/obsidian.json"
   "${HOME}/.config/kdeconnect:configs/kdeconnect"
   "${HOME}/.config/sunshine:configs/sunshine"
