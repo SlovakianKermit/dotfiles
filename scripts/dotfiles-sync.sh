@@ -474,8 +474,12 @@ cmd_pull() {
 
   log "Pulling latest from GitHub..."
   cd "${REPO_DIR}"
-  git pull
-  ok "Repo up to date."
+  if $DRY_RUN; then
+    log "Would run: git pull"
+  else
+    git pull
+    ok "Repo up to date."
+  fi
 
   # Clear stale failure logs
   : >"${REPO_DIR}/packages/failed.txt"
