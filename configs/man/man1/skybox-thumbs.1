@@ -54,6 +54,15 @@ under the first existing of
 .IR /mnt/data_storage .
 The script is normally run on the Proxmox host; from a workstation use
 .BR skybox-thumbs-remote (1).
+.P
+On the Proxmox host a systemd timer
+.RI ( skybox-thumbs.timer )
+runs the script nightly at 04:00 with a randomised delay of up to 30 minutes.
+The service processes one video at a time at idle I/O priority and low CPU
+weight, and only creates thumbnails that are missing, so a normal run takes
+seconds. New recordings get their sidecar at the next nightly run; run
+.B skybox-thumbs
+manually to cover them sooner.
 .SH OPTIONS
 .TP
 .BI \-j " N, \-\-jobs " N
@@ -197,10 +206,17 @@ invalid.
 .TP
 .I <video>.jpg
 Generated thumbnail, same folder and basename as the video.
+.TP
+.I /etc/systemd/system/skybox-thumbs.timer
+Nightly schedule on the Proxmox host (04:00, up to 30 minutes of jitter).
+.TP
+.I /etc/systemd/system/skybox-thumbs.service
+One-shot service running this script with idle I/O priority.
 .SH SEE ALSO
 .BR skybox-thumbs-remote (1),
 .BR ctbrec-vr (1),
 .BR ctbrec-vr-remote (1),
-.BR ts2mkv (1)
+.BR ts2mkv (1),
+.BR systemd.timer (5)
 .SH AUTHOR
 Written for local use.
