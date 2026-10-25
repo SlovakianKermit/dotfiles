@@ -1,0 +1,206 @@
+.TH SKYBOX-THUMBS 1 "2026-10-25" "skybox-thumbs" "User Commands"
+.SH NAME
+skybox-thumbs \- pre-generate SKYBOX custom thumbnails as sidecar JPEGs
+.SH SYNOPSIS
+.B skybox-thumbs
+[\fIOPTIONS\fR]
+[\fIDIR\fR ...]
+.SH DESCRIPTION
+.B skybox-thumbs
+scans video folders and writes a JPEG next to every video, using the same
+basename with a
+.B .jpg
+extension (for example
+.I clip.ts
+and
+.IR clip.jpg ).
+SKYBOX uses such an image as the custom thumbnail of the video, including
+when the video is reached over SMB, and therefore no longer has to download
+and decode a frame for every file when a folder is opened.
+.P
+This matters most for large VR captures: the 5760\(mu2880 HEVC MPEG-TS files
+in this collection take roughly half a second and tens of megabytes of network
+traffic each to sample on the headset, over hundreds of files. Sidecar images
+are a few kilobytes and are read directly from the share.
+.P
+The sampled frame is taken at
+.B \-\-percent
+of the duration (default 15), clamped to between
+.B \-\-min\-offset
+(default 30 seconds) and
+.B \-\-max\-offset
+(default 600 seconds). Frames are written as 640\(muc0\(mu640
+bounding-box JPEGs at
+.B \-\-quality
+4 (roughly 15\-25 kB each).
+.P
+Seeking in these MPEG-TS captures frequently decodes to a flat grey frame, so
+extraction uses
+.BR ffmpeg (1)
+with
+.B \-skip_frame nokey
+and starts at a keyframe. If the result is suspiciously small (under 4096
+bytes), or extraction fails, the first keyframe is tried and the larger image
+is kept. A video that yields no image at all is reported and skipped; it does
+not abort the run.
+.P
+Without positional arguments the directories default to
+.I vr
+and
+.I Good
+under the first existing of
+.I /mnt/pve/Data_Storage
+(the Proxmox host, where the files are local) and
+.IR /mnt/data_storage .
+The script is normally run on the Proxmox host; from a workstation use
+.BR skybox-thumbs-remote (1).
+.SH OPTIONS
+.TP
+.BI \-j " N, \-\-jobs " N
+Extract up to
+.I N
+thumbnails in parallel. Default: 2. Every
+.B ffmpeg
+and
+.B ffprobe
+process is run with
+.B nice
+19 and
+.B ionice
+class 3.
+.TP
+.BI \-p " PCT, \-\-percent " PCT
+Sample the frame this percentage into the video. Default: 15.
+.TP
+.BI \-\-min\-offset " SEC"
+Never sample earlier than
+.I SEC
+seconds. Default: 30.
+.TP
+.BI \-\-max\-offset " SEC"
+Never sample later than
+.I SEC
+seconds. Default: 600.
+.TP
+.BI \-w " PX, \-\-width " PX
+Thumbnail bounding box, preserving aspect ratio. Default: 640.
+.TP
+.BI \-q " N, \-\-quality " N
+.B ffmpeg
+.B \-q:v
+value for the JPEG encoder, 2 (best) to 31 (worst). Default: 4.
+.TP
+.BI \-t " SEC, \-\-timeout " SEC
+Per-video
+.B ffmpeg
+timeout. Default: 180 seconds.
+.TP
+.B \-n, \-\-dry\-run
+Print what would be created or pruned; write nothing.
+.TP
+.B \-f, \-\-force
+Regenerate sidecars that already exist.
+.TP
+.B \-\-prune
+Delete orphaned
+.B .jpg
+sidecars: only files whose names match the ctbrec recording pattern and that
+have no matching video in the same directory. Other images are never touched.
+.TP
+.B \-\-no\-recursive
+Scan only the top level of each directory instead of descending.
+.TP
+.BI \-l " N, \-\-limit " N
+Process at most
+.I N
+videos. Useful for a pilot run.
+.TP
+.B \-\-quiet
+Suppress per-file output; the summary and failures are still printed.
+.TP
+.B \-v, \-\-verbose
+Also print videos skipped because a sidecar already exists.
+.TP
+.B \-h, \-\-help
+Show help and exit.
+.TP
+.B \-\-version
+Show the version and exit.
+.SH BEHAVIOUR
+.SS Output
+.IP \(bu 2
+A sidecar is written next to its video as
+.IR name.jpg ,
+atomically via a hidden temporary file, so an interrupted run never leaves a
+partial image.
+.IP \(bu 2
+The sidecar inherits the video's owner, group and permission bits (with the
+group-write bit added), so SMB clients can read it.
+.IP \(bu 2
+Videos that already have
+.BR .jpg ,
+.B .jpeg
+or
+.B .png
+sidecar are skipped unless
+.B \-\-force
+is given. Exit status is 1 if any video failed.
+.SS Requirements
+.IP \(bu 2
+.B ffmpeg
+and
+.B ffprobe
+on
+.IR PATH .
+.IP \(bu 2
+Enough free space for roughly 25 kB per video.
+.SH EXAMPLES
+Generate thumbnails for the default folders on the Proxmox host:
+.IP
+.EX
+skybox-thumbs
+.EE
+.P
+Pilot three files, then inspect them in the headset:
+.IP
+.EX
+skybox-thumbs \-\-limit 3
+.EE
+.P
+Regenerate everything in two folders in parallel:
+.IP
+.EX
+skybox-thumbs \-\-force \-j 3 /mnt/pve/Data_Storage/vr /mnt/pve/Data_Storage/Good
+.EE
+.P
+Same, from a workstation, over SSH:
+.IP
+.EX
+skybox-thumbs-remote \-\-force \-j 3
+.EE
+.P
+Remove sidecars whose videos have been deleted:
+.IP
+.EX
+skybox-thumbs \-\-prune
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+All requested thumbnails exist (or would be created, with
+.BR \-\-dry\-run ).
+.TP
+.B 1
+At least one video could not be sampled, or an argument or dependency was
+invalid.
+.SH FILES
+.TP
+.I <video>.jpg
+Generated thumbnail, same folder and basename as the video.
+.SH SEE ALSO
+.BR skybox-thumbs-remote (1),
+.BR ctbrec-vr (1),
+.BR ctbrec-vr-remote (1),
+.BR ts2mkv (1)
+.SH AUTHOR
+Written for local use.

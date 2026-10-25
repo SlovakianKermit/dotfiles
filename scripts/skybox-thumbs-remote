@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER="${SKYBOX_THUMBS_SERVER:-proxmox}"
+REMOTE_BIN="${SKYBOX_THUMBS_BIN:-/usr/local/bin/skybox-thumbs}"
+
+SSH_OPTS=(-o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
+
+exec ssh "${SSH_OPTS[@]}" "$SERVER" \
+  env PYTHONUNBUFFERED=1 "$REMOTE_BIN" "$@"

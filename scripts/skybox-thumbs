@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Generate SKYBOX custom thumbnails (sidecar JPEGs) for video folders.
+
+SKYBOX displays an image that sits next to a video with the same basename
+(``movie.ts`` + ``movie.jpg``) instead of extracting a frame over SMB.  This
+script pre-generates those images, which is much faster than letting the
+headset decode a 5.7K frame for every file in a folder.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+VIDEO_EXTS = (".ts", ".mts", ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v")
+SIDECAR_EXTS = (".jpg", ".jpeg", ".png")
+# Only prune sidecars whose names look like ctbrec recordings, never user art.
+CTBREC_RE = re.compile(r"^.+_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{3}\.jpg$")
+BASES = ("/mnt/pve/Data_Storage", "/mnt/data_storage")
+DEFAULT_SUBDIRS = ("vr", "Good")
+MIN_GOOD_BYTES = 4096  # a flat/grey frame compresses to ~1.5 kB at 640px
+
+_counter = {"created": 0, "skipped": 0}
+_failures = []
+_lock = None
+
+
+def default_dirs():
+    for base in BASES:
+        if os.path.isdir(base):
+            return [os.path.join(base, d) for d in DEFAULT_SUBDIRS]
+    return [os.path.join(BASES[0], d) for d in DEFAULT_SUBDIRS]
+
+
+def tool_prefix():
+    prefix = []
+    if shutil.which("nice"):
+        prefix += ["nice", "-n", "19"]
+    if shutil.which("ionice"):
+        prefix += ["ionice", "-c", "3"]
+    return prefix
+
+
+def probe_duration(path, timeout):
+    cmd = tool_prefix() + [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nw=1:nk=1", path,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        value = float(r.stdout.strip().splitlines()[0])
+    except (IndexError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def grab(video, offset, out, args):
+    cmd = tool_prefix() + [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-ss", f"{offset:.3f}", "-skip_frame", "nokey", "-i", video,
+        "-frames:v", "1",
+        "-vf", f"scale={args.width}:{args.width}:force_original_aspect_ratio=decrease",
+        "-q:v", str(args.quality), "-f", "image2", "-y", out,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    except OSError as exc:
+        return None, str(exc)
+    if r.returncode != 0 or not os.path.exists(out):
+        line = r.stderr.strip().splitlines()
+        return None, (line[-1] if line else f"ffmpeg exit {r.returncode}")
+    size = os.path.getsize(out)
+    if size == 0:
+        return None, "empty image"
+    return size, None
+
+
+def process(video, args):
+    sidecar = os.path.splitext(video)[0] + ".jpg"
+    try:
+        src = os.stat(video)
+    except OSError as exc:
+        return video, "stat: %s" % exc
+
+    if not args.force:
+        stem = os.path.splitext(video)[0]
+        for ext in SIDECAR_EXTS:
+            if os.path.exists(stem + ext):
+                with _lock:
+                    _counter["skipped"] += 1
+                if args.verbose:
+                    print("skip (exists): %s" % (stem + ext))
+                return video, None
+
+    if args.dry_run:
+        with _lock:
+            _counter["created"] += 1
+        print("would create: %s" % sidecar)
+        return video, None
+
+    duration = probe_duration(video, min(args.timeout, 120))
+    target = args.min_offset
+    if duration is not None:
+        target = min(max(duration * args.percent / 100.0, args.min_offset),
+                     args.max_offset)
+
+    tmp = os.path.join(os.path.dirname(video), ".%s.jpg.tmp" % os.path.basename(sidecar))
+    size, err = grab(video, target, tmp, args)
+
+    # A seek into these damaged/truncated MPEG-TS captures can decode to a
+    # flat grey frame; fall back to the first keyframe and keep the larger one.
+    if err is None and size < MIN_GOOD_BYTES:
+        alt = tmp + ".alt"
+        size2, err2 = grab(video, 0.0, alt, args)
+        if err2 is None and size2 > size:
+            os.replace(alt, tmp)
+            size = size2
+        elif os.path.exists(alt):
+            os.unlink(alt)
+    if err is not None:
+        fallback = tmp + ".alt"
+        size2, err2 = grab(video, 0.0, fallback, args)
+        if err2 is None:
+            os.replace(fallback, tmp)
+            size, err = size2, None
+        elif os.path.exists(fallback):
+            os.unlink(fallback)
+
+    if err is not None:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        with _lock:
+            _failures.append((video, err))
+        return video, err
+
+    try:
+        os.chmod(tmp, (src.st_mode & 0o777) | 0o020)
+        if os.geteuid() == 0:
+            os.chown(tmp, src.st_uid, src.st_gid)
+        os.replace(tmp, sidecar)
+    except OSError as exc:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        with _lock:
+            _failures.append((video, "write: %s" % exc))
+        return video, "write: %s" % exc
+
+    with _lock:
+        _counter["created"] += 1
+    if not args.quiet:
+        print("create: %s (%d B)" % (sidecar, size))
+    return video, None
+
+
+def collect(dirs, recursive):
+    videos = []
+    for root_dir in dirs:
+        if recursive:
+            for root, subdirs, files in os.walk(root_dir):
+                subdirs[:] = sorted(d for d in subdirs if not d.startswith("."))
+                for name in sorted(files):
+                    if os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                        videos.append(os.path.join(root, name))
+        else:
+            for name in sorted(os.listdir(root_dir)):
+                path = os.path.join(root_dir, name)
+                if os.path.isfile(path) and os.path.splitext(name)[1].lower() in VIDEO_EXTS:
+                    videos.append(path)
+    return videos
+
+
+def prune(dirs, args):
+    removed = 0
+    for root_dir in dirs:
+        for root, subdirs, files in os.walk(root_dir):
+            subdirs[:] = sorted(d for d in subdirs if not d.startswith("."))
+            if not args.recursive:
+                subdirs[:] = []
+            for name in sorted(files):
+                if not CTBREC_RE.match(name):
+                    continue
+                base = os.path.splitext(name)[0]
+                if any(os.path.exists(os.path.join(root, base + ext)) for ext in VIDEO_EXTS):
+                    continue
+                path = os.path.join(root, name)
+                if args.dry_run:
+                    print("would prune: %s" % path)
+                else:
+                    try:
+                        os.unlink(path)
+                    except OSError as exc:
+                        with _lock:
+                            _failures.append((path, "prune: %s" % exc))
+                        continue
+                    print("prune: %s" % path)
+                removed += 1
+    return removed
+
+
+def main():
+    global _lock
+    import threading
+    _lock = threading.Lock()
+
+    p = argparse.ArgumentParser(
+        prog="skybox-thumbs",
+        description="Pre-generate SKYBOX custom thumbnails (same-name JPEGs) "
+                    "for video folders.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Defaults to vr/ and Good/ under the first existing of\n"
+               "/mnt/pve/Data_Storage or /mnt/data_storage.")
+    p.add_argument("dirs", nargs="*", metavar="DIR",
+                   help="folders to scan (default: <base>/vr <base>/Good)")
+    p.add_argument("-n", "--dry-run", action="store_true",
+                   help="show what would be done, change nothing")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="regenerate thumbnails that already exist")
+    p.add_argument("-j", "--jobs", type=int, default=2, metavar="N",
+                   help="parallel extractions (default: 2)")
+    p.add_argument("-t", "--timeout", type=int, default=180, metavar="SEC",
+                   help="per-file ffmpeg timeout (default: 180)")
+    p.add_argument("-p", "--percent", type=float, default=15.0, metavar="PCT",
+                   help="sample frame this far into the video (default: 15)")
+    p.add_argument("--min-offset", type=float, default=30.0, metavar="SEC",
+                   help="minimum sample offset (default: 30)")
+    p.add_argument("--max-offset", type=float, default=600.0, metavar="SEC",
+                   help="maximum sample offset (default: 600)")
+    p.add_argument("-w", "--width", type=int, default=640, metavar="PX",
+                   help="thumbnail bounding-box width/height (default: 640)")
+    p.add_argument("-q", "--quality", type=int, default=4, metavar="N",
+                   help="ffmpeg mjpeg -q:v value, 2 best/31 worst (default: 4)")
+    p.add_argument("--prune", action="store_true",
+                   help="delete orphaned ctbrec-named .jpg sidecars")
+    p.add_argument("--no-recursive", dest="recursive", action="store_false",
+                   help="scan only the top level of each folder")
+    p.add_argument("-l", "--limit", type=int, metavar="N",
+                   help="process at most N videos (for a pilot run)")
+    p.add_argument("--quiet", action="store_true", help="only print the summary")
+    p.add_argument("-v", "--verbose", action="store_true", help="print skips too")
+    p.add_argument("--version", action="version", version="skybox-thumbs 1.0")
+    args = p.parse_args()
+
+    if args.jobs < 1:
+        p.error("--jobs must be at least 1")
+    dirs = args.dirs or default_dirs()
+    missing = [d for d in dirs if not os.path.isdir(d)]
+    if missing:
+        p.error("not a directory: %s" % ", ".join(missing))
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        p.error("ffmpeg and ffprobe are required")
+
+    started = time.time()
+    videos = collect(dirs, args.recursive)
+    if args.limit is not None:
+        videos = videos[:args.limit]
+    if not args.quiet:
+        print("%d video(s) in %s" % (len(videos), ", ".join(dirs)))
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        list(pool.map(lambda v: process(v, args), videos))
+
+    removed = prune(dirs, args) if args.prune else 0
+    elapsed = time.time() - started
+    action = "would create" if args.dry_run else "created"
+    print("\n%s %d, skipped %d, failed %d%s (%.1fs)"
+          % (action, _counter["created"], _counter["skipped"],
+             len(_failures), ", pruned %d" % removed if args.prune else "",
+             elapsed))
+    for path, err in _failures:
+        print("FAILED: %s: %s" % (path, err), file=sys.stderr)
+    return 1 if _failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

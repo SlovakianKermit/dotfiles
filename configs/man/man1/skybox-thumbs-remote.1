@@ -1,0 +1,49 @@
+.TH SKYBOX-THUMBS-REMOTE 1 "2026-10-25" "skybox-thumbs-remote" "User Commands"
+.SH NAME
+skybox-thumbs-remote \- run skybox-thumbs on the Proxmox host over SSH
+.SH SYNOPSIS
+.B skybox-thumbs-remote
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B skybox-thumbs-remote
+is a thin wrapper that executes
+.I /usr/local/bin/skybox-thumbs
+on the Proxmox host, where the media share is mounted locally. All arguments
+are passed through unchanged, so the options are those of
+.BR skybox-thumbs (1).
+.P
+The SSH connection uses
+.B BatchMode=yes
+and disables the
+.B RemoteCommand
+and TTY settings normally applied by the host's
+.I ~/.ssh/config
+entry, so the wrapper works non-interactively.
+.SH ENVIRONMENT
+.TP
+.B SKYBOX_THUMBS_SERVER
+SSH host alias to use. Default: \fIproxmox\fR.
+.TP
+.B SKYBOX_THUMBS_BIN
+Remote executable path. Default: \fI/usr/local/bin/skybox-thumbs\fR.
+.SH EXAMPLES
+Generate thumbnails with the remote defaults:
+.IP
+.EX
+skybox-thumbs-remote
+.EE
+.P
+Pilot run and prune:
+.IP
+.EX
+skybox-thumbs-remote \-\-limit 3
+skybox-thumbs-remote \-\-prune
+.EE
+.SH EXIT STATUS
+The exit status of the remote command, or the SSH client's status if the
+connection fails.
+.SH SEE ALSO
+.BR skybox-thumbs (1),
+.BR ssh (1)
+.SH AUTHOR
+Written for local use.
