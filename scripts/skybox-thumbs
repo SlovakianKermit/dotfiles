@@ -87,13 +87,9 @@ def grab(video, offset, out, args):
 
 def process(video, args):
     sidecar = os.path.splitext(video)[0] + ".jpg"
-    try:
-        src = os.stat(video)
-    except OSError as exc:
-        return video, "stat: %s" % exc
+    stem = os.path.splitext(video)[0]
 
     if not args.force:
-        stem = os.path.splitext(video)[0]
         for ext in SIDECAR_EXTS:
             if os.path.exists(stem + ext):
                 with _lock:
@@ -101,6 +97,11 @@ def process(video, args):
                 if args.verbose:
                     print("skip (exists): %s" % (stem + ext))
                 return video, None
+
+    try:
+        src = os.stat(video)
+    except OSError as exc:
+        return video, "stat: %s" % exc
 
     if args.dry_run:
         with _lock:

@@ -57,10 +57,16 @@ The script is normally run on the Proxmox host; from a workstation use
 .P
 On the Proxmox host a systemd timer
 .RI ( skybox-thumbs.timer )
-runs the script nightly at 04:00 with a randomised delay of up to 30 minutes.
-The service processes one video at a time at idle I/O priority and low CPU
-weight, and only creates thumbnails that are missing, so a normal run takes
-seconds. New recordings get their sidecar at the next nightly run; run
+runs the script every three hours (00:00, 03:00, and so on) with a randomised
+delay of up to 10 minutes. The service processes one video at a time at idle
+I/O priority and low CPU weight. It checks for an existing sidecar before
+doing anything else and skips that video, so a run with nothing new only lists
+directories and calls
+.BR stat (2):
+it reads no video data, starts no
+.B ffmpeg
+process and writes nothing. New recordings get their sidecar at the next run;
+run
 .B skybox-thumbs
 manually to cover them sooner.
 .SH OPTIONS
@@ -208,7 +214,7 @@ invalid.
 Generated thumbnail, same folder and basename as the video.
 .TP
 .I /etc/systemd/system/skybox-thumbs.timer
-Nightly schedule on the Proxmox host (04:00, up to 30 minutes of jitter).
+Three-hourly schedule on the Proxmox host (00:00, 03:00, ... with up to 10 minutes of jitter).
 .TP
 .I /etc/systemd/system/skybox-thumbs.service
 One-shot service running this script with idle I/O priority.
