@@ -4,7 +4,7 @@ ConditionPathIsDirectory=/mnt/shared/VR
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/skybox-thumbs --quiet -j 1 --timeout 180 /mnt/shared/VR
+ExecStart=%h/.local/bin/skybox-thumbs --quiet --prune -j 1 --timeout 180 /mnt/shared/VR
 Nice=19
 IOSchedulingClass=idle
 IOSchedulingPriority=7
