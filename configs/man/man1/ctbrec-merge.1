@@ -139,6 +139,10 @@ part must stay in place to be extended), so a full concat remux is used.
 .TP
 .B \-\-dry\-run
 Print the merge plan, including the chosen mode, without changing anything.
+The
+.B \-\-max\-streams
+deferral is ignored in this mode, so the plan can be previewed while many
+recordings are still being written.
 .TP
 .B \-\-top\-level
 Only process files directly in
@@ -177,6 +181,8 @@ Defer the whole run when more than
 .I N
 recordings are open for writing. Defaults to
 .BR 4 .
+Ignored under
+.BR \-\-dry\-run .
 .TP
 .B \-\-cooldown \fISECONDS\fR
 Minimum time to sleep between merged groups. Defaults to

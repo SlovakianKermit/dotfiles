@@ -6,6 +6,10 @@ Rows=1
 [Effect-overview]
 BorderActivate=9
 
+[NightColor]
+Active=true
+Mode=Constant
+
 [Plugins]
 shakecursorEnabled=false
 

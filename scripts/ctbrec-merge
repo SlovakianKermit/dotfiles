@@ -820,8 +820,12 @@ def main():
         if active_paths is not None:
             print(f"active: {len(active_paths)} recording(s) open for writing")
             if len(active_paths) > args.max_streams:
-                print(f"deferring: {len(active_paths)} active recordings (> --max-streams {args.max_streams})", file=sys.stderr)
-                return 0
+                if args.dry_run:
+                    print(f"note: {len(active_paths)} active recordings (> --max-streams {args.max_streams}); "
+                          f"continuing because --dry-run changes nothing", file=sys.stderr)
+                else:
+                    print(f"deferring: {len(active_paths)} active recordings (> --max-streams {args.max_streams})", file=sys.stderr)
+                    return 0
 
     if args.fix_timestamps:
         return run_repair(args, active_paths, now)
