@@ -20,17 +20,23 @@ from the first video stream, not from the file name or extension, so a
 that actually contains H.264 is detected correctly and a mislabelled container
 is not mistaken for H.264.
 .P
-Every candidate file is probed on every run and no result is remembered
-between runs. An earlier version probed one file per capture model and cached
-the answer, on the assumption that a model always uses the same codec; that
-assumption is false, because a model can be re\-encoded part\-way through its
-catalogue. In practice it moved HEVC files into
+Every file is probed and the answer is cached
+.B per file
+in
+.BR ~/.cache/h264\-sort/files.tsv ,
+keyed by absolute path and invalidated when the file's size or mtime changes.
+A rerun over an unchanged folder therefore probes nothing, and a new download
+costs exactly one probe. An earlier version cached per capture model, on the
+assumption that a model always uses the same codec; that assumption was false
+(re\-encodes happen part\-way through a catalogue), so it both moved HEVC files
+into
 .B h.264
-and left H.264 files behind in the same folder, so the cache has been removed.
-A scan of a few hundred TS files over a network mount takes tens of seconds
-with the default parallelism; raise
-.B \-j
-for a cold filesystem.
+and left H.264 files behind.
+.P
+Because the cache is keyed by file rather than by name, two folders are
+independent: a model that is H.264 in one place and HEVC in another is handled
+correctly. Entries for files that no longer exist are dropped when the cache is
+next rewritten, and a moved file is re\-keyed to its new path.
 .P
 Files are moved, never copied, and an existing destination file is never
 overwritten: a numeric suffix
@@ -45,6 +51,9 @@ as reported by
 .BR ffprobe (1)
 (default:
 .BR h264 ).
+The cache records whatever codec a file actually has, so switching
+.B \-c
+never costs a new probe for an unchanged file.
 .TP
 .BI \-t ", " \-\-target " NAME"
 Use
@@ -65,11 +74,16 @@ searched.
 .BI \-j ", " \-\-jobs " N"
 Probe
 .I N
-files concurrently (default: 8). Lower it for a flaky network mount, raise it
-for a local disk.
+files concurrently (default: 8). Only matters for files that are not already
+cached. Lower it for a flaky network mount, raise it for a local disk.
+.TP
+.BR \-R ", " \-\-refresh
+Probe every file in this run again, ignoring the cache, and update it. Cached
+files outside this run are kept.
 .TP
 .BR \-n ", " \-\-dry\-run
-Print what would be moved without changing anything on disk.
+Print what would be moved without changing anything on disk. Probe results are
+still cached.
 .TP
 .BR \-h ", " \-\-help
 Show usage and exit.
@@ -95,7 +109,7 @@ Without
 .B \-r
 only the top level of each directory is scanned.
 .SS Detection
-Each candidate is run through
+Missing or changed files are run through
 .BR ffprobe (1)
 with
 .BR \-select_streams " v:0"
@@ -107,10 +121,19 @@ match.
 .P
 Probing finishes before the first move, so interrupting the scan with
 .B Ctrl\-C
-leaves the directory exactly as it was.
+leaves the directory exactly as it was; files probed before the interrupt are
+still written to the cache.
 .SS Requirements
 .IP \(bu 2
 .BR ffprobe (1)
+.SH FILES
+.TP
+.B ~/.cache/h264\-sort/files.tsv
+Per\-file codec cache, tab\-separated:
+.IR path ", " size ", " mtime ", " codec .
+Honours
+.BR XDG_CACHE_HOME .
+Deleting it is always safe; the next run re\-probes everything.
 .SH EXAMPLES
 Preview what would be moved in a media folder:
 .IP
@@ -130,10 +153,10 @@ Handle a folder tree, including nested captures:
 h264\-sort \-r /mnt/data_storage/Good
 .EE
 .P
-On a local disk, probe sixteen files at a time:
+Re\-probe everything, for example after replacing files in place:
 .IP
 .EX
-h264\-sort \-j 16 /mnt/data_storage/vr
+h264\-sort \-R \-n /mnt/data_storage/vr
 .EE
 .P
 Gather HEVC files instead, into a folder named

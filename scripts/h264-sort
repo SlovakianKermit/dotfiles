@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 # h264-sort — move H.264/AVC videos in a directory into an "h.264" subdirectory.
 #
-# Every candidate file is probed with ffprobe. Captures from the same model do
-# NOT reliably share a codec — a model can be re-encoded part-way through its
-# catalogue — so probing one file per model and remembering the answer put HEVC
-# files into h.264/ and left H.264 files behind. Nothing is cached between
-# runs; the file list is probed in parallel instead.
+# Codec detection uses ffprobe, and the answer is cached per FILE in
+# ~/.cache/h264-sort/files.tsv, keyed by path and invalidated by size+mtime.
+# A per-model cache was tried first and was wrong: captures from one model do
+# not reliably share a codec (re-encodes happen mid-catalogue), which moved
+# HEVC files into h.264/ and left H.264 files behind. Per-file caching is the
+# only sound way to make a rescan cheap: a rerun over an unchanged folder
+# probes nothing, and a new download costs exactly one probe.
 set -euo pipefail
 
 CODEC="h264"
 TARGET=""
 RECURSE=0
 DRY=0
+REFRESH=0
 JOBS=""
 declare -a args=()
 
 EXTS=(mkv mp4 mov m4v avi ts mts m2ts webm flv wmv mpg mpeg ogv 3gp)
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/h264-sort"
+CACHE="$CACHE_DIR/files.tsv"
 
 die() { printf 'h264-sort: %s\n' "$*" >&2; exit 1; }
 
@@ -25,13 +30,16 @@ Usage: h264-sort [OPTIONS] DIR|FILE...
 
 Move every H.264/AVC video found in each directory into a subdirectory of that
 directory (default: h.264). Detection is by ffprobe on the first video stream,
-not by file extension, and every candidate file is probed: nothing is cached.
+not by file extension. The codec of every file is cached by path, size and
+mtime in ~/.cache/h264-sort/files.tsv, so a rerun only probes new or changed
+files.
 
 Options:
   -c, --codec CODEC   ffprobe codec_name to collect (default: h264)
   -t, --target NAME   Subdirectory name (default: h.264, or CODEC if -c given)
   -r, --recursive     Also search subdirectories (target dir itself is skipped)
   -j, --jobs N        Probe N files in parallel (default: 8)
+  -R, --refresh       Re-probe every file in this run, ignoring the cache
   -n, --dry-run       Print what would be moved, change nothing
   -h, --help          Show this help and exit
 
@@ -45,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     -t|--target)    [[ $# -ge 2 ]] || die "-t needs an argument"; TARGET="$2"; shift 2 ;;
     -j|--jobs)      [[ $# -ge 2 ]] || die "-j needs an argument"; JOBS="$2"; shift 2 ;;
     -r|--recursive) RECURSE=1; shift ;;
+    -R|--refresh)   REFRESH=1; shift ;;
     -n|--dry-run)   DRY=1; shift ;;
     -h|--help)      usage; exit 0 ;;
     --)             shift; while [[ $# -gt 0 ]]; do args+=("$1"); shift; done ;;
@@ -95,38 +104,89 @@ done
 
 [[ ${#files[@]} -gt 0 ]] || { printf 'h264-sort: no video files found\n'; exit 0; }
 
-# Probe every candidate file, in parallel. \x1f would not survive a path with a
-# newline, so paths are passed as separate argv entries instead.
+# Per-file cache: path -> size, mtime, codec. A cached entry is only trusted
+# when the file still exists with the same size and mtime.
+declare -A c_size=() c_mtime=() c_codec=()
+if [[ -r "$CACHE" ]]; then
+  while IFS=$'\t' read -r p sz mt c; do
+    [[ -n "$p" && -n "$c" ]] && { c_size["$p"]="$sz"; c_mtime["$p"]="$mt"; c_codec["$p"]="$c"; }
+  done <"$CACHE"
+fi
+
+CACHE_DIRTY=0
+save_cache() {
+  [[ $CACHE_DIRTY -eq 1 ]] || return 0
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+  local tmp="$CACHE.$$" p
+  for p in "${!c_codec[@]}"; do
+    [[ -e "$p" ]] || continue
+    printf '%s\t%s\t%s\t%s\n' "$p" "${c_size[$p]:-0}" "${c_mtime[$p]:-0}" "${c_codec[$p]}"
+  done | sort >"$tmp" 2>/dev/null && mv -f "$tmp" "$CACHE" || rm -f "$tmp"
+}
+trap save_cache EXIT
+
+# "size mtime" for a path, empty when stat fails.
+file_sig() { stat -c '%s %Y' -- "$1" 2>/dev/null || true; }
+
+# Cache keys are absolute, so the same file found via "." and via its full path
+# is one entry, not two.
+declare -A key_of=()
+declare -A sig_of=()
+declare -a miss=()
+hits=0
+for f in "${files[@]}"; do
+  key="$(realpath -m -- "$f")"
+  key_of["$f"]="$key"
+  sig="$(file_sig "$f")"
+  sig_of["$f"]="$sig"
+  if [[ $REFRESH -eq 0 && -n "$sig" && -n "${c_codec[$key]:-}" ]]; then
+    read -r sz mt <<<"$sig"
+    if [[ "${c_size[$key]:-}" == "$sz" && "${c_mtime[$key]:-}" == "$mt" ]]; then
+      hits=$((hits+1)); continue
+    fi
+  fi
+  miss+=("$f")
+done
+
+# Probe the files we know nothing (or something stale) about, in parallel.
 declare -A codec_of=()
-worker="$(mktemp)"
-out="$(mktemp)"
-cleanup() { rm -f "$worker" "$out"; }
-trap cleanup EXIT
-cat >"$worker" <<'W'
+probed=0
+if [[ ${#miss[@]} -gt 0 ]]; then
+  worker="$(mktemp)"
+  out="$(mktemp)"
+  cleanup() { rm -f "$worker" "$out"; }
+  trap 'cleanup; save_cache' EXIT
+  cat >"$worker" <<'W'
 f=$1
 c=$(ffprobe -v error -select_streams v:0 \
       -show_entries stream=codec_name -of default=nw=1:nk=1 \
       -- "$f" 2>/dev/null | head -n1)
 printf '%s\t%s\n' "$f" "${c:-}"
 W
-printf '%s\0' "${files[@]}" \
-  | xargs -0 -P "$JOBS" -n1 bash "$worker" >"$out" 2>/dev/null || true
-probed=0
-while IFS=$'\t' read -r f c; do
-  [[ -n "$f" && -n "$c" ]] || continue
-  codec_of["$f"]="$c"
-  probed=$((probed+1))
-done <"$out"
-cleanup
-trap - EXIT
+  printf '%s\0' "${miss[@]}" \
+    | xargs -0 -P "$JOBS" -n1 bash "$worker" >"$out" 2>/dev/null || true
+  while IFS=$'\t' read -r f c; do
+    [[ -n "$f" && -n "$c" ]] || continue
+    codec_of["$f"]="$c"
+    read -r sz mt <<<"${sig_of[$f]:-"0 0"}"
+    key="${key_of[$f]}"
+    c_size["$key"]="$sz"; c_mtime["$key"]="$mt"; c_codec["$key"]="$c"
+    CACHE_DIRTY=1
+    probed=$((probed+1))
+  done <"$out"
+  cleanup
+  trap save_cache EXIT
+fi
 
 moved=0; skipped=0; failed=0; unreadable=0
 for f in "${files[@]}"; do
-  if [[ -z "${codec_of[$f]:-}" ]]; then
+  key="${key_of[$f]}"
+  c="${codec_of[$f]:-${c_codec[$key]:-}}"
+  if [[ -z "$c" || -z "${sig_of[$f]:-}" ]]; then
     printf 'unreadable: %s\n' "$f" >&2
     unreadable=$((unreadable+1)); continue
   fi
-  if [[ "${codec_of[$f]}" != "$CODEC" ]]; then
+  if [[ "$c" != "$CODEC" ]]; then
     skipped=$((skipped+1)); continue
   fi
 
@@ -151,6 +211,11 @@ for f in "${files[@]}"; do
   fi
 
   if mv -f -- "$f" "$dest"; then
+    # Re-key the cache entry to the new path; mv keeps size and mtime.
+    newkey="$(realpath -m -- "$dest")"
+    c_size["$newkey"]="${c_size[$key]:-0}"; c_mtime["$newkey"]="${c_mtime[$key]:-0}"; c_codec["$newkey"]="$c"
+    unset 'c_size[$key]' 'c_mtime[$key]' 'c_codec[$key]'
+    CACHE_DIRTY=1
     printf 'moved: %s -> %s\n' "$f" "$dest"
     moved=$((moved+1))
   else
@@ -160,6 +225,6 @@ for f in "${files[@]}"; do
 done
 
 if [[ $DRY -eq 1 ]]; then verb="to move"; else verb=moved; fi
-printf '\nh264-sort: %d %s, %d not %s, %d unreadable, %d failed (%d files probed)\n' \
-  "$moved" "$verb" "$skipped" "$CODEC" "$unreadable" "$failed" "$probed"
+printf '\nh264-sort: %d %s, %d not %s, %d unreadable, %d failed (%d probed, %d from cache)\n' \
+  "$moved" "$verb" "$skipped" "$CODEC" "$unreadable" "$failed" "$probed" "$hits"
 [[ $failed -eq 0 ]]
