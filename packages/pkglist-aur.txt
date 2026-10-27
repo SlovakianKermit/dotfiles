@@ -18,6 +18,7 @@ r2modman-bin
 rayburst-bin
 sober-bin
 spotifast-bin
+tinyfiledialogs
 typing_test
 vesktop
 wthrr-bin
