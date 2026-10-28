@@ -179,6 +179,35 @@ this mode. An explicit
 .B \-q
 overrides the VR quality default.
 .TP
+.BI \-\-fix\-pts " MODE"
+Rebuild the output timeline from decoded element counts instead of the
+container timestamps.
+.I MODE
+is
+.BR auto " (default), " always " or " never .
+In
+.B auto
+mode,
+.B .ts
+and
+.B .mts
+sources are spot-checked before encoding: two byte-aligned windows are read
+and the PTS advance is compared with the number of video frames actually
+present. A healthy stream advances about one frame time per frame; a
+capture whose clock has stalled advances almost nothing (or races), which
+makes the container duration far shorter than the real content. In that
+case the video timeline is rebuilt from the decoded frame index
+(\fBsetpts=N/\fIfps\fB/TB\fR, with
+.B \-fps_mode passthrough
+so no frames are dropped) and the audio timeline from the decoded sample
+count (\fBasetpts=N\fR), which requires re-encoding the audio as AAC at
+160 kbit/s. The progress bar then measures against the estimated real
+length instead of the stalled one.
+.B never
+restores the old behaviour;
+.B always
+applies the rebuild to every file.
+.TP
 .B \-h
 Show a short help message and exit.
 .SH BEHAVIOUR
@@ -212,7 +241,8 @@ the GPU still encodes
 .IP \(bu 2
 Audio streams are
 .B copied
-(not re-encoded)
+(not re-encoded) unless a stalled timeline forces a rebuild (see
+.BR "\-\-fix\-pts" )
 .IP \(bu 2
 If copying the audio makes the Matroska muxer fail (for example a corrupt
 ADTS AAC lead-in in an MPEG-TS capture that ffmpeg cannot parse), the file
@@ -260,6 +290,32 @@ by default), with each input's relative path mirrored beneath it. An explicit
 single-file
 .B \-\-output
 still wins over this placement.
+.SS Stalled MPEG-TS timelines
+Some long captures keep recording after their clock has stopped advancing:
+every frame still arrives at the real rate and the picture is intact, but
+each PTS advances by microseconds instead of one frame time. ffprobe then
+reports a duration far shorter than the real content, so the progress bar
+reaches 100% while most of the file is still unread and the remaining hours
+of picture end up crammed into the last second or two of the output
+timeline (players skip straight through it).
+.P
+.B \-\-fix\-pts auto
+detects this on
+.B .ts
+and
+.B .mts
+inputs and rebuilds both timelines from what the file actually contains:
+video from the decoded frame index at the probed frame rate, audio from the
+decoded sample count. The output then runs for its true length and progress
+is measured against an estimate derived from the file's bytes-per-frame
+density. Audio is re-encoded in this mode, so the source's audio timestamps
+cannot leak into the output.
+.P
+Audio packets the recorder genuinely dropped cannot be restored; if the
+stalled region lost audio, the rebuilt track will be shorter than the
+picture there. Use
+.B \-\-fix\-pts never
+to keep the old pass-through behaviour.
 .SS Batch discovery
 In batch mode, files are found recursively under each input directory with
 extensions (case-insensitive):

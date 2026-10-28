@@ -9,7 +9,17 @@ ffmpeg-encode-av1 wrapper passes --codec av1).
 VR180/VR360 captures (which arrive already heavily compressed as one
 side-by-side HEVC frame) and refuses to shrink the frame: the encoded
 output must keep the source's exact pixel dimensions or the job fails.  VR
-outputs are written under a VR/ subdirectory of the output root."""
+outputs are written under a VR/ subdirectory of the output root.
+
+--fix-pts rebuilds the output timeline from element counts (decoded frame
+index for video, decoded sample count for audio) instead of trusting the
+container timestamps.  Long MPEG-TS captures sometimes keep recording long
+after their clock has stalled: frames still arrive at the real rate but
+their PTS advance by microseconds, so ffprobe reports a duration far
+shorter than the real content, -progress pins at 100% well before the end
+of the file, and hours of picture would be crammed into the last seconds of
+the output.  Default "auto" spot-checks .ts/.mts sources for this and only
+then rebuilds; "always"/"never" override the decision."""
 
 import argparse
 import curses
@@ -71,6 +81,18 @@ CODECS = {
 # as a speed control.
 PRESET_ASYNC = {"speed": 8, "balanced": 4, "quality": 2}
 
+# Broken-timeline detection (--fix-pts auto).  MPEG-TS is a fixed 188-byte
+# packet stream, so a stalled capture clock can be measured by reading a
+# couple of byte-aligned windows and comparing the PTS advance against the
+# number of frames actually present.
+TS_PACKET = 188
+TS_SAMPLE_BYTES = 8 << 20           # bytes read per probe window
+TS_SAMPLE_POINTS = (0.25, 0.90)     # fractional offsets to sample
+# Ratio of measured PTS advance to the advance implied by the frame count.
+# A healthy stream sits at ~1.0; this file's tail measured 0.0003.
+TS_PTS_RATIO_MIN = 0.5
+TS_PTS_RATIO_MAX = 2.0
+
 # ═══════════════════════════════════════════════════════════════════════
 # Data
 # ═══════════════════════════════════════════════════════════════════════
@@ -90,6 +112,7 @@ class Job:
     start: float = 0.0
     paused_accum: float = 0.0
     cancel: bool = False
+    pts_fixed: bool = False
 
     @property
     def basename(self) -> str:
@@ -148,7 +171,7 @@ def get_dimensions(path: str) -> Optional[Tuple[int, int]]:
              "-of", "csv=p=0:s=x", path],
             capture_output=True, text=True, timeout=30,
         )
-        w, h = r.stdout.strip().split("x")[:2]
+        w, h = _first_line(r.stdout).split("x")[:2]
         return int(w), int(h)
     except Exception:
         return None
@@ -162,7 +185,7 @@ def get_pix_fmt(path: str) -> str:
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=30,
         )
-        return r.stdout.strip()
+        return _first_line(r.stdout)
     except Exception:
         return ""
 
@@ -200,6 +223,124 @@ def check_vaapi() -> bool:
         return "vaapi" in r.stdout
     except Exception:
         return False
+
+def _first_line(text: str) -> str:
+    """First non-empty line of an ffprobe result.
+
+    MPEG-TS files carrying more than one program make ffprobe repeat every
+    -show_entries value once per program, so always take a single line
+    instead of the whole blob.
+    """
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line
+    return ""
+
+def get_frame_rate(path: str) -> float:
+    """Average frame rate of the first video stream (0.0 on failure)."""
+    for entry in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            r = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", f"stream={entry}",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                capture_output=True, text=True, timeout=30,
+            )
+            num, _, den = _first_line(r.stdout).partition("/")
+            fps = float(num) / float(den or 1)
+            if fps > 0:
+                return fps
+        except Exception:
+            continue
+    return 0.0
+
+# ── MPEG-TS timeline probe ──────────────────────────────────────────────
+
+def _ts_video_pid(path: str) -> Optional[int]:
+    """PES PID of the first video stream (mpegts stream ids are PIDs)."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=id",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        return int(_first_line(r.stdout).split(",")[0], 16)
+    except Exception:
+        return None
+
+def _ts_scan_window(fh, offset: int, pid: int,
+                    nbytes: int = TS_SAMPLE_BYTES) -> Optional[Tuple[int, float, float]]:
+    """Count video PES packets and their PTS span in one packet-aligned window.
+
+    Returns (frames, first_pts, last_pts) with PTS in seconds, or None when
+    the window does not contain at least two timestamped video packets.
+    """
+    fh.seek(offset)
+    data = fh.read(nbytes)
+    frames = 0
+    first = last = None
+    for i in range(len(data) // TS_PACKET):
+        p = data[i * TS_PACKET:(i + 1) * TS_PACKET]
+        if p[0] != 0x47 or not p[1] & 0x40:
+            continue                              # no sync byte / not PES start
+        if (((p[1] & 0x1F) << 8) | p[2]) != pid:
+            continue
+        afc = (p[3] >> 4) & 3                     # adaptation field control
+        o = 4
+        if afc in (2, 3):
+            o += 1 + p[4]
+        if o + 14 > TS_PACKET or p[o:o + 3] != b"\x00\x00\x01":
+            continue
+        if not p[o + 7] & 0x80:
+            continue                              # no PTS in this PES header
+        b = p[o + 9:o + 14]
+        pts = (((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15
+               | b[3] << 7 | b[4] >> 1) / 90000.0
+        if first is None:
+            first = pts
+        last = pts
+        frames += 1
+    if frames < 2 or first is None or last is None:
+        return None
+    return frames, first, last
+
+def probe_ts_timeline(path: str, fps: float) -> Tuple[bool, float]:
+    """Check an MPEG-TS for a stalled container clock.
+
+    Returns (broken, real_duration_estimate).  broken is True when the PTS
+    advance across a sampled window does not match the number of frames in
+    it; real_duration_estimate extrapolates the file's true length from the
+    sampled bytes-per-frame density (0.0 when unavailable).
+    """
+    if pathlib.Path(path).suffix.lower() not in (".ts", ".mts") or fps <= 0:
+        return False, 0.0
+    pid = _ts_video_pid(path)
+    if pid is None:
+        return False, 0.0
+
+    bytes_per_frame = 0.0
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            for frac in TS_SAMPLE_POINTS:
+                start = int(size * frac)
+                start -= start % TS_PACKET
+                window = _ts_scan_window(fh, start, pid)
+                if window is None:
+                    continue
+                frames, first, last = window
+                expected = frames / fps
+                ratio = (last - first) / expected if expected > 0 else 1.0
+                if ratio < TS_PTS_RATIO_MIN or ratio > TS_PTS_RATIO_MAX:
+                    return True, (size / (TS_SAMPLE_BYTES / frames)) / fps
+                bytes_per_frame = TS_SAMPLE_BYTES / frames
+        if bytes_per_frame > 0:
+            return False, (size / bytes_per_frame) / fps
+    except OSError:
+        return False, 0.0
+    return False, 0.0
 
 # ═══════════════════════════════════════════════════════════════════════
 # Queue
@@ -285,16 +426,26 @@ def _rate_control_args(codec: str, preset: str, quality: int) -> List[str]:
     args += ["-async_depth", str(PRESET_ASYNC[preset])]
     return args
 
-def _audio_args(copy_audio: bool) -> List[str]:
+def _audio_args(copy_audio: bool, fix_pts: bool = False) -> List[str]:
     if copy_audio:
         return ["-c:a", "copy"]
-    return ["-c:a", "aac", "-b:a", "160k"]
+    args = ["-c:a", "aac", "-b:a", "160k"]
+    if fix_pts:
+        # Copying audio would carry the stalled timestamps into the output,
+        # so re-encode and restamp from the decoded sample count.  In ffmpeg
+        # 9 asetpts' N is the running sample index; PTS lands exactly at
+        # N/sample_rate seconds for any rate.
+        args += ["-af", "asetpts=N"]
+    return args
 
 def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
                       device: str, copy_audio: bool = True,
-                      sw_decode: bool = False) -> List[str]:
+                      sw_decode: bool = False, fix_pts: bool = False,
+                      fps: float = 30.0) -> List[str]:
     # sw_decode: software decode + hwupload for streams the VAAPI decoder
     # can't initialise on (e.g. malformed 4K SPS); the GPU still encodes.
+    # fix_pts: rebuild the timeline from frame index / sample count for
+    # captures whose container clock stalled.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
@@ -303,6 +454,11 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
     if not sw_decode:
         cmd.extend(["-hwaccel", HWACCEL, "-hwaccel_output_format", HWACCEL])
     cmd.extend(["-i", job.input_path])
+
+    vf: List[str] = []
+    color_args: List[str] = []
+    if fix_pts:
+        vf.append(f"setpts=N/{fps:g}/TB")
     if sw_decode:
         if is_rgb_pix_fmt(get_pix_fmt(job.input_path)):
             # Animated WebP/PNG decode to RGB(A).  Left to itself, swscale
@@ -310,20 +466,29 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
             # which shifts skin tones once a player applies its own colour
             # handling.  Convert RGB->YUV as full->limited BT.709 and tag the
             # frame (VAAPI honours setparams, not the -color_* output opts).
-            cmd.extend([
-                "-vf",
+            vf.append(
                 "scale=in_range=pc:out_range=tv:out_color_matrix=bt709,"
                 "setparams=color_primaries=bt709:color_trc=bt709:"
-                "colorspace=bt709:range=tv,format=nv12,hwupload",
+                "colorspace=bt709:range=tv,format=nv12,hwupload"
+            )
+            color_args = [
                 "-color_range", "tv",
                 "-colorspace", "bt709",
                 "-color_primaries", "bt709",
                 "-color_trc", "bt709",
-            ])
+            ]
         else:
-            cmd.extend(["-vf", "format=nv12,hwupload"])
+            vf.append("format=nv12,hwupload")
+    if vf:
+        cmd.extend(["-vf", ",".join(vf)])
+    if color_args:
+        cmd.extend(color_args)
     cmd.extend(_rate_control_args(codec, preset, quality))
-    cmd.extend(_audio_args(copy_audio))
+    if fix_pts:
+        # Rebuilt timestamps are already correct; keep the muxer from
+        # dropping/duplicating frames based on the (bad) input deltas.
+        cmd.extend(["-fps_mode", "passthrough"])
+    cmd.extend(_audio_args(copy_audio, fix_pts))
     cmd.extend(["-map", "0:v?", "-map", "0:a?"])
     cmd.extend(["-y", job.output_path])
     return cmd
@@ -419,10 +584,25 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
             state.ffmpeg_pids.discard(proc.pid)
 
 def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
-                  quality: int, delete_original: bool, vr: bool = False):
+                  quality: int, delete_original: bool, vr: bool = False,
+                  fix_pts_mode: str = "auto"):
     device = find_vaapi_device()
     sw_decode = False
     copy_audio = True
+    fps = get_frame_rate(job.input_path) or 30.0
+
+    # A stalled capture clock makes the container duration a lie: the encode
+    # would pin at 100% and cram the remaining picture into the last seconds.
+    # Detect it once here and rebuild the timeline from element counts.
+    fix_pts = False
+    if fix_pts_mode != "never":
+        broken, real_duration = probe_ts_timeline(job.input_path, fps)
+        fix_pts = fix_pts_mode == "always" or broken
+        if fix_pts:
+            job.pts_fixed = True
+            copy_audio = False
+            if real_duration > 0:
+                job.duration = real_duration
 
     def cancelled() -> bool:
         with state.lock:
@@ -431,7 +611,8 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     def attempt() -> Tuple[int, str]:
         return _run_ffmpeg(
             _build_ffmpeg_cmd(job, codec, preset, quality, device,
-                              copy_audio, sw_decode), job, state)
+                              copy_audio, sw_decode, fix_pts, fps),
+            job, state)
 
     try:
         returncode, stderr_text = attempt()
@@ -614,7 +795,8 @@ class TUI:
                 t = threading.Thread(
                     target=ffmpeg_worker,
                     args=(job, self.state, self.args.codec, self.args.preset,
-                          self.args.quality, self.args.delete, self.args.vr),
+                          self.args.quality, self.args.delete, self.args.vr,
+                          self.args.fix_pts),
                     daemon=True,
                 )
                 self.state.workers.append(t)
@@ -938,6 +1120,8 @@ class TUI:
         if current:
             name = current.basename
             label = f" [{idx}/{total}] {name} "
+            if current.pts_fixed:
+                label += "⟲ timeline rebuilt "
             if active_count > 1:
                 label += f"(+{active_count - 1} active) "
         elif self.queue.pending:
@@ -1182,6 +1366,14 @@ def parse_args() -> argparse.Namespace:
                         "downscales. Outputs are written under a VR/ "
                         "subdirectory of the output root. An explicit -q "
                         "still overrides the default.")
+    p.add_argument("--fix-pts", dest="fix_pts", default="auto",
+                   choices=["auto", "always", "never"],
+                   help="Rebuild the output timeline from decoded frame/sample "
+                        "counts instead of the container timestamps, for "
+                        "captures whose clock stalled (frames present, PTS "
+                        "barely advancing). auto (default) spot-checks "
+                        ".ts/.mts sources for this; audio is re-encoded in "
+                        "this mode.")
     return p.parse_args()
 
 def main_curses(stdscr, queue: Queue, state: SharedState, args):
@@ -1250,9 +1442,12 @@ def main():
 
     # ── Summary after TUI exit ──────────────────────────────────────
     done, failed, skipped, kept, total_in, total_out = queue.stats
+    fixed = sum(1 for j in queue.jobs if j.pts_fixed)
     print()
     print("═" * 44)
     print(f" Done: {done}  |  Failed: {failed}  |  Skipped: {skipped}  |  Kept: {kept}")
+    if fixed:
+        print(f" Timeline rebuilt: {fixed} file(s) (stalled source PTS)")
     if done + failed + skipped + kept > 0:
         saved = total_in - total_out
         if saved >= 0:
