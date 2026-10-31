@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE 1 "2026-10-02" "ctbrec-merge" "User Commands"
+.TH CTBREC-MERGE 1 "2026-10-31" "ctbrec-merge" "User Commands"
 .SH NAME
 ctbrec-merge \- losslessly merge and repair ctbrec transport stream recordings
 .SH SYNOPSIS
@@ -55,30 +55,44 @@ switches the script into repair mode. Instead of merging, it scans the
 recordings under
 .B \-\-dir
 and rewrites, in place and losslessly, any whose timeline contains phantom gaps
-left by an earlier merge (see BEHAVIOUR). Repair ffmpeg runs at low CPU/IO
-priority with a hard per\-device bandwidth cap, so an unrelated encode reading
-the same disk keeps its share of the device.
+left by an earlier merge (see BEHAVIOUR).
 .P
-The defaults are tuned for a drive\-managed SMR disk, where large write bursts
-cause long stalls:
-.IP \(bu 2
-merging is deferred when more than
+.SS IO policy
+Everything that decides how much of the disk a run may use is controlled by a
+single
+.B \-\-mode
+preset; the individual knobs are still there as overrides but normally do not
+need to be touched.
+.TP
+.B max
+Full throughput: no bandwidth cap, no cooldown, no drain waits, and
+.B \-\-jobs
+defaults to 8 for probing. Use it when nothing is recording.
+.TP
+.B balanced
+(default) Steady 90M/s read and write per device, no burst, a short cooldown
+and a drain check before each burst. A merge therefore never saturates the
+drive, and a large group no longer ends in a wall of 100% io.
+.TP
+.B reserved
+Leaves the drive to everything else: 40M/s cap, idle ionice class, a long
+cooldown, and a strict drain gate. If the disk is still busy after
+.BR \-\-io\-wait\-max ,
+the run stops instead of adding another burst; the next run picks up where it
+left off.
+.P
+The cap is applied to the ffmpeg doing the work, never to the recorders, so an
+unrelated writer keeps its share of the device. In append mode the bytes flow
+through this process rather than straight into ffmpeg's own file, so the same
+rate is enforced by a token bucket on the copy loop; back\-pressure from the
+pipe throttles ffmpeg's read side as well.
+.P
+The merge is deferred when more than
 .B \-\-max\-streams
-recordings are open for writing;
-.IP \(bu 2
-the run refuses to start when the filesystem is below
+recordings are open for writing, and the run refuses to start when the
+filesystem is below
 .B \-\-min\-free\-pct
-percent free;
-.IP \(bu 2
-after a group that merged at least one file the run takes a
-.B \-\-cooldown
-and then waits (up to
-.BR \-\-io\-wait\-max )
-for host io pressure to fall below
-.BR \-\-io\-wait\-threshold .
-Groups that merge nothing are not paced, and
-.B \-\-dry\-run
-never waits.
+percent free.
 Every mergeable group is processed unless
 .B \-\-max\-run\-gb
 sets an output budget (unlimited by default).
@@ -102,6 +116,18 @@ Requires
 and
 .BR ffprobe (1).
 .SH OPTIONS
+.TP
+.B \-m, \-\-mode \fI\,max|balanced|reserved\/\fR
+Choose the io policy preset. Defaults to
+.BR balanced .
+Each preset fills in every pacing knob below; any knob given explicitly on the
+command line still wins.
+.TP
+.B \-\-status
+Print the measured disk busy percentage, io stall percentage, unflushed
+(\fIDirty\fR + \fIWriteback\fR) megabytes, the detected device, whether the
+bandwidth cap can be applied, and the thresholds of the active mode, then exit
+without merging. Useful for answering "is the disk busy right now and why".
 .TP
 .B \-\-dir \fIDIR\fR
 Base directory to scan. Defaults to
@@ -158,8 +184,8 @@ timeline is
 with the wall\-clock gaps removed.
 .TP
 .B \-j, \-\-jobs \fIN\fR
-Number of parallel header probes. Defaults to
-.BR 1 ;
+Number of parallel header probes. Defaults to 1, except 8 under
+.BR "\-\-mode max" ;
 probing is I/O\-light and serial probing avoids seek thrash on a busy disk.
 .TP
 .B \-\-no\-append
@@ -185,25 +211,84 @@ Ignored under
 .BR \-\-dry\-run .
 .TP
 .B \-\-cooldown \fISECONDS\fR
-Minimum time to sleep between merged groups. Defaults to
-.BR 10 .
+Minimum time to sleep before starting another burst. Defaults to 5 under
+.BR balanced ,
+30 under
+.BR reserved ,
+and 0 under
+.BR max .
 .TP
 .B \-\-io\-wait\-max \fISECONDS\fR
-After
+Wait up to this long, after
 .BR \-\-cooldown ,
-wait up to this long for host io pressure to fall below
-.BR \-\-io\-wait\-threshold .
-.B 0
-disables the pressure poll, but not the
-.B \-\-cooldown
-sleep; set
-.B \-\-cooldown 0
-for no pacing at all. Defaults to
-.BR 180 .
+for the disk to drain before starting a burst. Defaults to 120 under
+.BR balanced ,
+600 under
+.BR reserved ,
+and 0 (no gate at all) under
+.BR max .
 .TP
 .B \-\-io\-wait\-threshold \fIPERCENT\fR
-Host io pressure (full avg10, in percent) considered drained. Defaults to
-.BR 5 .
+Io stall percentage considered drained, measured from the cumulative
+.B full
+counter in
+.B /proc/pressure/io
+over the sample window rather than from
+.BR avg10 .
+The cumulative form is deliberate:
+.B avg10
+is a decaying average and reads 0 the moment a burst pauses, even while
+hundreds of megabytes of dirty pages are still owed to the disk. Defaults to 10
+under
+.BR balanced ,
+3 under
+.BR reserved .
+.TP
+.B \-\-disk\-busy\-threshold \fIPERCENT\fR
+Device busy percentage (from
+.BR /proc/diskstats )
+considered drained. Defaults to 40 under
+.BR balanced ,
+15 under
+.BR reserved ,
+100 (ignored) under
+.BR max .
+.TP
+.B \-\-drain\-dirty\-mb \fIMB\fR
+Megabytes of
+.B Dirty
+plus
+.B Writeback
+still owed to the disk that counts as busy. This is the signal a burst has
+finished at the filesystem level even though no process is blocked yet: the
+write went into the page cache and the stall only appears later, in a kworker.
+Defaults to 256 under
+.BR balanced ,
+64 under
+.BR reserved ,
+0 (ignored) under
+.BR max .
+.TP
+.B \-\-drain\-sample \fISECONDS\fR
+Length of each measurement window when checking for drain. Defaults to
+.BR 1 .
+.TP
+.B \-\-drain\-timeout\-action \fI\,proceed|stop\/\fR
+What to do when the disk is still busy after
+.BR \-\-io\-wait\-max .
+.B proceed
+starts the burst anyway;
+.B stop
+ends the run with the remaining groups left for the next one. Defaults to
+.B proceed
+under
+.B max
+and
+.BR balanced ,
+and to
+.B stop
+under
+.BR reserved .
 .TP
 .B \-\-max\-run\-gb \fIGB\fR
 Stop after roughly
@@ -231,29 +316,65 @@ bitrate and so its content duration. Defaults to
 .BR 60 .
 .TP
 .B \-\-nice \fIN\fR
-Run repair ffmpeg at nice level
-.IR N .
-Defaults to
-.BR 19 .
+Nice level for the merge and repair ffmpeg. Defaults to 0 under
+.BR max ,
+10 under
+.BR balanced ,
+19 under
+.BR reserved .
+.TP
+.B \-\-io\-class \fI\,best-effort|idle\/\fR
+Ionice class for the merge and repair ffmpeg. Defaults to
+.B best\-effort
+(nice 7) under
+.B max
+and
+.BR balanced ,
+and to
+.B idle
+under
+.BR reserved .
 .TP
 .B \-\-io\-rate \fIRATE\fR
-Hard per\-device read and write bandwidth cap for repair ffmpeg, applied with
+Hard per\-device read and write bandwidth cap for the ffmpeg doing the merge or
+repair, applied with
 .BR systemd\-run (1)
 via
 .B IOReadBandwidthMax
 and
 .BR IOWriteBandwidthMax .
 Defaults to
-.BR 80M .
-.B 0
-disables the cap, leaving only
-.B nice
+.B 90M
+under
+.BR balanced ,
+.B 40M
+under
+.BR reserved ,
 and
-.BR ionice .
+.B 0
+(no cap) under
+.BR max .
+.B 0
+leaves only
+.BR nice " and " ionice .
+The cap is skipped when no block device backs
+.B \-\-dir
+or when a systemd scope cannot be created; the script warns once and falls back
+rather than failing.
+.TP
+.B \-\-io\-weight \fIN\fR
+cgroup io weight (1\-10000) for the scope hosting that ffmpeg. Defaults to 1000
+under
+.BR max ,
+100 under
+.BR balanced ,
+10 under
+.BR reserved .
 .TP
 .B \-\-io\-device \fIDEV\fR
 Block device for
-.BR \-\-io\-rate .
+.BR \-\-io\-rate
+and for the busy\-time measurements.
 Defaults to the device backing
 .BR \-\-dir ,
 detected with
@@ -308,15 +429,33 @@ Before each group, free space is checked against the bytes that group will add
 Progress is printed before scanning each model and before each ffmpeg append
 or remux, so a long SMR garbage\-collection stall is not mistaken for a hang.
 .IP \(bu 2
-After a group that merged at least one file the script sleeps
+A burst is paced on both sides. While it runs, ffmpeg is executed inside a
+systemd scope carrying the
+.B \-\-io\-rate
+cap and the mode's io weight; in append mode the copy loop additionally
+sleeps to hold the same average rate, which also throttles ffmpeg's input
+through pipe back\-pressure. There is therefore no such thing as "a large merge
+that pins the disk at 100%": the group simply takes longer.
+.IP \(bu 2
+Before a burst, and after any group that actually wrote output, the run
+sleeps
 .B \-\-cooldown
-seconds and then polls
-.B /proc/pressure/io
-until host io pressure is below
-.BR \-\-io\-wait\-threshold
-for two consecutive samples or
+seconds and then polls until the disk is quiet for two consecutive samples or
 .B \-\-io\-wait\-max
-elapses.
+expires. "Quiet" means device busy below
+.BR \-\-disk\-busy\-threshold ,
+io stall below
+.BR \-\-io\-wait\-threshold ,
+and unflushed data below
+.BR \-\-drain\-dirty\-mb ;
+all three must agree. When it never gets quiet the mode decides between
+starting anyway and stopping the run. Groups that write nothing are not paced,
+and
+.B \-\-dry\-run
+never waits.
+.IP \(bu 2
+Every merged file reports its own throughput (elapsed time and MB/s), so a slow
+group is visible in the log instead of looking like a hang.
 .IP \(bu 2
 The output keeps the first part's filename, so the merged file stays in the
 same directory as its inputs.
@@ -342,10 +481,28 @@ Preview the merge plan for the default server directory:
 ctbrec-merge \-\-dry\-run
 .EE
 .P
-Merge for real (append mode, low\-I/O defaults):
+Merge with the default balanced policy (90M/s cap, short waits):
 .IP
 .EX
 ctbrec-merge
+.EE
+.P
+Use the whole disk because nothing is being recorded:
+.IP
+.EX
+ctbrec-merge \-\-mode max
+.EE
+.P
+Stay out of the way of a live encode on the same spindle:
+.IP
+.EX
+ctbrec-merge \-\-mode reserved
+.EE
+.P
+Ask what the disk is doing right now:
+.IP
+.EX
+ctbrec-merge \-\-status
 .EE
 .P
 Merge with the originals kept (forces a concat remux):
@@ -357,7 +514,7 @@ ctbrec-merge \-\-keep \-\-verify
 Ignore the activity gate and all drain waits:
 .IP
 .EX
-ctbrec-merge \-\-max\-streams 999 \-\-cooldown 0 \-\-io\-wait\-max 0
+ctbrec-merge \-\-mode max \-\-max\-streams 999
 .EE
 .P
 Merge the old flat directory layout:

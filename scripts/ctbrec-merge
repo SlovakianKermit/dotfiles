@@ -150,41 +150,169 @@ def active_write_paths(root):
     return active
 
 
-def io_full_avg10():
+def psi_full_total():
+    """Cumulative microseconds of full io stall, or None.
+
+    The counter is used instead of ``avg10``.  ``avg10`` is a decaying average,
+    so it reads 0 the instant a burst pauses -- exactly the moment the kernel
+    still has hundreds of megabytes of dirty pages to flush.  Dividing the
+    counter's delta by the elapsed time gives the true stall percentage over
+    the sample window with no smoothing and no aliasing.
+    """
     try:
         with open("/proc/pressure/io") as f:
             for line in f:
                 if line.startswith("full"):
                     for tok in line.split():
-                        if tok.startswith("avg10="):
-                            return float(tok.split("=", 1)[1])
+                        if tok.startswith("total="):
+                            return int(tok.split("=", 1)[1])
     except (OSError, ValueError):
         return None
     return None
 
 
-def wait_for_drain(args):
-    if args.cooldown > 0:
+def meminfo_unflushed():
+    """Bytes the kernel still owes the disk (Dirty + Writeback)."""
+    vals = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                key, _, rest = line.partition(":")
+                if key in ("Dirty", "Writeback"):
+                    vals[key] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    if not vals:
+        return None
+    return vals.get("Dirty", 0) + vals.get("Writeback", 0)
+
+
+def diskstats_io_ticks(targets):
+    """Milliseconds the device(s) spent doing io, straight from the kernel."""
+    want = {f"{maj}:{mino}" for maj, mino in targets}
+    if not want:
+        return None
+    ticks = None
+    try:
+        with open("/proc/diskstats") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 14 or f"{parts[0]}:{parts[1]}" not in want:
+                    continue
+                try:
+                    t = int(parts[12])
+                except ValueError:
+                    continue
+                ticks = t if ticks is None else max(ticks, t)
+    except OSError:
+        return None
+    return ticks
+
+
+def device_targets(path):
+    """(major, minor) of the disk backing path, whole disk first.
+
+    Whole-disk statistics are preferred so a sibling partition or an unrelated
+    writer on the same spindle still shows up as busy.
+    """
+    dev = backing_device(path)
+    if not dev:
+        return []
+    try:
+        st = os.stat(dev)
+    except OSError:
+        return []
+    maj, mino = os.major(st.st_rdev), os.minor(st.st_rdev)
+    targets = [(maj, mino)]
+    try:
+        parent = os.path.dirname(os.path.realpath(f"/sys/dev/block/{maj}:{mino}"))
+        with open(os.path.join(parent, "dev")) as f:
+            pmaj, pmino = (int(x) for x in f.read().strip().split(":"))
+        if (pmaj, pmino) != targets[0]:
+            targets.insert(0, (pmaj, pmino))
+    except (OSError, ValueError):
+        pass
+    return targets
+
+
+class DiskSampler:
+    """Measures how busy the backing disk actually is.
+
+    Three independent signals, because each one lies on its own:
+
+    * device busy time from ``/proc/diskstats`` -- the drive is doing work;
+    * PSI ``full`` stall time -- tasks are actually blocked;
+    * ``Dirty``/``Writeback`` -- the kernel still owes the drive bytes that no
+      process is waiting on yet (page cache absorbs the write, the stall comes
+      later in a kworker).
+
+    A burst is only considered finished when all three are quiet.
+    """
+
+    def __init__(self, targets):
+        self.targets = targets or []
+        self.prev = None
+
+    def _read(self):
+        return (time.monotonic(), psi_full_total(),
+                diskstats_io_ticks(self.targets), meminfo_unflushed())
+
+    def prime(self):
+        self.prev = self._read()
+
+    def read(self, window=2.0):
+        if self.prev is None:
+            self.prime()
+        time.sleep(window)
+        cur = self._read()
+        t0, psi0, ticks0, _ = self.prev
+        t1, psi1, ticks1, dirty = cur
+        self.prev = cur
+        dt = max(1e-6, t1 - t0)
+        util = stall = None
+        if ticks0 is not None and ticks1 is not None:
+            util = min(100.0, max(0.0, 100.0 * (ticks1 - ticks0) / 1000.0 / dt))
+        if psi0 is not None and psi1 is not None:
+            stall = min(100.0, max(0.0, 100.0 * (psi1 - psi0) / 1e6 / dt))
+        return {"util": util, "stall": stall,
+                "dirty_mb": None if dirty is None else dirty / 1e6}
+
+
+def wait_for_drain(args, sampler, cooldown=True):
+    """Gate a merge burst until the disk is genuinely quiet.
+
+    Returns False when the disk is still busy after --io-wait-max and the mode
+    says to stop rather than pile another burst onto the backlog.
+    """
+    if cooldown and args.cooldown > 0:
         time.sleep(args.cooldown)
-    if args.io_wait_max <= 0:
-        return
+    if args.io_wait_max <= 0 or sampler is None:
+        return True
     deadline = time.monotonic() + args.io_wait_max
-    stable = 0
+    quiet = 0
     notified = False
+    sampler.prime()
     while time.monotonic() < deadline:
-        v = io_full_avg10()
-        if v is None:
-            return
-        if v <= args.io_wait_threshold:
-            stable += 1
-            if stable >= 2:
-                return
-        else:
-            stable = 0
-            if not notified:
-                print(f"  disk busy ({v:.0f}% io pressure), waiting up to {args.io_wait_max:.0f}s")
-                notified = True
-        time.sleep(2.0)
+        st = sampler.read(args.drain_sample)
+        why = []
+        if st["util"] is not None and st["util"] > args.disk_busy_threshold:
+            why.append(f"disk {st['util']:.0f}% busy")
+        if st["stall"] is not None and st["stall"] > args.io_wait_threshold:
+            why.append(f"{st['stall']:.0f}% io stall")
+        if args.drain_dirty_mb > 0 and st["dirty_mb"] is not None \
+                and st["dirty_mb"] > args.drain_dirty_mb:
+            why.append(f"{st['dirty_mb']:.0f} MB unflushed")
+        if not why:
+            quiet += 1
+            if quiet >= 2:
+                return True
+            continue
+        quiet = 0
+        if not notified:
+            print(f"  waiting for disk ({', '.join(why)}), up to {args.io_wait_max:.0f}s")
+            notified = True
+    print(f"  disk still busy after {args.io_wait_max:.0f}s", file=sys.stderr)
+    return args.drain_timeout_action == "proceed"
 
 
 def find_chain_groups(rows, threshold):
@@ -315,6 +443,13 @@ def append_preflight(group):
     return {"packet": ps, "start_time": group[0]["start_time"]}
 
 
+def rate_txt(started, in_bytes, out_bytes):
+    """'12s, 74 MB/s' for the work a single group just did."""
+    elapsed = max(0.001, time.monotonic() - started)
+    mbps = (in_bytes + out_bytes) / elapsed / 1e6
+    return f"{elapsed:.0f}s, {mbps:.0f} MB/s"
+
+
 def merge_run(group, args):
     gaps = []
     for prev, cur in zip(group, group[1:]):
@@ -363,16 +498,51 @@ def merge_run(group, args):
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
         tf.write(list_txt)
         list_path = tf.name
+    started = time.monotonic()
+    limiter = RateLimiter(parse_rate(args.io_rate))
+    proc = None
     try:
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        cmd = io_priority_prefix(args) + [
+               "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-f", "concat", "-safe", "0", "-i", list_path,
-               "-map", "0", "-c", "copy", "-f", "mpegts", part_path]
-        r = subprocess.run(cmd, input=None, capture_output=True, text=True)
+               "-map", "0", "-c", "copy", "-f", "mpegts", "pipe:1"]
+        errf = tempfile.TemporaryFile()
+        # The output is copied through this process rather than written by
+        # ffmpeg directly: a direct write lands in the page cache at memory
+        # speed and the real disk burst only starts later in writeback, where
+        # neither the token bucket nor the cgroup cap can shape it.
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
+        except OSError as exc:
+            rc = 127
+            stderr = f"could not run ffmpeg: {exc}"
+        else:
+            with open(part_path, "wb") as f:
+                while True:
+                    chunk = proc.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    limiter.add(len(chunk))
+                f.flush()
+                os.fsync(f.fileno())
+            rc = proc.wait()
+            errf.seek(0)
+            stderr = errf.read().decode(errors="replace")
+            errf.close()
     finally:
+        if proc is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
         os.remove(list_path)
     CURRENT_PART = None
-    if r.returncode != 0:
-        print(f"  error: ffmpeg failed, kept originals\n{r.stderr}", file=sys.stderr)
+    if rc != 0:
+        print(f"  error: ffmpeg failed, kept originals\n{stderr}", file=sys.stderr)
         try:
             os.remove(part_path)
         except OSError:
@@ -419,7 +589,9 @@ def merge_run(group, args):
 
     os.rename(part_path, out_path)
 
-    print(f"  ok: {out_name} ({out_size/1e6:.0f} MB), originals {'kept' if args.keep else 'deleted'}")
+    print(f"  ok: {out_name} ({out_size/1e6:.0f} MB, "
+          f"{rate_txt(started, in_sizes, out_size)}), "
+          f"originals {'kept' if args.keep else 'deleted'}")
     return {"merged": True, **base, "size": out_size, "n_del": n_del, "n_keep": n_keep}
 
 
@@ -434,6 +606,8 @@ def append_run(group, args, pre, base, gaps):
     # merged timeline has no phantom gaps and byte<->time seeking stays linear.
     cur_end = start1 + max(0.0, group[0]["mtime"] - group[0]["start"])
     appended = 0
+    limiter = RateLimiter(parse_rate(args.io_rate))
+    started = time.monotonic()
     CURRENT_APPEND = out_path
     CURRENT_APPEND_SIZE = orig_size
     with open(out_path, "ab") as f:
@@ -442,17 +616,44 @@ def append_run(group, args, pre, base, gaps):
             if off < last_off + APPEND_MARGIN:
                 off = last_off + APPEND_MARGIN
             print(f"  appending {e['name']} ({e['size']/1e6:.0f} MB)")
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            cmd = io_priority_prefix(args) + [
+                   "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                    "-i", e["path"], "-map", "0", "-c", "copy",
                    "-muxdelay", "0", "-muxpreload", "0",
                    "-output_ts_offset", f"{off:.3f}",
                    "-f", "mpegts", "pipe:1"]
-            r = subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-            if r.returncode != 0:
+            errf = tempfile.TemporaryFile()
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
+            except OSError as exc:
+                errf.close()
                 f.flush()
                 os.truncate(out_path, orig_size)
                 CURRENT_APPEND = None
-                print(f"  error: ffmpeg append failed, part rolled back, kept originals\n{r.stderr.decode(errors='replace')}", file=sys.stderr)
+                print(f"  error: could not run ffmpeg: {exc}, part rolled back, "
+                      f"kept originals", file=sys.stderr)
+                return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+            try:
+                while True:
+                    chunk = proc.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    limiter.add(len(chunk))
+                rc = proc.wait()
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                proc.stdout.close()
+                errf.seek(0)
+                stderr = errf.read().decode(errors="replace")
+                errf.close()
+            if rc != 0:
+                f.flush()
+                os.truncate(out_path, orig_size)
+                CURRENT_APPEND = None
+                print(f"  error: ffmpeg append failed, part rolled back, kept originals\n{stderr}", file=sys.stderr)
                 return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
             last_off = off
             cur_end = off + e.get("start_time", 0.0) + max(0.0, e["mtime"] - e["start"])
@@ -485,7 +686,9 @@ def append_run(group, args, pre, base, gaps):
     CURRENT_APPEND = None
     CURRENT_APPEND_SIZE = 0
 
-    print(f"  ok: {group[0]['name']} ({new_size/1e6:.0f} MB), appended {len(group)-1} part(s), {appended/1e6:.0f} MB folded in")
+    print(f"  ok: {group[0]['name']} ({new_size/1e6:.0f} MB, "
+          f"{rate_txt(started, appended, appended)}), appended {len(group)-1} part(s), "
+          f"{appended/1e6:.0f} MB folded in")
     return {"merged": True, **base, "size": new_size, "n_del": n_del, "n_keep": 0}
 
 
@@ -599,18 +802,98 @@ def io_priority_prefix(args):
     The bandwidth cap lives in the child's own cgroup, so an unrelated ffmpeg
     encode reading the same disk (via a different cgroup, e.g. through Samba)
     keeps its share of the device.  Falls back to nice/ionice alone when no
-    block device backs --dir or systemd-run is unavailable.
+    block device backs --dir, when --io-rate is off, or when the systemd scope
+    is unavailable.
     """
+    inner = ["nice", "-n", str(args.nice)]
+    if args.io_class == "idle":
+        inner += ["ionice", "-c3"]
+    else:
+        inner += ["ionice", "-c2", "-n7"]
     rate = (args.io_rate or "").strip()
     device = args.io_device or backing_device(args.dir)
-    if rate and rate not in ("0", "off", "none"):
-        if device and shutil.which("systemd-run"):
-            return ["systemd-run", "--scope", "-q", "--collect",
-                    "-p", f"IOReadBandwidthMax={device} {rate}",
-                    "-p", f"IOWriteBandwidthMax={device} {rate}",
-                    "-p", "IOWeight=10", "--",
-                    "nice", "-n", str(args.nice), "ionice", "-c3"]
-    return ["nice", "-n", str(args.nice), "ionice", "-c3"]
+    if rate and rate not in ("0", "off", "none") and device and args.io_scope:
+        return ["systemd-run", "--scope", "-q", "--collect", "--no-ask-password",
+                "-p", f"IOReadBandwidthMax={device} {rate}",
+                "-p", f"IOWriteBandwidthMax={device} {rate}",
+                "-p", f"IOWeight={args.io_weight}",
+                "--"] + inner
+    return inner
+
+
+def io_scope_works(args):
+    """Probe once whether a systemd io scope can be created.
+
+    Without the probe a D-Bus or controller problem would make every merge
+    fail instead of silently degrading to nice/ionice.
+    """
+    rate = (args.io_rate or "").strip()
+    if not rate or rate in ("0", "off", "none"):
+        return False
+    if not shutil.which("systemd-run"):
+        return False
+    try:
+        r = subprocess.run(
+            ["systemd-run", "--scope", "-q", "--collect", "--no-ask-password",
+             "-p", "IOWeight=10", "--", "true"],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def ensure_io_scope(args):
+    """Probe the io scope lazily, only once real work is about to start."""
+    if getattr(args, "io_scope", None) is not None:
+        return args.io_scope
+    args.io_scope = io_scope_works(args)
+    rate = (args.io_rate or "").strip()
+    if not args.io_scope and rate and rate not in ("0", "off", "none"):
+        dev = args.io_device or backing_device(args.dir)
+        if dev:
+            print(f"warn: io cap {rate} unavailable on {dev} (no usable systemd "
+                  f"scope); falling back to nice/ionice", file=sys.stderr)
+    return args.io_scope
+
+
+class RateLimiter:
+    """Average-rate limiter for data copied through userspace.
+
+    Append mode streams ffmpeg's stdout into the file, so the write happens in
+    this process and no cgroup sandbox can throttle it.  Throttling the copy
+    rate also throttles ffmpeg, because the pipe backs up and it blocks on
+    write -- so one limiter paces both the read and the write side.
+    """
+
+    def __init__(self, rate):
+        self.rate = rate
+        self.started = time.monotonic()
+        self.done = 0
+
+    def add(self, nbytes):
+        if self.rate <= 0:
+            return
+        self.done += nbytes
+        ahead = self.done / self.rate - (time.monotonic() - self.started)
+        if ahead > 0:
+            time.sleep(min(ahead, 5.0))
+
+
+def parse_rate(rate):
+    """'80M' / '40M' / '2G' / '0' -> bytes per second (0 = no cap)."""
+    rate = (rate or "").strip()
+    if not rate or rate in ("0", "off", "none"):
+        return 0.0
+    mult = 1
+    if rate[-1] in "kKmMgG":
+        mult = {"k": 1e3, "m": 1e6, "g": 1e9}[rate[-1].lower()]
+        rate = rate[:-1]
+    try:
+        return float(rate) * mult
+    except ValueError:
+        return 0.0
+
 
 
 def fix_one(path, args):
@@ -628,20 +911,44 @@ def fix_one(path, args):
     part = path + ".part"
     CURRENT_PART = part
     remove_quiet(part)
+    limiter = RateLimiter(parse_rate(args.io_rate))
     cmd = io_priority_prefix(args) + [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-        "-i", path, "-map", "0", "-c", "copy", "-f", "mpegts", part,
+        "-i", path, "-map", "0", "-c", "copy", "-f", "mpegts", "pipe:1",
     ]
+    errf = tempfile.TemporaryFile()
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
     except OSError as exc:
-        remove_quiet(part)
+        errf.close()
         CURRENT_PART = None
         return False, f"could not run ffmpeg: {exc}", 0
-    if r.returncode != 0:
+    # As with merging, the bytes are copied here instead of written by ffmpeg,
+    # so the rate applies to the actual write and not just to a page-cache
+    # hand-off.
+    try:
+        with open(part, "wb") as f:
+            while True:
+                chunk = proc.stdout.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                limiter.add(len(chunk))
+            f.flush()
+            os.fsync(f.fileno())
+        rc = proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+        errf.seek(0)
+        stderr = errf.read().decode(errors="replace")
+        errf.close()
+    if rc != 0:
         remove_quiet(part)
         CURRENT_PART = None
-        return False, f"ffmpeg failed: {r.stderr.strip()[:300]}", 0
+        return False, f"ffmpeg failed: {stderr.strip()[:300]}", 0
     out_size = os.path.getsize(part)
     if abs(out_size - size) > max(2 * 1024 * 1024, 0.03 * size):
         remove_quiet(part)
@@ -711,23 +1018,27 @@ def run_repair(args, active_paths, now):
 
     rate = (args.io_rate or "").strip()
     device = args.io_device or backing_device(args.dir)
+    ensure_io_scope(args)
     if rate and rate not in ("0", "off", "none"):
-        if device and shutil.which("systemd-run"):
-            print(f"io cap: {rate} read/write on {device}, nice {args.nice}")
-        else:
-            print("warn: io cap unavailable (no block device / no systemd-run); "
-                  "using nice only", file=sys.stderr)
+        if device and args.io_scope:
+            print(f"io cap: {rate} read/write on {device}, weight {args.io_weight}, nice {args.nice}")
+        elif device:
+            print("io cap: unavailable, using nice/ionice only", file=sys.stderr)
 
+    sampler = DiskSampler(device_targets(args.dir))
     fixed = failed = 0
     written = 0
     budget = args.max_run_gb * 1e9
-    for e in selected:
+    for i, e in enumerate(selected):
         du = shutil.disk_usage(os.path.dirname(e["path"]))
         need = e["size"] + FREE_MARGIN_BYTES
         if du.free < need:
             print(f"  skip {e['name']}: need {need/1e9:.1f} GB free, "
                   f"have {du.free/1e9:.1f} GB", file=sys.stderr)
             continue
+        if not wait_for_drain(args, sampler, cooldown=i > 0):
+            print("stopping: disk still saturated, next run will continue", file=sys.stderr)
+            break
         print(f"fixing {e['name']} ({e['ratio']:.2f}x, {e['size']/1e9:.2f} GB)")
         ok, res, residual = fix_one(e["path"], args)
         if ok:
@@ -741,8 +1052,6 @@ def run_repair(args, active_paths, now):
         if budget and written >= budget:
             print(f"run budget reached ({args.max_run_gb:.0f} GB); stopping", file=sys.stderr)
             break
-        if args.cooldown > 0:
-            time.sleep(args.cooldown)
 
     print(f"\ndone: {fixed} file(s) repaired ({written/1e6:.0f} MB output)")
     if failed:
@@ -750,11 +1059,34 @@ def run_repair(args, active_paths, now):
     return 0
 
 
+MODES = {
+    # mode      io cap  weight  nice  class  jobs cooldown wait  stall% busy%  dirty   timeout
+    "max": dict(io_rate="0", io_weight=1000, nice=0, io_class="best-effort", jobs=8,
+                cooldown=0.0, io_wait_max=0.0, io_wait_threshold=100.0,
+                disk_busy_threshold=100.0, drain_dirty_mb=0.0,
+                drain_timeout_action="proceed"),
+    "balanced": dict(io_rate="90M", io_weight=100, nice=10, io_class="best-effort", jobs=1,
+                     cooldown=5.0, io_wait_max=120.0, io_wait_threshold=10.0,
+                     disk_busy_threshold=40.0, drain_dirty_mb=256.0,
+                     drain_timeout_action="proceed"),
+    "reserved": dict(io_rate="40M", io_weight=10, nice=19, io_class="idle", jobs=1,
+                     cooldown=30.0, io_wait_max=600.0, io_wait_threshold=3.0,
+                     disk_busy_threshold=15.0, drain_dirty_mb=64.0,
+                     drain_timeout_action="stop"),
+}
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="ctbrec-merge",
         description="Losslessly merge ctbrec recordings of the same model that were split by a restart (small gaps).",
     )
+    ap.add_argument("-m", "--mode", choices=sorted(MODES), default="balanced",
+                    help="io policy preset: max = all bandwidth, no waits; "
+                         "balanced = capped, brief waits (default); "
+                         "reserved = heavy cap, stops when the disk stays busy")
+    ap.add_argument("--status", action="store_true",
+                    help="print current disk busy/stall/unflushed figures and the active policy, then exit")
     ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
                     help="base directory (one folder per model, or flat .mts files)")
     ap.add_argument("--gap", type=int, default=3600,
@@ -773,20 +1105,14 @@ def main():
                     help="only process files directly in --dir, never enter subdirectories")
     ap.add_argument("--verify", action="store_true",
                     help="verify merged output duration with ffprobe (extra full read)")
-    ap.add_argument("-j", "--jobs", type=int, default=1,
-                    help="parallel header probes (default 1)")
+    ap.add_argument("-j", "--jobs", type=int, default=None,
+                    help="parallel header probes (default: from --mode, 1 except max)")
     ap.add_argument("--no-append", dest="append", action="store_false",
                     help="disable byte-append merging, always remux via ffmpeg concat")
     ap.add_argument("--min-free-pct", type=float, default=3.81,
                     help="refuse to run when the filesystem is less than this percent free (default 3.81)")
     ap.add_argument("--max-streams", type=int, default=4,
                     help="defer when more than this many recordings are open for writing (default 4)")
-    ap.add_argument("--cooldown", type=float, default=10.0,
-                    help="minimum seconds to sleep between merged groups (default 10)")
-    ap.add_argument("--io-wait-max", type=float, default=180.0,
-                    help="after --cooldown, wait up to this many seconds for io pressure to fall below --io-wait-threshold; 0 disables (default 180)")
-    ap.add_argument("--io-wait-threshold", type=float, default=5.0,
-                    help="host io pressure (full avg10 percent) considered drained (default 5)")
     ap.add_argument("--max-run-gb", type=float, default=0.0,
                     help="stop after this many GB of output per run; 0 disables (default unlimited)")
     ap.add_argument("--fix-timestamps", action="store_true",
@@ -795,23 +1121,76 @@ def main():
                     help="repair files whose container/content duration ratio exceeds this (default 1.05)")
     ap.add_argument("--fix-sample", type=float, default=60.0,
                     help="seconds of packets to sample when estimating content duration (default 60)")
-    ap.add_argument("--nice", type=int, default=19,
-                    help="run repair ffmpeg at this nice level (default 19)")
-    ap.add_argument("--io-rate", default="80M",
-                    help="hard read/write bandwidth cap per device for repair ffmpeg via systemd-run (default 80M; 0 disables)")
-    ap.add_argument("--io-device", default=None,
-                    help="block device for --io-rate (default: detected from --dir)")
+
+    adv = ap.add_argument_group("pacing overrides (normally set by --mode)")
+    adv.add_argument("--io-rate", default=None,
+                     help="hard read/write bandwidth cap per device, e.g. 90M; 0 disables")
+    adv.add_argument("--io-weight", type=int, default=None,
+                     help="cgroup io weight for merge/repair ffmpeg (1-10000)")
+    adv.add_argument("--nice", type=int, default=None,
+                     help="nice level for merge/repair ffmpeg")
+    adv.add_argument("--io-class", choices=["best-effort", "idle"], default=None,
+                     help="ionice class for merge/repair ffmpeg")
+    adv.add_argument("--cooldown", type=float, default=None,
+                     help="minimum seconds to sleep between groups")
+    adv.add_argument("--io-wait-max", type=float, default=None,
+                     help="max seconds to wait for the disk to drain before each group; 0 disables")
+    adv.add_argument("--io-wait-threshold", type=float, default=None,
+                     help="io stall percent (measured over the sample window, not avg10) considered drained")
+    adv.add_argument("--disk-busy-threshold", type=float, default=None,
+                     help="device busy percent considered drained")
+    adv.add_argument("--drain-dirty-mb", type=float, default=None,
+                     help="dirty+writeback megabytes still owed to the disk that counts as busy; 0 ignores")
+    adv.add_argument("--drain-sample", type=float, default=1.0,
+                     help="seconds per measurement window when checking for drain (default 1)")
+    adv.add_argument("--drain-timeout-action", choices=["proceed", "stop"], default=None,
+                     help="what to do when the disk is still busy after --io-wait-max")
+    adv.add_argument("--io-device", default=None,
+                     help="block device for the io cap (default: detected from --dir)")
     args = ap.parse_args()
+
+    preset = MODES[args.mode]
+    for key, val in preset.items():
+        if getattr(args, key) is None:
+            setattr(args, key, val)
+    args.io_scope = None
 
     if not os.path.isdir(args.dir):
         print(f"error: {args.dir} is not a directory", file=sys.stderr)
         return 1
+
+    if args.status:
+        dev = args.io_device or backing_device(args.dir) or "no block device"
+        devs = device_targets(args.dir)
+        sampler = DiskSampler(devs)
+        sampler.prime()
+        st = sampler.read(max(0.5, args.drain_sample))
+
+        def pct(v):
+            return "n/a" if v is None else f"{v:.0f}%"
+
+        def mb(v):
+            return "n/a" if v is None else f"{v:.0f} MB"
+
+        print(f"mode: {args.mode}  (io cap {args.io_rate or 'off'}, weight {args.io_weight}, jobs {args.jobs})")
+        print(f"device: {dev}  [{', '.join(f'{a}:{b}' for a, b in devs) or 'no block device'}]")
+        ensure_io_scope(args)
+        print(f"scope: {'active' if args.io_scope else 'unavailable (nice/ionice only)'}")
+        print(f"busy: {pct(st['util'])}   stall: {pct(st['stall'])}   unflushed: {mb(st['dirty_mb'])}")
+        print(f"gate: quiet when busy < {args.disk_busy_threshold:.0f}%, stall < "
+              f"{args.io_wait_threshold:.0f}%, unflushed < {args.drain_dirty_mb:.0f} MB (wait {args.io_wait_max:.0f}s)")
+        return 0
 
     du = shutil.disk_usage(args.dir)
     free_pct = 100.0 * du.free / du.total
     if free_pct < args.min_free_pct:
         print(f"error: only {free_pct:.1f}% free (< --min-free-pct {args.min_free_pct:.0f}), refusing to merge", file=sys.stderr)
         return 1
+
+    print(f"mode: {args.mode}  (io cap {args.io_rate or 'off'} x2, weight {args.io_weight}, "
+          f"jobs {args.jobs}, cooldown {args.cooldown:.0f}s, "
+          f"drain {args.io_wait_max:.0f}s @ <{args.disk_busy_threshold:.0f}% busy/"
+          f"<{args.io_wait_threshold:.0f}% stall)")
 
     now = datetime.now().timestamp()
     active_paths = None
@@ -859,8 +1238,18 @@ def main():
                 model_groups.append((d, entries))
 
     budget = args.max_run_gb * 1e9
+    sampler = None if args.dry_run else DiskSampler(device_targets(args.dir))
+    if model_groups and not args.dry_run:
+        ensure_io_scope(args)
+    gate_next = True
     ran = 0
     for model, entries in model_groups:
+        # Gate *before* the burst: the previous group's writes may still be in
+        # the page cache or queued in the drive's SMR media cache, and adding
+        # another burst on top of that is what pins the disk at 100%.
+        if gate_next and not wait_for_drain(args, sampler, cooldown=ran > 0):
+            print("stopping: disk still saturated, the next run will continue", file=sys.stderr)
+            break
         merged, bytes_out, n_del, n_keep, skipped, res_summary = process_group(model, entries, args)
         total_merged += merged
         total_bytes += bytes_out
@@ -869,11 +1258,10 @@ def main():
         skipped_params += skipped
         summary.extend(res_summary)
         ran += 1
+        gate_next = bool(bytes_out)
         if budget and total_bytes >= budget:
             print(f"run budget reached ({args.max_run_gb:.0f} GB); stopping", file=sys.stderr)
             break
-        if merged and ran < len(model_groups):
-            wait_for_drain(args)
 
     if summary:
         print("\nSummary:")

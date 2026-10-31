@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Remnant II
+Comment=Play this game on Steam
+Exec=steam steam://rungameid/1282100
+Icon=steam_icon_1282100
+Terminal=false
+Type=Application
+Categories=Game;

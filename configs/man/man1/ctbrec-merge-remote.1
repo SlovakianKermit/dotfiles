@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE-REMOTE 1 "2026-10-01" "ctbrec-merge-remote" "User Commands"
+.TH CTBREC-MERGE-REMOTE 1 "2026-10-31" "ctbrec-merge-remote" "User Commands"
 .SH NAME
 ctbrec-merge-remote \- run ctbrec-merge on the Proxmox server over ssh
 .SH SYNOPSIS
@@ -21,7 +21,7 @@ with
 plus any arguments given to the wrapper. All scanning, probing, and merging
 happen on the server; nothing is copied to the local machine. The remote
 interpreter is run with
-.B PYTHONUNBUFFERED\=1
+.B PYTHONUNBUFFERED=1
 so that, despite ssh having no TTY, progress lines stream back live instead of
 arriving in buffered blocks. Standard output and standard error are streamed
 back, and the remote exit status is returned as the wrapper's exit status.
@@ -57,6 +57,8 @@ is also given on the command line, this flag wins.
 All other options are forwarded verbatim to
 .BR ctbrec-merge (1);
 see that page for the full list. The most useful are
+.BR \-\-mode ,
+.BR \-\-status ,
 .BR \-\-dry\-run ,
 .BR \-\-keep ,
 and
@@ -91,10 +93,28 @@ Preview the merge plan on the server:
 ctbrec-merge-remote \-\-dry\-run
 .EE
 .P
-Merge on the server, verifying each output:
+Merge on the server at the default balanced io policy:
 .IP
 .EX
 ctbrec-merge-remote \-\-verify
+.EE
+.P
+Merge flat out while nothing is recording:
+.IP
+.EX
+ctbrec-merge-remote \-\-mode max \-\-detach
+.EE
+.P
+Merge without disturbing a live encode on the same disk:
+.IP
+.EX
+ctbrec-merge-remote \-\-mode reserved \-\-detach
+.EE
+.P
+Ask the server what the disk is doing:
+.IP
+.EX
+ctbrec-merge-remote \-\-status
 .EE
 .P
 Merge on the server so the job survives closing the terminal:

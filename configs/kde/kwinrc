@@ -13,6 +13,10 @@ Mode=Constant
 [Plugins]
 shakecursorEnabled=false
 
+[Tiling][0c9a1f79-af82-487f-b80f-feccd67ba16c][]
+padding=4
+tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}
+
 [Tiling][0c9a1f79-af82-487f-b80f-feccd67ba16c][59d4f900-a717-4f01-abe4-10b98181934d]
 padding=4
 tiles={"layoutDirection":"horizontal","tiles":[{"width":0.25},{"width":0.5},{"width":0.25}]}

@@ -1,5 +1,4 @@
 amf-amdgpu-pro
-aria2-next
 bottles
 cemu
 cpuid
