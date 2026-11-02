@@ -16,6 +16,8 @@ local options = {
 	notify_error_timeout = 15000,
 	delete_source = true,
 	quit_after_cut = true,
+	delete_retries = 5,
+	delete_retry_delay = 0.75,
 }
 
 require("mp.options").read_options(options, "mpv-lossless-cut")
@@ -153,22 +155,78 @@ local function ensure_directory_exists(dir)
 	return true
 end
 
+-- Best-effort unlink that reports *why* it failed. Returns true if the path is
+-- no longer there (missing already counts as success).
 local function delete_file(file_path)
 	local file_info = utils.file_info(file_path)
 
-	if not file_info or file_info.is_dir then
-		return false
+	if not file_info then
+		-- already gone; nothing to do
+		return true
+	end
+
+	if file_info.is_dir then
+		return false, "path is a directory"
 	end
 
 	local args
 	if os_name == "windows" then
-		args = { "cmd", "/c", "del", file_path }
+		args = { "cmd", "/c", "del", "/f", file_path }
 	else
-		args = { "rm", file_path }
+		-- "--" so names starting with a dash are not parsed as options
+		args = { "rm", "-f", "--", file_path }
 	end
 
-	local res = utils.subprocess({ args = args, cancellable = false })
-	return res.status == 0
+	local res = utils.subprocess({
+		args = args,
+		cancellable = false,
+		capture_stdout = true,
+		capture_stderr = true,
+	})
+
+	if res.status == 0 then
+		return true
+	end
+
+	local err = res.stderr and res.stderr:gsub("%s+$", "") or ""
+	if err == "" then
+		err = "rm exited with " .. tostring(res.status)
+	end
+	return false, err
+end
+
+-- Delete the source after a verified cut. Network shares (SMB/CIFS, NFS) can
+-- refuse - or only complete - an unlink while the player still holds the file
+-- open, so this retries with backoff and confirms the file is really gone
+-- instead of trusting the exit status. Calls on_done(err) when it gives up.
+local function delete_source(file_path, on_done)
+	local attempts = math.max(1, math.floor(tonumber(options.delete_retries) or 1))
+	local delay = tonumber(options.delete_retry_delay) or 0.75
+
+	local function attempt(n)
+		local ok, err = delete_file(file_path)
+
+		-- some servers accept the delete but only unlink once the last handle
+		-- is closed, so the filesystem - not the exit code - is the truth
+		if ok and not utils.file_info(file_path) then
+			log("Deleted source: " .. file_path)
+			on_done(nil)
+			return
+		elseif ok then
+			err = "file still present after rm"
+		end
+
+		if n >= attempts then
+			on_done(err or "unknown error")
+			return
+		end
+
+		mp.add_timeout(delay * 2 ^ (n - 1), function()
+			attempt(n + 1)
+		end)
+	end
+
+	attempt(1)
 end
 
 local function set_file_times(file_path, mtime)
@@ -670,20 +728,23 @@ local function cut_render()
 				end
 			end
 
-			if do_delete and not delete_file(source) then
-				-- some mounts won't unlink while the handle is still closing
-				mp.add_timeout(1.0, function()
-					if delete_file(source) then
-						log("Deleted source: " .. source)
-					else
-						msg.warn("Could not delete source: " .. source)
+			if do_delete then
+				-- Unload the source first: a share can keep refusing the
+				-- unlink (or only complete it on close) while mpv still has
+				-- the file open, and the demuxer readahead keeps the share
+				-- busy. Only safe to stop playback when we are quitting anyway.
+				if options.quit_after_cut then
+					mp.commandv("stop")
+				end
+
+				delete_source(source, function(err)
+					if err then
+						msg.error("Could not delete source " .. source .. ": " .. tostring(err))
+						notify("Source not deleted", source .. "\n" .. tostring(err), "critical")
 					end
 					finish()
 				end)
 			else
-				if do_delete then
-					log("Deleted source: " .. source)
-				end
 				finish()
 			end
 		end
