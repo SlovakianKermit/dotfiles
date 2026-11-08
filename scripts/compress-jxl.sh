@@ -9,8 +9,8 @@ EFFORT=3
 THREADS=$(nproc)
 LOG_MODE=0
 COMPARE_MODE=0
-TARGET_W=2560
-TARGET_H=1440
+TARGET_W=0
+TARGET_H=0
 
 # ── Usage ─────────────────────────────────────────────────
 usage() {
@@ -23,7 +23,7 @@ Recursively convert images to JPEG XL. Replaces originals only when smaller.
   -q, --quality N    Quality 0-100 (default: $QUALITY)
   -e, --effort N     Encoder effort 1-10 (default: $EFFORT)
   -s, --size WxH     Max dimensions, fits within box keeping aspect, or 'none'
-                     (default: ${TARGET_W}x${TARGET_H})
+                     (default: none — images keep their original size)
   -t, --threads N    Parallel jobs (default: $(nproc))
   -c, --compare      Save pre-encode PNGs to /tmp/jxl_compare_src/
   -l, --log          Save a log file in the images directory
@@ -36,7 +36,7 @@ Examples:
   compress-jxl.sh ~/Pics 80 5            # custom dir, q80, e5
   compress-jxl.sh -q 75 -e 3 -c          # named flags + compare mode
   compress-jxl.sh -l -e 1                # log timing + results
-  compress-jxl.sh -s none ~/Pics         # never downscale
+  compress-jxl.sh -s none ~/Pics         # never downscale (default)
   compress-jxl.sh -s 1920x1080 ~/Pics    # cap at 1080p
 EOF
 }

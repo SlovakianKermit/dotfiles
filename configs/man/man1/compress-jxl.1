@@ -1,4 +1,4 @@
-.TH COMPRESS-JXL 1 "2026-11-08" "2.0" "User Commands"
+.TH COMPRESS-JXL 1 "2026-11-08" "2.1" "User Commands"
 .SH NAME
 compress-jxl \- batch compress images to JPEG XL
 .SH SYNOPSIS
@@ -17,9 +17,9 @@ compress-jxl \- batch compress images to JPEG XL
 Recursively finds all \fB.jpg\fP, \fB.jpeg\fP, and \fB.png\fP files under
 the target directory and converts them to JPEG XL (\fB.jxl\fP) using
 .BR cjxl (1).
-Images whose width or height exceeds the target box (2560\(mu1440 by
-default, see \fB\-s\fP) are downscaled to fit inside it with the aspect
-ratio unchanged.
+Images are left at their original resolution by default.
+If a target box is supplied with \fB\-s\fP, images whose width or height
+exceeds it are downscaled to fit inside it with the aspect ratio unchanged.
 The original file is replaced only if the compressed output is smaller.
 Directories named
 .B Cooking
@@ -71,10 +71,10 @@ nominal setting.
 .RE
 .TP
 .BR \-s ", " \-\-size " \fIWxH\fP|\fBnone\fR"
-Maximum output dimensions (default: 2560\(mu1440).
-Larger images are scaled to fit within the box while keeping their
-aspect ratio; the image is never enlarged.
-Use \fBnone\fP (or \fB0\fP) to disable downscaling entirely.
+Maximum output dimensions (default: \fBnone\fP, no downscaling).
+When \fIWxH\fP is given, larger images are scaled to fit within the box
+while keeping their aspect ratio; the image is never enlarged.
+Use \fBnone\fP (or \fB0\fP) to make this explicit.
 .TP
 .BR \-t ", " \-\-threads " \fIthreads\fP"
 Parallel encode jobs (default: one per CPU core).
@@ -113,7 +113,7 @@ Numeric effort (1\(en10). Must follow a numeric quality.
 .SH EXAMPLES
 .TP
 compress-jxl.sh
-Run with defaults: quality 85, effort 3, 2560\(mu1440 cap,
+Run with defaults: quality 85, effort 3, no downscaling,
 \fB~/Pictures/img/Downloads\fP.
 .TP
 compress-jxl.sh 80
@@ -129,10 +129,10 @@ compress-jxl.sh -q 75 -e 3 -t 6 -c ~/ai_art
 Quality 75, effort 3, 6 parallel jobs, save comparison sources.
 .TP
 compress-jxl.sh -s 1920x1080 ~/Pictures/wallpapers
-Cap downscaling at 1080p instead of the default 2560\(mu1440.
+Downscale to fit 1080p instead of the default (no downscaling).
 .TP
-compress-jxl.sh -s none ~/Pictures/archive
-Keep original resolution for every file.
+compress-jxl.sh -s 2560x2560 ~/Pictures/archive
+Cap the long edge at 2560 px for every orientation.
 .SH BEHAVIOUR
 Each file is encoded to a temporary name and moved into place only after
 a successful encode, so an interrupted run never leaves a partial
