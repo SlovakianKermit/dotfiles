@@ -1,4 +1,4 @@
-.TH CHECK-AI-IMAGES 1 "2026-08-10" "check-ai-images" "User Commands"
+.TH CHECK-AI-IMAGES 1 "2026-11-08" "check-ai-images" "User Commands"
 .SH NAME
 check-ai-images \- scan subdirectories for AI-generation image metadata
 .SH SYNOPSIS
@@ -18,10 +18,12 @@ AI-generation metadata, using
 For each immediate subdirectory (depth 1, not recursive), a sample of at most
 .B 3
 images is taken (jpg, jpeg, png, webp, avif, heic, heif, tiff, tif, bmp, gif,
-jxl). Each sample is dumped as JSON with
+jxl), keeping the first three names in sort order. All samples are then
+inspected with a single
 .B exiftool \-j
-and every metadata value is matched, case-insensitively, against the detection
-patterns listed in DETECTION PATTERNS. A single match flags the whole
+run, split across a few parallel workers (one per CPU core, capped at 8).
+Every metadata tag name and value is matched, case-insensitively, against the
+detection patterns listed in DETECTION PATTERNS. A single match flags the whole
 subdirectory.
 .P
 A final summary is printed:
@@ -37,12 +39,13 @@ directories containing no supported image files, prefixed
 (only shown if any)
 .P
 In verbose mode, the matching file and pattern are also reported to standard
-error for each flagged directory, as the scan runs.
+error for each flagged directory, after the scan completes.
 .SH OPTIONS
 .TP
 .B \-v
 Verbose. For each flagged directory, print the triggering file and matched
-pattern to standard error:
+pattern to standard error (the first pattern that matches, in the order of
+DETECTION PATTERNS):
 .RS
 .PD 0
 .TP
@@ -64,8 +67,8 @@ Print the usage summary and exit with status 1.
 Target directory to scan. Defaults to the current working directory. Must be
 a directory; otherwise an error is printed and the script exits with status 1.
 .SH DETECTION PATTERNS
-An image is flagged if any of its metadata values matches one of the
-following signatures:
+An image is flagged if one of its metadata tag names or values matches one of
+the following signatures:
 .IP \(bu 2
 .B Tool signatures
 (substring match): Midjourney, Stable Diffusion, DALL\-E (also DALL\(pcE),
@@ -108,12 +111,15 @@ check-ai-images \-v ~/Downloads
 Scan completed.
 .TP
 .B 1
-Help was shown, an unknown option was given, or the target is not a
-directory.
+Help was shown, an unknown option was given, the target is not a directory,
+or a required tool is missing.
 .SH REQUIREMENTS
 .B exiftool
 must be installed (from
-.BR perl-image-exiftool ).
+.BR perl-image-exiftool ),
+along with
+.BR jq (1).
 .SH SEE ALSO
 .BR exiftool (1),
+.BR jq (1),
 .BR find (1)
