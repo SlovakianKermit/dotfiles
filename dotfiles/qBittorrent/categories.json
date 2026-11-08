@@ -1,11 +1,12 @@
 {
     "Image": {
-        "download_path": "/home/killian/Pictures/img/Downloads/Cooking",
+        "download_path": "/mnt/shared/img/Downloads/Cooking",
         "inactive_seeding_time_limit": -2,
-        "ratio_limit": -2,
-        "save_path": "/home/killian/Pictures/img/Downloads",
-        "seeding_time_limit": 0,
-        "share_limit_action": "Stop"
+        "ratio_limit": -1,
+        "save_path": "/mnt/shared/img/Downloads",
+        "seeding_time_limit": -1,
+        "share_limit_action": "Stop",
+        "share_limits_mode": "Default"
     },
     "Movies": {
         "download_path": false,
@@ -13,7 +14,8 @@
         "ratio_limit": -2,
         "save_path": "/mnt/data_storage/Movies",
         "seeding_time_limit": -2,
-        "share_limit_action": "Default"
+        "share_limit_action": "Default",
+        "share_limits_mode": "Default"
     },
     "Shows": {
         "download_path": false,
@@ -21,6 +23,7 @@
         "ratio_limit": -2,
         "save_path": "/mnt/data_storage/Shows",
         "seeding_time_limit": -2,
-        "share_limit_action": "Default"
+        "share_limit_action": "Default",
+        "share_limits_mode": "Default"
     }
 }

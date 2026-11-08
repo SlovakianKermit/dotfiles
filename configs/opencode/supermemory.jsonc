@@ -7,7 +7,7 @@
   "maxProfileItems": 5,
   "injectProfile": true,
   "autoRecallEveryPrompt": true,
-  "captureEveryNTurns": 3,
+  "captureEveryNTurns": 5,
   "compactionThreshold": 0.8,
   "projectContainerTag": "sm_project_default"
 }

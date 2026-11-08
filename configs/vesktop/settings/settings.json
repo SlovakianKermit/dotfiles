@@ -517,7 +517,9 @@
             "enabled": true
         },
         "WebKeybinds": {
-            "enabled": true
+            "enabled": true,
+            "showNavigationButtons": true,
+            "overrideCommonKeybinds": true
         },
         "WebScreenShareFixes": {
             "enabled": true
@@ -563,6 +565,18 @@
         },
         "ExpressionManager": {
             "enabled": false
+        },
+        "AddAttachments": {
+            "enabled": false
+        },
+        "DirectFileDownload": {
+            "enabled": false
+        },
+        "JumpToTop": {
+            "enabled": false
+        },
+        "MutedServersActivityBadge": {
+            "enabled": false
         }
     },
     "uiElements": {
@@ -579,7 +593,7 @@
         "authenticated": false,
         "url": "https://api.vencord.dev/",
         "settingsSync": false,
-        "settingsSyncVersion": 1793384000796
+        "settingsSyncVersion": 1794014159243
     },
     "nativeTitleBar": false
 }
