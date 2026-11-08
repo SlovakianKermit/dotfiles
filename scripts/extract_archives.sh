@@ -2,8 +2,8 @@
 
 set -uo pipefail
 
-ROOT="."
 DEPTH=1
+declare -a PATHS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -12,9 +12,11 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     -h | --help)
-      echo "Usage: $(basename "$0") [OPTIONS] [DIRECTORY]"
+      echo "Usage: $(basename "$0") [OPTIONS] [PATH...]"
       echo ""
-      echo "Extract archives. By default only archives directly inside DIRECTORY (or . ) are processed."
+      echo "Extract archives. PATH may be a directory (archives up to DEPTH levels"
+      echo "inside it are processed) or an archive file (processed directly,"
+      echo "bypassing the directory scan). Default PATH is the current directory."
       echo ""
       echo "Options:"
       echo "  -d, --depth N   Process archives up to N directories deep (default: 1)"
@@ -26,7 +28,7 @@ while [[ $# -gt 0 ]]; do
       exit 1
       ;;
     *)
-      ROOT="$1"
+      PATHS+=("$1")
       shift
       ;;
   esac
@@ -148,20 +150,49 @@ extract_archive() {
   echo "  [DONE] Extracted and removed: $archive"
 }
 
-# Find all supported archives and process them
-while IFS= read -r -d '' archive; do
-  extract_archive "$archive"
-done < <(find "$ROOT" -maxdepth "$DEPTH" -type f \( \
-  -iname "*.zip" \
-  -o -iname "*.tar" \
-  -o -iname "*.tar.gz" \
-  -o -iname "*.tgz" \
-  -o -iname "*.tar.bz2" \
-  -o -iname "*.tbz2" \
-  -o -iname "*.tar.xz" \
-  -o -iname "*.txz" \
-  -o -iname "*.7z" \
-  \) -print0)
+# Build the list of archives to process
+if [[ ${#PATHS[@]} -eq 0 ]]; then
+  PATHS=(".")
+fi
+
+declare -a ARCHIVES=()
+
+collect_from_dir() {
+  local dir="$1" found
+  while IFS= read -r -d '' found; do
+    ARCHIVES+=("$found")
+  done < <(find "$dir" -maxdepth "$DEPTH" -type f \( \
+    -iname "*.zip" \
+    -o -iname "*.tar" \
+    -o -iname "*.tar.gz" \
+    -o -iname "*.tgz" \
+    -o -iname "*.tar.bz2" \
+    -o -iname "*.tbz2" \
+    -o -iname "*.tar.xz" \
+    -o -iname "*.txz" \
+    -o -iname "*.7z" \
+    \) -print0)
+}
+
+for path in "${PATHS[@]}"; do
+  if [[ -d "$path" ]]; then
+    collect_from_dir "$path"
+  elif [[ -f "$path" ]]; then
+    # Explicit archive path: no directory scan, processed as given.
+    ARCHIVES+=("$path")
+  else
+    echo "No such file or directory: $path" >&2
+    exit 1
+  fi
+done
+
+if [[ ${#ARCHIVES[@]} -gt 0 ]]; then
+  for archive in "${ARCHIVES[@]}"; do
+    extract_archive "$archive"
+  done
+else
+  echo "No archives found."
+fi
 
 # --- Summary ---
 echo ""

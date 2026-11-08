@@ -1,0 +1,176 @@
+.TH QBT-EXTRACT 1 "2026-11-08" "qbt-extract.sh" "User Commands"
+.SH NAME
+qbt-extract.sh \- extract archives of finished qBittorrent torrents
+.SH SYNOPSIS
+.B qbt-extract.sh
+[\fB\-n\fR|\fB\-\-dry\-run\fR]
+\fISAVE_PATH\fR \fICONTENT_PATH\fR
+[\fINAME\fR]
+[\fICATEGORY\fR]
+.br
+.B qbt-extract.sh
+\fB\-h\fR|\fB\-\-help\fR
+.SH DESCRIPTION
+.B qbt-extract.sh
+is a thin wrapper meant to be used as qBittorrent's
+\(dqRun external program on torrent finished\(dq hook. Configure it with:
+.IP
+.EX
+/home/killian/.local/bin/qbt-extract.sh "%D" "%F" "%N" "%L"
+.EE
+.P
+The arguments are the qBittorrent substitution tokens for the finished
+torrent: save path, content path, torrent name and category.
+.P
+The program filters by category and save path, waits briefly for the
+content to settle, locates the archives belonging to the torrent, and
+delegates extraction to
+.BR extract_archives (1),
+which verifies integrity, extracts into a directory named after the archive,
+and deletes the archive on success.
+.P
+All activity is appended to a log file. Concurrent completions are
+serialised with
+.BR flock (1)
+so overlapping torrents cannot process the same archive twice.
+.P
+qBittorrent fires this hook only after auto-management has moved the
+finished torrent out of its incomplete directory, so the content path is
+normally already final. The settle wait exists only as a safety net for slow
+or unusual moves.
+.SH ARGUMENTS
+.TP
+.I SAVE_PATH
+Final save path of the torrent (qBittorrent token
+.BR %D ).
+.TP
+.I CONTENT_PATH
+Content path, i.e. the archive file or the torrent root folder (token
+.BR %F ).
+If it does not exist, the program falls back to
+.IR SAVE_PATH/NAME .
+.TP
+.I NAME
+Torrent name (token
+.BR %N ).
+Optional; used for the fallback path lookup and for log lines.
+.TP
+.I CATEGORY
+Torrent category (token
+.BR %L ).
+Optional; an empty value disables the category check but not the path check.
+.SH OPTIONS
+.TP
+.B \-n\fR, \fB\-\-dry\-run
+Log and print what would be extracted without changing anything.
+.TP
+.B \-h\fR, \fB\-\-help
+Show usage and exit.
+.SH FILTERS
+A torrent is processed only when both checks pass:
+.IP \(bu 2
+its category equals
+.B QBT_EXTRACT_CATEGORY
+(default
+.IR Image ),
+or the category argument is empty; and
+.IP \(bu 2
+its save path is equal to or below
+.B QBT_EXTRACT_PATH
+(default
+.IR /mnt/shared/img ).
+.P
+Anything else is skipped with an exit status of 0.
+.SH ARCHIVE DISCOVERY
+If
+.I CONTENT_PATH
+is a regular file it is used as the archive. If it is a directory, archives
+directly inside it are collected (no recursion). Recognised extensions are
+.BR .zip ", " .7z ", " .tar ", " .tar.gz ", " .tgz ", " .tar.bz2 ", " .tbz2 ", "
+.BR .tar.xz " and " .txz .
+.P
+When no archives are found the program exits 0 without logging an error,
+which is the normal case for torrents that are not archives.
+.SH ENVIRONMENT
+.TP
+.B QBT_EXTRACT_CATEGORY
+Category to process. Default:
+.IR Image .
+.TP
+.B QBT_EXTRACT_PATH
+Save path prefix that must contain the torrent. Default:
+.IR /mnt/shared/img .
+Set to an empty string to disable the path check.
+.TP
+.B QBT_EXTRACT_EXTRACTOR
+Extractor command. Default:
+.IR ~/.local/bin/extract_archives.sh .
+.TP
+.B QBT_EXTRACT_LOG
+Log file. Default:
+.IR ~/.local/share/qbt-extract.log .
+Rotated once to
+.IR <log>.1
+when it exceeds
+.BR QBT_EXTRACT_LOG_MAX .
+.TP
+.B QBT_EXTRACT_SETTLE_TIMEOUT
+Seconds to wait for unstable or missing content. Default: 15.
+.TP
+.B QBT_EXTRACT_LOCK_TIMEOUT
+Seconds to wait for the shared lock. Default: 1800.
+.TP
+.B QBT_EXTRACT_LOG_MAX
+Log size in bytes before rotation. Default: 1048576.
+.TP
+.B XDG_RUNTIME_DIR
+Directory for the lock file
+.IR qbt-extract.lock .
+Falls back to
+.IR /tmp .
+.SH EXAMPLES
+Run by hand as qBittorrent would, for one torrent:
+.IP
+.EX
+qbt-extract.sh \\
+  /mnt/shared/img/Downloads \\
+  "/mnt/shared/img/Downloads/maldo - 2B [AI Generated].zip" \\
+  "maldo - 2B [AI Generated]" Image
+.EE
+.P
+Check what would happen for a whole directory without touching it:
+.IP
+.EX
+QBT_EXTRACT_PATH=/tmp/torrents qbt-extract.sh \-n \\
+  /tmp/torrents /tmp/torrents/Some.Pack Some.Pack Image
+.EE
+.P
+Follow what the hook has been doing:
+.IP
+.EX
+tail \-f ~/.local/share/qbt-extract.log
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Extraction succeeded, or the torrent was intentionally skipped (wrong
+category, wrong path, no archives, content missing).
+.TP
+.B 1
+An archive failed to extract (it is kept), the extractor returned an error,
+or the lock could not be acquired.
+.TP
+.B 2
+Wrong number of arguments or an unknown option.
+.SH FILES
+.TP
+.I ~/.local/share/qbt-extract.log
+Activity log, including the full output of the extractor.
+.SH NOTES
+Because the archive is deleted after a successful extraction, a torrent that
+is still seeding will be reported as \(dqmissing files\(dq by qBittorrent
+afterwards. This is expected with the default delete behaviour.
+.SH SEE ALSO
+.BR extract_archives (1),
+.BR flock (1),
+.BR qbittorrent (1)

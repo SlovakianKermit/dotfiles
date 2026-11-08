@@ -1,34 +1,43 @@
-.TH EXTRACT_ARCHIVES 1 "2026-10-10" "extract_archives.sh" "User Commands"
+.TH EXTRACT_ARCHIVES 1 "2026-11-08" "extract_archives.sh" "User Commands"
 .SH NAME
 extract_archives.sh \- extract archives at limited depth and remove the originals
 .SH SYNOPSIS
 .B extract_archives.sh
 [\fB\-d\fR|\fB\-\-depth\fR \fIN\fR]
-[\fIDIRECTORY\fR]
+[\fIPATH\fR...]
 .br
 .B extract_archives.sh
 \fB\-h\fR|\fB\-\-help\fR
 .SH DESCRIPTION
 .B extract_archives.sh
-finds archives under the target directory up to
+resolves each
+.I PATH
+argument to a list of archives, verifies their integrity, extracts each one
+into a new subdirectory named after the archive (without its extension), and
+deletes the original archive only after a fully successful extraction.
+.P
+A
+.I PATH
+that is a directory is searched for archives up to
 .I N
-levels deep (default 1, i.e. only archives directly inside
-.IR DIRECTORY ),
-verifies their
-integrity, extracts each one into a new subdirectory named after the archive
-(without its extension), and deletes the original archive only after a fully
-successful extraction.
+levels deep (default 1, i.e. only archives directly inside the directory).
+A
+.I PATH
+that is a regular file is treated as an archive and processed directly,
+without any directory scan; this is how callers hand over a single known
+archive. With no
+.I PATH
+the current directory (\fB.\fR) is searched as a directory.
 .P
 Archives that fail their integrity check or fail to extract are left in
 place and reported at the end; the partially extracted target directory of a
 failed extraction is removed.
 .P
-The first positional argument sets the search root and defaults to the
-current directory (\fB.\fR). Supported formats are detected from the
-extension, which is lowercased before matching, so uppercase extensions such
-as
+Supported formats are detected from the extension, which is lowercased
+before matching, so uppercase extensions such as
 .BR .ZIP ", " .TAR.GZ ", and " .7Z
-are handled.
+are handled. A file passed explicitly triggers no extension scan and is
+reported as skipped if its format is unsupported.
 .P
 Supported formats:
 .IP \(bu 2
@@ -58,16 +67,19 @@ for
 .BR .7z .
 .SH ARGUMENTS
 .TP
-.I DIRECTORY
-Directory to search recursively. Default:
+.I PATH...
+One or more directories to search and/or archive files to process.
+Directories are scanned recursively to depth
+.IR N ;
+files are processed as-is. Default:
 .BR . .
 .SH OPTIONS
 .TP
 .BI \-d ", " \-\-depth " N"
 Process archives up to
 .I N
-directories deep. Default: 1. Must match
-.IR ^[1\-9][0\-9]*$ ;
+directories deep when scanning directories. Default: 1. Must match
+.IR ^[1\-9][0-9]*$ ;
 anything else exits 1.
 .TP
 .B \-h\fR, \fB\-\-help
@@ -100,6 +112,8 @@ If the check fails, the archive is reported as failed and kept untouched.
 The archive is extracted into
 .IR dir/name ,
 where
+.I dir
+is the directory containing the archive and
 .I name
 is the archive filename with its known extension removed (e.g.
 .I foo.tar.gz
@@ -136,6 +150,12 @@ Process a specific directory two levels deep:
 extract_archives.sh \-d 2 ~/Downloads
 .EE
 .P
+Extract two specific archives and ignore everything else in their directory:
+.IP
+.EX
+extract_archives.sh ~/Downloads/one.zip ~/Downloads/two.7z
+.EE
+.P
 Typical output for a clean run:
 .IP
 .EX
@@ -153,20 +173,24 @@ Processing: ~/Downloads/corrupt.zip
   [FAIL] Integrity check failed, keeping archive: ~/Downloads/corrupt.zip
 
 ===== FAILED ARCHIVES (1) =====
-  \- ~/Downloads/corrupt.zip
+  - ~/Downloads/corrupt.zip
 .EE
 .SH EXIT STATUS
 .TP
 .B 0
-The scan completed; individual failures are
-reported on stdout in the failed-archives summary, not via the exit status.
+The run completed; individual extraction failures are reported on stdout in
+the failed-archives summary, not via the exit status.
 .TP
 .B 1
 Bad
 .B \-d
-value or unknown option.
+value, unknown option, or a
+.I PATH
+that does not exist.
 .SH SEE ALSO
+.BR qbt-extract (1),
 .BR tar (1),
 .BR unzip (1),
 .BR 7z (1),
-.BR find (1)
+.BR find (1),
+.BR flock (1)

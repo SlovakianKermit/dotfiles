@@ -4,7 +4,7 @@
         "inactive_seeding_time_limit": -2,
         "ratio_limit": -1,
         "save_path": "/mnt/shared/img/Downloads",
-        "seeding_time_limit": -1,
+        "seeding_time_limit": 0,
         "share_limit_action": "Stop",
         "share_limits_mode": "Default"
     },
