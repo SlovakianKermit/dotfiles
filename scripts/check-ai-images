@@ -3,17 +3,20 @@ set -euo pipefail
 
 usage() {
     cat <<EOF
-Usage: check-ai-images [-v] [DIRECTORY]
+Usage: check-ai-images [-v] [-d] [-n COUNT] [DIRECTORY]
 
 Inspect image files in subdirectories for AI-generation metadata using exiftool.
 Reports which subdirectories contain images with AI-related metadata.
 
 Options:
   -v        Verbose: show which file and pattern triggered each AI detection.
+  -d        Debug: like -v, but for every matching sample, and print the
+            matching metadata tags and values (key=value).
+  -n COUNT  Number of images to sample per subdirectory (default 3).
+            Use 0 to check every image.
   -h        Show this help.
 
 Default directory: current working directory.
-Sample size: up to 3 images per subdirectory.
 EOF
     exit 1
 }
@@ -64,29 +67,57 @@ patterns_json() {
 EOF
 }
 
-# Reads the JSON stream produced by exiftool and prints one NUL-delimited
-# "file\0label\0" pair per flagged image.
+# Reads the JSON stream produced by exiftool and prints one record per flagged
+# image: "file\0label\0matched tag=value pairs\0".
 match_filter='
   def sd: "negative prompt|Steps:|Sampler:|CFG scale|Seed:|Model hash";
+  def meta: del(.SourceFile, .Directory, .FileName) | to_entries;
+  def firsthit($b):
+    first($pats[] as $p | select($b | test($p[1]; "i")) | {l: $p[0], r: $p[1]})
+    // (if ($b | test("Parameters"; "i")) and ($b | test(sd; "i"))
+        then {l: "Stable Diffusion PNG Parameters", r: sd} else empty end);
   add // []
   | sort_by(.SourceFile)
   | .[]
   | . as $o
   | ($o | del(.SourceFile, .Directory, .FileName) | tojson) as $b
-  | (first($pats[] as $p | select($b | test($p[1]; "i")) | $p[0])
-     // (if $b | test("Parameters"; "i") and ($b | test(sd; "i"))
-         then "Stable Diffusion PNG Parameters" else empty end)
-    ) as $label
-  | "\(.SourceFile)\u0000\($label)\u0000"
+  | ($o | firsthit($b)) as $m
+  | "\(.SourceFile)\u0000\($m.l)\u0000\(
+      [ $o | meta[]
+        | select((.key | test($m.r; "i")) or ((.value | tostring) | test($m.r; "i")))
+        | "\(.key)=\((.value | tostring)[0:200])"
+      ] | .[0:4] | join(" | ")
+    )\u0000"
 '
 
 main() {
     local verbose=0
+    local debug=0
+    local sample_size=3
     local target="."
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -v) verbose=1; shift ;;
+            -d|--debug) debug=1; verbose=1; shift ;;
+            -n|--number)
+                if [[ $# -lt 2 ]]; then
+                    echo "Error: $1 requires a count" >&2
+                    usage
+                fi
+                if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+                    echo "Error: invalid sample size '$2' (expected a non-negative integer)" >&2
+                    exit 1
+                fi
+                sample_size=$((10#$2))
+                shift 2 ;;
+            -n*) sample_size="${1#-n}"
+                if [[ ! "$sample_size" =~ ^[0-9]+$ ]]; then
+                    echo "Error: invalid sample size '${1#-n}' (expected a non-negative integer)" >&2
+                    exit 1
+                fi
+                sample_size=$((10#$sample_size))
+                shift ;;
             -h|--help) usage ;;
             -*) echo "Unknown option: $1" >&2; usage ;;
             *) target="$1"; shift ;;
@@ -106,23 +137,24 @@ main() {
         exit 1
     fi
 
-    local sample_size=3
     local -a dirs=()
     local -a files=()
     local -A seen=()
     local -A has_image=()
     local -A ai_reason=()   # dirs -> label
     local -A ai_file=()     # dirs -> matching file
+    local -A ai_detail=()   # dirs -> matching tag=value pairs
 
     while IFS= read -r -d '' dir; do
         dirs+=("$dir")
     done < <(find "$target" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
 
-    # One find pass for the whole tree: keep at most $sample_size files per dir.
+    # One find pass for the whole tree: keep at most $sample_size files per dir
+    # (0 means keep every image).
     while IFS= read -r -d '' img; do
         local d="${img%/*}"
         local n=${seen[$d]:-0}
-        if (( n < sample_size )); then
+        if (( sample_size == 0 || n < sample_size )); then
             seen[$d]=$((n + 1))
             files+=("$img")
             has_image[$d]=1
@@ -157,12 +189,22 @@ main() {
         shopt -u nullglob
 
         if (( ${#slot_files[@]} > 0 )); then
-            local f label
-            while IFS= read -r -d '' f && IFS= read -r -d '' label; do
+            local f label detail
+            while IFS= read -r -d '' f && IFS= read -r -d '' label && IFS= read -r -d '' detail; do
                 local d="${f%/*}"
                 if [[ -z "${ai_reason[$d]:-}" ]]; then
                     ai_reason[$d]="$label"
                     ai_file[$d]="$f"
+                    ai_detail[$d]="$detail"
+                fi
+                if (( debug )); then
+                    {
+                        echo "[AI] $d"
+                        echo "       file: $f"
+                        echo "       match: $label"
+                        echo "       tags: $detail"
+                        echo ""
+                    } >&2
                 fi
             done < <(jq -j -s --argjson pats "$pats" "$match_filter" "${slot_files[@]}" 2>/dev/null || true)
         fi
@@ -182,17 +224,21 @@ main() {
         fi
     done
 
-    if (( verbose )) && (( ${#dirs_ai[@]} > 0 )); then
+    if (( verbose )) && (( ! debug )) && (( ${#dirs_ai[@]} > 0 )); then
         for dir in "${dirs_ai[@]}"; do
             echo "[AI] $dir" >&2
             echo "       file: ${ai_file[$dir]}" >&2
             echo "       match: ${ai_reason[$dir]}" >&2
+            if [[ -n "${ai_detail[$dir]:-}" ]]; then
+                echo "       tags: ${ai_detail[$dir]}" >&2
+            fi
             echo "" >&2
         done
     fi
 
     echo "============================================"
     echo " Scanned ${#dirs[@]} subdirectories in $target"
+    echo " Checked ${#files[@]} image(s)"
     echo "============================================"
     echo ""
 

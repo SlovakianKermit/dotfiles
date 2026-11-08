@@ -4,6 +4,8 @@ check-ai-images \- scan subdirectories for AI-generation image metadata
 .SH SYNOPSIS
 .B check-ai-images
 [\fB\-v\fP]
+[\fB\-d\fP]
+[\fB\-n\fP \fIcount\fP]
 [\fIdirectory\fP]
 .br
 .B check-ai-images
@@ -18,15 +20,18 @@ AI-generation metadata, using
 For each immediate subdirectory (depth 1, not recursive), a sample of at most
 .B 3
 images is taken (jpg, jpeg, png, webp, avif, heic, heif, tiff, tif, bmp, gif,
-jxl), keeping the first three names in sort order. All samples are then
-inspected with a single
+jxl), keeping the first names in sort order. The sample size is settable with
+.BR \-n ;
+.B \-n 0
+checks every image. All samples are then inspected with a single
 .B exiftool \-j
 run, split across a few parallel workers (one per CPU core, capped at 8).
 Every metadata tag name and value is matched, case-insensitively, against the
 detection patterns listed in DETECTION PATTERNS. A single match flags the whole
 subdirectory.
 .P
-A final summary is printed:
+The summary header reports how many subdirectories and how many images were
+checked, followed by:
 .IP \(bu 2
 directories containing AI metadata, prefixed
 .B [AI]
@@ -57,8 +62,31 @@ file:
 .TP
 match:
 \fIpattern label\fP
+.TP
+tags:
+\fIkey\fP=\fIvalue\fP ... (up to four matching tags, values cut at 200
+characters)
 .PD
 .RE
+.TP
+.B \-d, \-\-debug
+Debug. Implies
+.BR \-v ,
+but reports every matching sample in a directory rather than just the first,
+and adds the offending metadata tags as
+\fIkey\fP=\fIvalue\fP
+pairs. Use this to confirm a detection (or spot a false positive) without
+running
+.BR exiftool (1)
+by hand.
+.TP
+.B \-n, \-\-number \fIcount\fP
+Number of images to sample per subdirectory. Defaults to
+.BR 3 .
+.B 0
+checks every image in the subdirectory, at roughly 2 ms per image. Ignored
+when a subdirectory holds fewer images. The same value applies to every
+subdirectory; there is no per-directory override.
 .TP
 .B \-h, \-\-help
 Print the usage summary and exit with status 1.
@@ -104,6 +132,18 @@ Show which file and pattern triggered each detection:
 .IP
 .EX
 check-ai-images \-v ~/Downloads
+.EE
+.P
+Show the exact metadata tags behind every detection (for verifying a hit):
+.IP
+.EX
+check-ai-images \-d ~/Pictures
+.EE
+.P
+Check every image in every subdirectory instead of three per directory:
+.IP
+.EX
+check-ai-images \-d \-n 0 /mnt/data_storage
 .EE
 .SH EXIT STATUS
 .TP
