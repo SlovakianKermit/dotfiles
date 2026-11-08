@@ -1,11 +1,11 @@
-.TH COMPRESS-JXL 1 "2026-10-10" "1.1" "User Commands"
+.TH COMPRESS-JXL 1 "2026-11-08" "2.0" "User Commands"
 .SH NAME
 compress-jxl \- batch compress images to JPEG XL
 .SH SYNOPSIS
 .B compress-jxl.sh
 [\fB\-q\fR \fIquality\fP]
 [\fB\-e\fR \fIeffort\fP]
-[\fB\-s\fR \fIWxH\fP]
+[\fB\-s\fR \fIWxH\fP|\fBnone\fR]
 [\fB\-t\fR \fIthreads\fP]
 [\fB\-c\fP]
 [\fB\-l\fP]
@@ -17,12 +17,34 @@ compress-jxl \- batch compress images to JPEG XL
 Recursively finds all \fB.jpg\fP, \fB.jpeg\fP, and \fB.png\fP files under
 the target directory and converts them to JPEG XL (\fB.jxl\fP) using
 .BR cjxl (1).
-Images larger than the target size (2560\(mu1440 by default, see
-\fB\-s\fP) are downscaled before encoding.
+Images whose width or height exceeds the target box (2560\(mu1440 by
+default, see \fB\-s\fP) are downscaled to fit inside it with the aspect
+ratio unchanged.
 The original file is replaced only if the compressed output is smaller.
 Directories named
 .B Cooking
 under the target are skipped.
+.P
+Metadata is preserved without relying on external tag copies.
+Native EXIF, XMP, ICC profiles, and alpha channels are carried into the
+JXL container by \fBcjxl\fP itself.
+PNG text chunks used by AI generators (for example
+.BR Parameters ,
+.BR Prompt ,
+.B Workflow ,
+.BR Comment ,
+and
+.BR Description )
+are read directly from the PNG and re-embedded as properties in a private
+XMP namespace, so tag names and values survive byte-for-byte, including
+multi-hundred-kilobyte ComfyUI workflow JSON.
+Because a downscale is performed on a temporary file, the scanner also
+extracts the original EXIF and XMP blocks and passes them back to
+\fBcjxl\fP, so resized outputs keep their metadata too.
+.P
+Requirements: \fBcjxl\fP and \fBpython3\fP.
+Downscaling uses \fBvipsthumbnail\fP (libvips) when available and falls
+back to ImageMagick's \fBconvert\fP.
 .SH OPTIONS
 .TP
 .BR \-q ", " \-\-quality " \fIquality\fP"
@@ -31,15 +53,16 @@ Higher = larger file, better fidelity.
 .TP
 .BR \-e ", " \-\-effort " \fIeffort\fP"
 Encoder effort (1\(en10, default: 3).
-Higher = slower encode, smaller/better file.
+Higher = slower encode, generally more accurate quality at the same
+nominal setting.
 .RS
 .PD 0
 .TP
 1\(en2  lightning, decent compression
 .TP
-3\(en4  fast, good for batch runs
+3\(en4  fast, best size/time knee for batch runs
 .TP
-5\(en6  balanced
+5\(en6  balanced, about 4\(mu6\(mu slower
 .TP
 7     default cjxl speed, very good compression
 .TP
@@ -47,14 +70,17 @@ Higher = slower encode, smaller/better file.
 .PD
 .RE
 .TP
-.BR \-s ", " \-\-size " \fIWxH\fP"
-Maximum output dimensions for downscaling (default: 2560\(mu1440).
-Larger images are scaled to fit within \fIW\(muH\fP while keeping their
-aspect ratio.
+.BR \-s ", " \-\-size " \fIWxH\fP|\fBnone\fR"
+Maximum output dimensions (default: 2560\(mu1440).
+Larger images are scaled to fit within the box while keeping their
+aspect ratio; the image is never enlarged.
+Use \fBnone\fP (or \fB0\fP) to disable downscaling entirely.
 .TP
 .BR \-t ", " \-\-threads " \fIthreads\fP"
-Parallel encode jobs (default: 12).
-Each cjxl process auto-detects its own core count.
+Parallel encode jobs (default: one per CPU core).
+When four or more jobs run, each \fBcjxl\fP process is limited to one
+thread to avoid oversubscription; with fewer jobs each process uses all
+cores.
 .TP
 .BR \-c ", " \-\-compare
 Save a lossless PNG copy of each pre-encode source to
@@ -62,7 +88,7 @@ Save a lossless PNG copy of each pre-encode source to
 with tools like
 .BR ssimulacra2 (1)
 or
-.BR dssim (1).
+.BR butteraugli (1).
 .TP
 .BR \-l ", " \-\-log
 Append a per-run summary line to \fB.compress-jxl.log\fP in the target
@@ -87,13 +113,14 @@ Numeric effort (1\(en10). Must follow a numeric quality.
 .SH EXAMPLES
 .TP
 compress-jxl.sh
-Run with defaults: quality 85, effort 3, ~/Pictures/img/Downloads.
+Run with defaults: quality 85, effort 3, 2560\(mu1440 cap,
+\fB~/Pictures/img/Downloads\fP.
 .TP
 compress-jxl.sh 80
 Quality 80, effort 3, default directory.
 .TP
-compress-jxl.sh 90 7
-Quality 90, effort 7, default directory.
+compress-jxl.sh 90 5
+Quality 90, effort 5, default directory.
 .TP
 compress-jxl.sh ~/Pictures/wallpapers 80 5
 Custom directory, quality 80, effort 5.
@@ -103,13 +130,26 @@ Quality 75, effort 3, 6 parallel jobs, save comparison sources.
 .TP
 compress-jxl.sh -s 1920x1080 ~/Pictures/wallpapers
 Cap downscaling at 1080p instead of the default 2560\(mu1440.
+.TP
+compress-jxl.sh -s none ~/Pictures/archive
+Keep original resolution for every file.
+.SH BEHAVIOUR
+Each file is encoded to a temporary name and moved into place only after
+a successful encode, so an interrupted run never leaves a partial
+\fB.jxl\fP.
+The output inherits the source file's modification time.
 .SH FILES
 .TP
 .I ~/Pictures/img/Downloads/.compress-jxl.log
-Per-run summary appended after each batch when \fB-l\fP is used.
+Per-run summary appended after each batch when \fB\-l\fP is used.
 .TP
 .I /tmp/jxl_compare_src/
-Directory holding pre-encode PNGs when \fB-c\fP is used.
+Directory holding pre-encode PNGs when \fB\-c\fP is used.
+.TP
+.I /tmp/jxl_meta_\fIpid\fP/
+Temporary EXIF/XMP sidecars used during a run; removed on exit.
 .SH SEE ALSO
 .BR cjxl (1),
+.BR djxl (1),
+.BR jxlinfo (1),
 .BR ssimulacra2 (1)
