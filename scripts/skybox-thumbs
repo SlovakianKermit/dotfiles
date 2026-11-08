@@ -31,8 +31,11 @@ _lock = None
 def default_dirs():
     for base in BASES:
         if os.path.isdir(base):
-            return [os.path.join(base, d) for d in DEFAULT_SUBDIRS]
-    return [os.path.join(BASES[0], d) for d in DEFAULT_SUBDIRS]
+            # Skip default folders that do not exist: Good/ may be absent or
+            # removed, and a missing default must not abort the whole run.
+            return [os.path.join(base, d) for d in DEFAULT_SUBDIRS
+                    if os.path.isdir(os.path.join(base, d))]
+    return []
 
 
 def tool_prefix():
@@ -221,8 +224,8 @@ def main():
         description="Pre-generate SKYBOX custom thumbnails (same-name JPEGs) "
                     "for video folders.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Defaults to vr/ and Good/ under the first existing of\n"
-               "/mnt/pve/Data_Storage or /mnt/data_storage.")
+        epilog="Defaults to the existing ones among vr/ and Good/ under the\n"
+               "first existing of /mnt/pve/Data_Storage or /mnt/data_storage.")
     p.add_argument("dirs", nargs="*", metavar="DIR",
                    help="folders to scan (default: <base>/vr <base>/Good)")
     p.add_argument("-n", "--dry-run", action="store_true",
@@ -257,6 +260,8 @@ def main():
     if args.jobs < 1:
         p.error("--jobs must be at least 1")
     dirs = args.dirs or default_dirs()
+    if not dirs:
+        p.error("no default folders found; pass DIR explicitly")
     missing = [d for d in dirs if not os.path.isdir(d)]
     if missing:
         p.error("not a directory: %s" % ", ".join(missing))
