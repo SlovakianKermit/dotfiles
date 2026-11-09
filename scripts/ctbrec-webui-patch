@@ -47,7 +47,7 @@ INDEX_PATCHED = """            <p class="text-muted mt-2">No portrait available<
         </div>"""
 
 SCRIPT_TAG = '<script src="models.js"></script>'
-SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch2"></script>'
+SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch3"></script>'
 
 MODELS_ANCHOR = "function showPortraitPopup(model) {"
 MODELS_PATCHED = """// ctbrec-webui-patch: model currently shown in the portrait popup
@@ -80,7 +80,7 @@ function fetchPortraitForPopup() {
     if (hmac && hmac.length > 0) {
         headers['CTBREC-HMAC'] = CryptoJS.HmacSHA256('', hmac).toString(CryptoJS.enc.Hex);
     }
-    fetch('../image/portrait/fetch/' + encodeURIComponent(modelUrl), {
+    fetch('../image/portrait/fetch/' + encodeURIComponent(modelUrl) + '?t=' + Date.now(), {
         method: 'GET',
         cache: 'no-store',
         headers: headers
@@ -180,6 +180,14 @@ def patch_models(source: str, dry_run: bool) -> str:
     source = source.replace(
         "        method: 'GET',\n        headers: headers",
         "        method: 'GET',\n        cache: 'no-store',\n        headers: headers",
+    )
+    source = source.replace(
+        "fetch('../image/portrait/url/' + encodedUrl, {",
+        "fetch('../image/portrait/url/' + encodedUrl + '?t=' + Date.now(), {",
+    )
+    source = source.replace(
+        "fetch('../image/portrait/fetch/' + encodedUrl + '?preview=true', {",
+        "fetch('../image/portrait/fetch/' + encodedUrl + '?preview=true&t=' + Date.now(), {",
     )
     if not source.endswith("\n"):
         source += "\n"

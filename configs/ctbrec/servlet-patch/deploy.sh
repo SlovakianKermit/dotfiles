@@ -13,10 +13,12 @@ REMOTE_DIR="${CTBREC_DIR:-/opt/ctbrec}"
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SSH_OPTS=(-o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
 RESTART=1
+FORCE_RESTART=0
 
 for arg in "$@"; do
   case "$arg" in
     --no-restart) RESTART=0 ;;
+    --force-restart) FORCE_RESTART=1 ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "unknown option: $arg" >&2; exit 2 ;;
   esac
@@ -53,6 +55,21 @@ for class in "ImageServlet.class" "ImageServlet\$1.class"; do
 done
 
 if (( RESTART )); then
+  echo "== checking for active recordings"
+  active_code='import json,ssl,urllib.request;ctx=ssl._create_unverified_context();req=urllib.request.Request("https://127.0.0.1:8443/rec",data=b"{\"action\":\"listAll\"}",headers={"Content-Type":"application/json"},method="POST");d=json.load(urllib.request.urlopen(req,context=ctx,timeout=30));a=d.get("currentlyRecording") or [];print(len(a));print("\n".join(x.get("name","?") for x in a))'
+  active_out="$(ssh_run "pct exec ${VMID} -- python3 -c $(q "$active_code")" 2>/dev/null || true)"
+  active_count="$(printf '%s\n' "$active_out" | head -1)"
+  if [[ "$active_count" =~ ^[0-9]+$ ]] && (( active_count > 0 )); then
+    echo "   $active_count active recording(s):" >&2
+    printf '%s\n' "$active_out" | tail -n +2 | sed 's/^/     /' >&2
+    if (( ! FORCE_RESTART )); then
+      echo "   refusing to restart; re-run with --force-restart to interrupt them" >&2
+      exit 1
+    fi
+    echo "   --force-restart given, continuing" >&2
+  else
+    echo "   no active recordings"
+  fi
   echo "== restarting ctbrec (graceful shutdown)"
   ssh_run "pct exec ${VMID} -- systemctl restart ctbrec"
   # Wait for the web interface to bind; a failed start leaves the JVM running
