@@ -301,6 +301,58 @@ extends AbstractCtbrecServlet {
         }
     }
 
+    private byte[] runProcessWithInput(java.util.List<String> command, byte[] input, long timeoutSeconds) {
+        Process process = null;
+        try {
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.redirectError(ProcessBuilder.Redirect.DISCARD);
+            process = builder.start();
+            final Process running = process;
+            final byte[] data = input;
+            Thread writer = new Thread(() -> {
+                try (OutputStream stream = running.getOutputStream()) {
+                    stream.write(data);
+                }
+                catch (IOException ignored) {
+                }
+            }, "portrait-slice-writer");
+            writer.setDaemon(true);
+            writer.start();
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (InputStream stream = process.getInputStream()) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = stream.read(buffer)) > 0) {
+                    output.write(buffer, 0, read);
+                }
+            }
+            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return null;
+            }
+            writer.join(2000L);
+            return process.exitValue() == 0 && output.size() > 0 ? output.toByteArray() : null;
+        }
+        catch (Exception e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            return null;
+        }
+    }
+
+    private byte[] runToolWithInput(String tool, String fallback, java.util.List<String> args, byte[] input, long timeoutSeconds) {
+        java.util.List<String> command = new java.util.ArrayList<>();
+        command.add(tool);
+        command.addAll(args);
+        byte[] result = this.runProcessWithInput(command, input, timeoutSeconds);
+        if (result == null && fallback != null) {
+            command.set(0, fallback);
+            result = this.runProcessWithInput(command, input, timeoutSeconds);
+        }
+        return result;
+    }
+
     private byte[] runTool(String tool, String fallback, java.util.List<String> args, long timeoutSeconds) {
         java.util.List<String> command = new java.util.ArrayList<>();
         command.add(tool);
@@ -329,20 +381,44 @@ extends AbstractCtbrecServlet {
         }
     }
 
-    private byte[] extractFrame(File file, long position, boolean vrSideBySide) {
-        // VR recordings are a stereoscopic side-by-side pair (two fisheye
-        // images); keep the left eye only so the portrait is a single frame.
+    private byte[] readSlice(File file, long offset, int maxBytes) {
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file, "r")) {
+            long length = raf.length();
+            if (length <= 0) {
+                return null;
+            }
+            long start = Math.max(0L, Math.min(offset, length - 1L));
+            int toRead = (int)Math.min((long)maxBytes, length - start);
+            byte[] buffer = new byte[toRead];
+            raf.seek(start);
+            raf.readFully(buffer);
+            return buffer;
+        }
+        catch (Exception e) {
+            log.warn("Could not read recording slice from {}: {}", (Object)file.getName(), (Object)e.getMessage());
+            return null;
+        }
+    }
+
+    private byte[] extractFrame(File file, long offset, boolean vrSideBySide) {
+        // Seeking with -ss on these VR .ts files often decodes a grey
+        // placeholder.  Start a fresh decoder on a byte slice and keep only
+        // keyframes: fast and reliable.  VR recordings are a stereoscopic
+        // side-by-side pair, so keep the left eye only.
         String filter = vrSideBySide
             ? "crop=iw/2:ih:0:0,scale=256:256"
             : "scale=256:256:force_original_aspect_ratio=increase,crop=256:256";
+        byte[] slice = this.readSlice(file, offset, 16 * 1024 * 1024);
+        if (slice == null || slice.length == 0) {
+            return null;
+        }
         java.util.List<String> args = java.util.Arrays.asList(
             "-hide_banner", "-loglevel", "error",
-            "-ss", Long.toString(Math.max(0L, position)),
-            "-i", file.getAbsolutePath(),
+            "-skip_frame", "nokey", "-i", "pipe:0",
             "-frames:v", "1",
             "-vf", filter,
             "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1");
-        return this.runTool("ffmpeg", "/usr/bin/ffmpeg", args, 45L);
+        return this.runToolWithInput("ffmpeg", "/usr/bin/ffmpeg", args, slice, 90L);
     }
 
     private byte[] recordingFrame(Model model) {
@@ -356,30 +432,26 @@ extends AbstractCtbrecServlet {
         }
         catch (Exception ignored) {
         }
-        double duration = this.probeDuration(file);
-        java.util.List<Long> positions = new java.util.ArrayList<>();
+        long size = file.length();
+        long slice = 16L * 1024L * 1024L;
+        java.util.List<Long> offsets = new java.util.ArrayList<>();
         if (active) {
-            positions.add(duration > 0 ? Math.max(3L, (long)duration - 20L) : 30L);
-            if (duration > 0) {
-                positions.add(Math.max(3L, (long)(duration * 0.5)));
-                positions.add(Math.max(3L, (long)(duration * 0.2)));
+            offsets.add(Math.max(0L, size - slice));
+            if (size > 2 * slice) {
+                offsets.add(Math.max(0L, size - 2 * slice));
             }
-            positions.add(5L);
-        }
-        else if (duration > 0) {
-            positions.add(Math.max(5L, (long)(duration * 0.5)));
-            positions.add(Math.max(5L, (long)(duration * 0.3)));
-            positions.add(Math.max(5L, (long)(duration * 0.7)));
-            positions.add(5L);
+            offsets.add(size / 2L);
         }
         else {
-            positions.add(30L);
-            positions.add(5L);
+            offsets.add(size / 2L);
+            offsets.add((long)(size * 0.3));
+            offsets.add((long)(size * 0.7));
         }
+        offsets.add(0L);
         String url = model.getUrl() == null ? "" : model.getUrl();
         boolean vrSideBySide = url.contains("vr.stripchat") || model.getClass().getName().contains("VR");
         byte[] best = null;
-        for (long position : positions) {
+        for (long position : offsets) {
             byte[] frame = this.extractFrame(file, position, vrSideBySide);
             if (frame == null) {
                 continue;
