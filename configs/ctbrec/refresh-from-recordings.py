@@ -123,18 +123,32 @@ def probe_duration(file: str) -> float:
         return -1.0
 
 
-def grab_frame(file: str, position: float, vr: bool) -> bytes | None:
-    # VR recordings are a stereoscopic side-by-side pair; keep the left eye.
+SLICE_BYTES = 16 * 1024 * 1024
+
+
+def grab_frame(file: str, offset: int, vr: bool) -> bytes | None:
+    """Decode the first keyframe of a byte slice.
+
+    Seeking with -ss on these VR .ts files often lands on a grey placeholder
+    instead of real video.  Starting a fresh decoder at a keyframe in a byte
+    slice is reliable and fast, because -skip_frame nokey decodes keyframes only.
+    """
     scale_filter = VR_FILTER if vr else SCALE_FILTER
     try:
+        size = os.path.getsize(file)
+        with open(file, "rb") as handle:
+            handle.seek(max(0, min(offset, max(0, size - 1))))
+            data = handle.read(SLICE_BYTES)
+        if not data:
+            return None
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error",
-             "-ss", str(max(0, int(position))), "-i", file,
+             "-skip_frame", "nokey", "-i", "pipe:0",
              "-frames:v", "1", "-vf", scale_filter,
              "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"],
-            capture_output=True, timeout=90, check=False,
+            input=data, capture_output=True, timeout=90, check=False,
         )
-    except subprocess.SubprocessError:
+    except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0 or not result.stdout:
         return None
@@ -143,27 +157,21 @@ def grab_frame(file: str, position: float, vr: bool) -> bytes | None:
 
 def frame_for(file: str, vr: bool) -> bytes | None:
     active = time.time() - os.path.getmtime(file) < 300
-    duration = probe_duration(file)
-    positions = []
+    size = os.path.getsize(file)
     if active:
-        positions.append(max(3.0, duration - 20.0) if duration > 0 else 30.0)
-        if duration > 0:
-            positions.extend([max(3.0, duration * 0.5), max(3.0, duration * 0.2)])
-        positions.append(5.0)
-    elif duration > 0:
-        positions.extend([max(5.0, duration * 0.5), max(5.0, duration * 0.3),
-                          max(5.0, duration * 0.7), 5.0])
+        offsets = [max(0, size - SLICE_BYTES), max(0, size - 2 * SLICE_BYTES)]
     else:
-        positions.extend([30.0, 5.0])
+        offsets = [int(size * 0.5), int(size * 0.3), int(size * 0.7)]
+    offsets.append(0)
     best = None
-    for position in positions:
-        frame = grab_frame(file, position, vr)
+    for offset in offsets:
+        frame = grab_frame(file, offset, vr)
         if frame is None:
             continue
         if best is None or len(frame) > len(best):
             best = frame
         # A blank/transition frame compresses to almost nothing; try the next
-        # position instead of storing a grey rectangle.
+        # offset instead of storing a grey rectangle.
         if len(frame) >= 2500:
             best = frame
             break

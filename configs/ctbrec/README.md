@@ -14,10 +14,11 @@ behaviour changes:
    newest recording using ffmpeg. This is necessary because Stripchat's
    `previewUrlThumbBig` / `previewUrl` are static cover images for many models:
    the bytes stay identical over time even though `snapshotTimestamp` advances,
-   so they do not resemble the live stream. Active recordings contribute a
-   frame near the end of the growing file; finished recordings contribute a
-   frame from the midpoint. VR recordings are stereoscopic side-by-side, so
-   only the left eye is kept. Blank/transition frames are rejected by size; if
+   so they do not resemble the live stream. Extraction reads a 16 MB byte
+   slice (near the end for an active recording, mid-file for a finished one)
+   and decodes the first keyframe with `-skip_frame nokey`; plain `-ss`
+   seeking returns a grey placeholder on these VR `.ts` files. VR recordings
+   are stereoscopic side-by-side, so only the left eye is kept. Blank/transition frames are rejected by size; if
    no usable frame exists the endpoint keeps an already stored portrait, or
    falls back to the provider snapshot, but never to the profile avatar. If
    neither exists it returns 404 "No stream snapshot available".
