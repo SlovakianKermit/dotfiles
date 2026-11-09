@@ -27,6 +27,7 @@ import urllib.parse
 import urllib.request
 
 SCALE_FILTER = "scale=256:256:force_original_aspect_ratio=increase,crop=256:256"
+VR_FILTER = "crop=iw/2:ih:0:0,scale=256:256"
 
 
 def load_json(path, default=None):
@@ -53,8 +54,9 @@ def find_config_dir(explicit: str | None) -> str:
     return max(candidates, key=lambda p: os.path.getmtime(os.path.join(p, "models.json")))
 
 
-def newest_recording_files(config_dir: str) -> dict[str, tuple[int, str, str]]:
-    newest: dict[str, tuple[int, str, str]] = {}
+def newest_recording_files(config_dir: str) -> dict[str, list[tuple[int, str, str]]]:
+    """Newest-first list of usable recording files per model URL."""
+    found: dict[str, list[tuple[int, str, str]]] = {}
     for path in glob.glob(os.path.join(config_dir, "recordings", "*.json")):
         try:
             with open(path, "r", encoding="utf-8") as handle:
@@ -76,9 +78,37 @@ def newest_recording_files(config_dir: str) -> dict[str, tuple[int, str, str]]:
         except (TypeError, ValueError):
             start = 0
         name = model.get("displayName") or model.get("name") or url
-        if url not in newest or start > newest[url][0]:
-            newest[url] = (start, file, name)
-    return newest
+        found.setdefault(url, []).append((start, file, name))
+
+    video_extensions = (".ts", ".mp4", ".mkv", ".flv", ".mov")
+    ordered: dict[str, list[tuple[int, str, str]]] = {}
+    for url, items in found.items():
+        # Metadata for older recordings can be missing while the files are
+        # still on disk, so also consider siblings in the model directory.
+        directories = {os.path.dirname(file) for _start, file, _name in items}
+        name = items[0][2]
+        for directory in directories:
+            try:
+                for entry in os.listdir(directory):
+                    if not entry.lower().endswith(video_extensions):
+                        continue
+                    path = os.path.join(directory, entry)
+                    if os.path.isfile(path):
+                        items.append((int(os.path.getmtime(path)), path, name))
+            except OSError:
+                continue
+        items.sort(reverse=True)
+        seen = set()
+        unique = []
+        for item in items:
+            if item[1] in seen:
+                continue
+            seen.add(item[1])
+            unique.append(item)
+            if len(unique) >= 8:
+                break
+        ordered[url] = unique
+    return ordered
 
 
 def probe_duration(file: str) -> float:
@@ -93,12 +123,14 @@ def probe_duration(file: str) -> float:
         return -1.0
 
 
-def grab_frame(file: str, position: float) -> bytes | None:
+def grab_frame(file: str, position: float, vr: bool) -> bytes | None:
+    # VR recordings are a stereoscopic side-by-side pair; keep the left eye.
+    scale_filter = VR_FILTER if vr else SCALE_FILTER
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error",
              "-ss", str(max(0, int(position))), "-i", file,
-             "-frames:v", "1", "-vf", SCALE_FILTER,
+             "-frames:v", "1", "-vf", scale_filter,
              "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1"],
             capture_output=True, timeout=90, check=False,
         )
@@ -109,17 +141,33 @@ def grab_frame(file: str, position: float) -> bytes | None:
     return result.stdout
 
 
-def frame_for(file: str) -> bytes | None:
+def frame_for(file: str, vr: bool) -> bytes | None:
     active = time.time() - os.path.getmtime(file) < 300
     duration = probe_duration(file)
+    positions = []
     if active:
-        position = max(3.0, duration - 20.0) if duration > 0 else 30.0
+        positions.append(max(3.0, duration - 20.0) if duration > 0 else 30.0)
+        if duration > 0:
+            positions.extend([max(3.0, duration * 0.5), max(3.0, duration * 0.2)])
+        positions.append(5.0)
+    elif duration > 0:
+        positions.extend([max(5.0, duration * 0.5), max(5.0, duration * 0.3),
+                          max(5.0, duration * 0.7), 5.0])
     else:
-        position = max(5.0, duration * 0.5) if duration > 0 else 30.0
-    frame = grab_frame(file, position)
-    if frame is None and position > 5:
-        frame = grab_frame(file, 5)
-    return frame
+        positions.extend([30.0, 5.0])
+    best = None
+    for position in positions:
+        frame = grab_frame(file, position, vr)
+        if frame is None:
+            continue
+        if best is None or len(frame) > len(best):
+            best = frame
+        # A blank/transition frame compresses to almost nothing; try the next
+        # position instead of storing a grey rectangle.
+        if len(frame) >= 2500:
+            best = frame
+            break
+    return best
 
 
 def post_portrait(server: str, model_url: str, frame: bytes, key: str, context) -> int:
@@ -141,6 +189,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--delay", type=float, default=0.3, metavar="SECONDS")
     parser.add_argument("--limit", type=int, default=0, metavar="N")
     parser.add_argument("--include-vr", action="store_true", help="also process StripchatVRModel")
+    parser.add_argument("--vr-only", action="store_true", help="process only StripchatVRModel")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -158,9 +207,11 @@ def main(argv: list[str]) -> int:
         if not model:
             continue
         kind = model.get("type") or ""
-        if kind.endswith(".StripchatModel") or (args.include_vr and kind.endswith(".StripchatVRModel")):
+        is_vr = kind.endswith(".StripchatVRModel")
+        matches = is_vr if args.vr_only else (kind.endswith(".StripchatModel") or (args.include_vr and is_vr))
+        if matches:
             if url in newest:
-                wanted.append((url, model, newest[url]))
+                wanted.append((url, model, newest[url], is_vr))
     wanted.sort(key=lambda item: item[2][0], reverse=True)
     if args.limit and args.limit > 0:
         wanted = wanted[: args.limit]
@@ -168,17 +219,29 @@ def main(argv: list[str]) -> int:
     print(f"config: {config_dir}")
     print(f"mapped Stripchat models with a recording: {len(wanted)}")
     if args.dry_run:
-        for url, model, (start, file, name) in wanted:
+        for url, model, files, _vr in wanted:
+            start, file, name = files[0]
             print(f"  {name} <- {file}")
         return 0
 
     context = ssl._create_unverified_context()
     ok = failed = 0
-    for index, (url, model, (start, file, name)) in enumerate(wanted, start=1):
-        frame = frame_for(file)
-        if frame is None:
+    for index, (url, model, files, is_vr) in enumerate(wanted, start=1):
+        name = files[0][2]
+        frame = None
+        used_file = None
+        for _start, candidate, _name in files:
+            attempt = frame_for(candidate, is_vr)
+            if attempt is not None and len(attempt) >= 2500:
+                frame = attempt
+                used_file = candidate
+                break
+            if attempt is not None and (frame is None or len(attempt) > len(frame)):
+                frame = attempt
+                used_file = candidate
+        if frame is None or len(frame) < 2500:
             failed += 1
-            print(f"[{index}/{len(wanted)}] {name} ... frame extraction failed")
+            print(f"[{index}/{len(wanted)}] {name} ... no usable frame (blank/away)")
             continue
         try:
             status = post_portrait(args.server, url, frame, key, context)
@@ -187,7 +250,7 @@ def main(argv: list[str]) -> int:
             print(f"[{index}/{len(wanted)}] {name} ... upload failed: {error}")
             continue
         ok += 1
-        print(f"[{index}/{len(wanted)}] {name} ... ok ({len(frame)} bytes)")
+        print(f"[{index}/{len(wanted)}] {name} ... ok ({len(frame)} bytes, {os.path.basename(used_file)})")
         if args.delay:
             time.sleep(args.delay)
 

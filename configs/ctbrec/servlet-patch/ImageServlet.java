@@ -329,13 +329,18 @@ extends AbstractCtbrecServlet {
         }
     }
 
-    private byte[] extractFrame(File file, long position) {
+    private byte[] extractFrame(File file, long position, boolean vrSideBySide) {
+        // VR recordings are a stereoscopic side-by-side pair (two fisheye
+        // images); keep the left eye only so the portrait is a single frame.
+        String filter = vrSideBySide
+            ? "crop=iw/2:ih:0:0,scale=256:256"
+            : "scale=256:256:force_original_aspect_ratio=increase,crop=256:256";
         java.util.List<String> args = java.util.Arrays.asList(
             "-hide_banner", "-loglevel", "error",
             "-ss", Long.toString(Math.max(0L, position)),
             "-i", file.getAbsolutePath(),
             "-frames:v", "1",
-            "-vf", "scale=256:256:force_original_aspect_ratio=increase,crop=256:256",
+            "-vf", filter,
             "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1");
         return this.runTool("ffmpeg", "/usr/bin/ffmpeg", args, 45L);
     }
@@ -352,24 +357,47 @@ extends AbstractCtbrecServlet {
         catch (Exception ignored) {
         }
         double duration = this.probeDuration(file);
-        long position;
+        java.util.List<Long> positions = new java.util.ArrayList<>();
         if (active) {
-            position = duration > 0 ? Math.max(3L, (long)duration - 20L) : 30L;
+            positions.add(duration > 0 ? Math.max(3L, (long)duration - 20L) : 30L);
+            if (duration > 0) {
+                positions.add(Math.max(3L, (long)(duration * 0.5)));
+                positions.add(Math.max(3L, (long)(duration * 0.2)));
+            }
+            positions.add(5L);
         }
         else if (duration > 0) {
-            position = Math.max(5L, (long)(duration * 0.5));
+            positions.add(Math.max(5L, (long)(duration * 0.5)));
+            positions.add(Math.max(5L, (long)(duration * 0.3)));
+            positions.add(Math.max(5L, (long)(duration * 0.7)));
+            positions.add(5L);
         }
         else {
-            position = 30L;
+            positions.add(30L);
+            positions.add(5L);
         }
-        byte[] frame = this.extractFrame(file, position);
-        if (frame == null && position > 5L) {
-            frame = this.extractFrame(file, 5L);
+        String url = model.getUrl() == null ? "" : model.getUrl();
+        boolean vrSideBySide = url.contains("vr.stripchat") || model.getClass().getName().contains("VR");
+        byte[] best = null;
+        for (long position : positions) {
+            byte[] frame = this.extractFrame(file, position, vrSideBySide);
+            if (frame == null) {
+                continue;
+            }
+            if (best == null || frame.length > best.length) {
+                best = frame;
+            }
+            // A blank/transition frame compresses to almost nothing; try the
+            // next position instead of storing a grey rectangle.
+            if (frame.length >= 2500) {
+                best = frame;
+                break;
+            }
         }
-        if (frame != null) {
+        if (best != null) {
             log.info("Generated portrait from recording for model: {} ({})", (Object)model.getName(), (Object)file.getName());
         }
-        return frame;
+        return best;
     }
 
     private void fetchAndServePreview(HttpServletResponse resp, String modelUrl, boolean previewOnly) {
@@ -386,6 +414,22 @@ extends AbstractCtbrecServlet {
                 // Stripchat's preview URLs are often a static cover image, so
                 // prefer a frame from the newest recording (the actual stream).
                 byte[] frame = this.recordingFrame(model);
+                if (frame != null && frame.length < 2500) {
+                    // A blank or transition frame: never overwrite a usable
+                    // portrait with it. Serve the existing one if there is one.
+                    Optional<byte[]> existing = this.portraitStore.loadModelPortraitByModelUrl(modelUrl);
+                    if (existing.isPresent()) {
+                        byte[] bytes = existing.get();
+                        resp.setStatus(200);
+                        resp.setContentType("image/jpeg");
+                        resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+                        resp.setContentLength(bytes.length);
+                        resp.getOutputStream().write(bytes, 0, bytes.length);
+                        resp.getOutputStream().flush();
+                        return;
+                    }
+                    frame = null;
+                }
                 if (frame != null) {
                     if (!previewOnly) {
                         this.portraitStore.writePortrait(modelUrl, frame);

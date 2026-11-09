@@ -16,9 +16,11 @@ behaviour changes:
    the bytes stay identical over time even though `snapshotTimestamp` advances,
    so they do not resemble the live stream. Active recordings contribute a
    frame near the end of the growing file; finished recordings contribute a
-   frame from the midpoint. If no recording exists, the endpoint falls back to
-   the provider snapshot, but never to the profile avatar: it returns
-   404 "No stream snapshot available" instead.
+   frame from the midpoint. VR recordings are stereoscopic side-by-side, so
+   only the left eye is kept. Blank/transition frames are rejected by size; if
+   no usable frame exists the endpoint keeps an already stored portrait, or
+   falls back to the provider snapshot, but never to the profile avatar. If
+   neither exists it returns 404 "No stream snapshot available".
 2. Stripchat serves webp. Java's ImageIO has no webp decoder, so the stock
    endpoint stored raw webp bytes in a `.jpg` file, which the desktop client
    could not render (it fell back to the default picture). The patch pipes webp
