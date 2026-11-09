@@ -6,18 +6,19 @@ to rebuild the deployed artefacts.
 
 ## `servlet-patch/`
 
-`ImageServlet.java` is a decompiled ctbrec 26.10.13 `ImageServlet` with two
+`ImageServlet.java` is a decompiled ctbrec 26.10.13 `ImageServlet` with three
 behaviour changes:
 
 1. For models that implement `ctbrec.PortraitUrlProvider` (Stripchat and
-   Stripchat VR), the portrait fetch endpoint asks the model for its dedicated
-   portrait URL instead of using the site search fallback. Stripchat returns
-   `previewUrlThumbBig`, the latest live-stream snapshot, even while the model
-   is offline. The unmodified code used `avatarUrl` from search, i.e. the
-   default profile picture. If the provider fails (for example a transient 403
-   from the site) or only offers an avatar URL, the endpoint returns
-   404 "No stream snapshot available" rather than silently storing the avatar;
-   the backfill script records that as a failure and retries later.
+   Stripchat VR), the portrait fetch endpoint generates a 256x256 JPEG from the
+   newest recording using ffmpeg. This is necessary because Stripchat's
+   `previewUrlThumbBig` / `previewUrl` are static cover images for many models:
+   the bytes stay identical over time even though `snapshotTimestamp` advances,
+   so they do not resemble the live stream. Active recordings contribute a
+   frame near the end of the growing file; finished recordings contribute a
+   frame from the midpoint. If no recording exists, the endpoint falls back to
+   the provider snapshot, but never to the profile avatar: it returns
+   404 "No stream snapshot available" instead.
 2. Stripchat serves webp. Java's ImageIO has no webp decoder, so the stock
    endpoint stored raw webp bytes in a `.jpg` file, which the desktop client
    could not render (it fell back to the default picture). The patch pipes webp
@@ -59,3 +60,7 @@ mirrored from `~/.local/bin/ctbrec-auto-portraits`.
 - `~/.local/bin/ctbrec-webui-patch` - install/remove the WebUI "Fetch from
   stream" button by overriding static files in `/opt/ctbrec/patch/html/static`.
   Re-run `ctbrec-webui-patch apply` after a ctbrec upgrade.
+- `refresh-from-recordings.py` (this directory) - one-off migration that
+  regenerates already-stored Stripchat portraits from recording frames without
+  restarting the server. Run as the ctbrec user inside the container; supports
+  `--dry-run`, `--limit`, `--include-vr`.

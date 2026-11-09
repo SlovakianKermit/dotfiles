@@ -11,12 +11,12 @@ installs a small override of the ctbrec web interface that adds a
 .B "Fetch from stream"
 button to the portrait popup. The button asks the running server to download
 the model's current preview, save it as the portrait, and show it in the
-popup immediately. On Stripchat this is the latest live snapshot, not the
-default profile avatar (the server also converts Stripchat's webp to JPEG, so
-both the browser and the desktop client can display it), provided the
-companion
+popup immediately. On Stripchat this is a frame from the newest recording, not
+the static site preview or the default profile avatar; the server converts it
+to JPEG so both the browser and the desktop client can display it. This
+requires the companion
 .BR ImageServlet
-patch is installed (see
+patch (see
 .I ~/.local/share/ctbrec/README.md
 for that patch).
 .P

@@ -188,7 +188,7 @@ extends AbstractCtbrecServlet {
         }
         catch (IOException first) {
             java.util.List<String> full = new java.util.ArrayList<>();
-            full.add("/opt/ctbrec/ffmpeg/ffmpeg");
+            full.add("/usr/bin/ffmpeg");
             full.addAll(command);
             return new ProcessBuilder(full).start();
         }
@@ -242,6 +242,136 @@ extends AbstractCtbrecServlet {
         }
     }
 
+    private File findNewestRecordingFile(Model model) {
+        File newestFile = null;
+        java.time.Instant newestDate = null;
+        try {
+            List<ctbrec.Recording> recordings = this.recorder.getRecordings();
+            for (ctbrec.Recording recording : recordings) {
+                Model recordedModel = recording.getModel();
+                if (recordedModel == null || !recordedModel.getUrl().equals(model.getUrl())) {
+                    continue;
+                }
+                File file = recording.getPostProcessedFile();
+                if (file == null || !file.isFile()) {
+                    file = recording.getAbsoluteFile();
+                }
+                if (file == null || !file.isFile()) {
+                    continue;
+                }
+                java.time.Instant start = recording.getStartDate();
+                if (newestFile == null || (start != null && newestDate != null && start.isAfter(newestDate))) {
+                    newestFile = file;
+                    newestDate = start;
+                }
+            }
+        }
+        catch (Exception e) {
+            log.warn("Could not list recordings for {}: {}", (Object)model.getName(), (Object)e.getMessage());
+        }
+        return newestFile;
+    }
+
+    private byte[] runProcess(java.util.List<String> command, long timeoutSeconds) {
+        Process process = null;
+        try {
+            ProcessBuilder builder = new ProcessBuilder(command);
+            builder.redirectError(ProcessBuilder.Redirect.DISCARD);
+            process = builder.start();
+            process.getOutputStream().close();
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (InputStream stream = process.getInputStream()) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = stream.read(buffer)) > 0) {
+                    output.write(buffer, 0, read);
+                }
+            }
+            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return null;
+            }
+            return process.exitValue() == 0 && output.size() > 0 ? output.toByteArray() : null;
+        }
+        catch (Exception e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            return null;
+        }
+    }
+
+    private byte[] runTool(String tool, String fallback, java.util.List<String> args, long timeoutSeconds) {
+        java.util.List<String> command = new java.util.ArrayList<>();
+        command.add(tool);
+        command.addAll(args);
+        byte[] result = this.runProcess(command, timeoutSeconds);
+        if (result == null && fallback != null) {
+            command.set(0, fallback);
+            result = this.runProcess(command, timeoutSeconds);
+        }
+        return result;
+    }
+
+    private double probeDuration(File file) {
+        java.util.List<String> args = java.util.Arrays.asList(
+            "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1", file.getAbsolutePath());
+        byte[] out = this.runTool("ffprobe", "/usr/bin/ffprobe", args, 10L);
+        if (out == null) {
+            return -1;
+        }
+        try {
+            return Double.parseDouble(new String(out, StandardCharsets.UTF_8).trim());
+        }
+        catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private byte[] extractFrame(File file, long position) {
+        java.util.List<String> args = java.util.Arrays.asList(
+            "-hide_banner", "-loglevel", "error",
+            "-ss", Long.toString(Math.max(0L, position)),
+            "-i", file.getAbsolutePath(),
+            "-frames:v", "1",
+            "-vf", "scale=256:256:force_original_aspect_ratio=increase,crop=256:256",
+            "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1");
+        return this.runTool("ffmpeg", "/usr/bin/ffmpeg", args, 45L);
+    }
+
+    private byte[] recordingFrame(Model model) {
+        File file = this.findNewestRecordingFile(model);
+        if (file == null) {
+            return null;
+        }
+        boolean active = false;
+        try {
+            active = this.recorder.isCurrentlyRecording(model);
+        }
+        catch (Exception ignored) {
+        }
+        double duration = this.probeDuration(file);
+        long position;
+        if (active) {
+            position = duration > 0 ? Math.max(3L, (long)duration - 20L) : 30L;
+        }
+        else if (duration > 0) {
+            position = Math.max(5L, (long)(duration * 0.5));
+        }
+        else {
+            position = 30L;
+        }
+        byte[] frame = this.extractFrame(file, position);
+        if (frame == null && position > 5L) {
+            frame = this.extractFrame(file, 5L);
+        }
+        if (frame != null) {
+            log.info("Generated portrait from recording for model: {} ({})", (Object)model.getName(), (Object)file.getName());
+        }
+        return frame;
+    }
+
     private void fetchAndServePreview(HttpServletResponse resp, String modelUrl, boolean previewOnly) {
         try {
             Site site;
@@ -253,10 +383,25 @@ extends AbstractCtbrecServlet {
             Model model = modelOpt.get();
             String previewUrl;
             if (model instanceof PortraitUrlProvider) {
-                // Sites such as Stripchat expose a dedicated live-snapshot
-                // portrait URL.  Never fall back to the site avatar for these
-                // models: the avatar is the default offline picture and looks
-                // nothing like the stream.
+                // Stripchat's preview URLs are often a static cover image, so
+                // prefer a frame from the newest recording (the actual stream).
+                byte[] frame = this.recordingFrame(model);
+                if (frame != null) {
+                    if (!previewOnly) {
+                        this.portraitStore.writePortrait(modelUrl, frame);
+                        log.info("Fetched and saved portrait (recording frame) for model: {}", (Object)model.getName());
+                    }
+                    resp.setStatus(200);
+                    resp.setContentType("image/jpeg");
+                    resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+                    resp.setContentLength(frame.length);
+                    resp.getOutputStream().write(frame, 0, frame.length);
+                    resp.getOutputStream().flush();
+                    return;
+                }
+                // No recording available: fall back to the site's snapshot URL.
+                // Never fall back to the site avatar: it is the default
+                // offline picture and looks nothing like the stream.
                 previewUrl = null;
                 try {
                     previewUrl = ((PortraitUrlProvider)model).getPortraitUrl(false);
