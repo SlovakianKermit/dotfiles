@@ -6,13 +6,25 @@ to rebuild the deployed artefacts.
 
 ## `servlet-patch/`
 
-`ImageServlet.java` is a decompiled ctbrec 26.10.13 `ImageServlet` with one
-behaviour change: before falling back to the site's search results, the
-portrait fetch endpoint asks the model for a dedicated portrait URL through
-`ctbrec.PortraitUrlProvider`. Stripchat implements that by returning
-`previewUrlThumbBig` from its cam API, which is the latest live-stream snapshot
-even while the model is offline. The unmodified code used `avatarUrl` from
-search, i.e. the default profile picture.
+`ImageServlet.java` is a decompiled ctbrec 26.10.13 `ImageServlet` with two
+behaviour changes:
+
+1. For models that implement `ctbrec.PortraitUrlProvider` (Stripchat and
+   Stripchat VR), the portrait fetch endpoint asks the model for its dedicated
+   portrait URL instead of using the site search fallback. Stripchat returns
+   `previewUrlThumbBig`, the latest live-stream snapshot, even while the model
+   is offline. The unmodified code used `avatarUrl` from search, i.e. the
+   default profile picture. If the provider fails (for example a transient 403
+   from the site) or only offers an avatar URL, the endpoint returns
+   404 "No stream snapshot available" rather than silently storing the avatar;
+   the backfill script records that as a failure and retries later.
+2. Stripchat serves webp. Java's ImageIO has no webp decoder, so the stock
+   endpoint stored raw webp bytes in a `.jpg` file, which the desktop client
+   could not render (it fell back to the default picture). The patch pipes webp
+   bytes through ffmpeg and stores a real 256x256 JPEG.
+
+Portrait responses also send `Cache-Control: no-store` so browsers cannot show
+a stale picture after a refresh.
 
 `deploy.sh` copies the installed jar from the container, compiles the class
 against it with the local JDK 21, pushes the class files into

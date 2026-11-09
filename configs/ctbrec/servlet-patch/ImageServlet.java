@@ -159,12 +159,86 @@ extends AbstractCtbrecServlet {
         if (imageData.isPresent()) {
             resp.setStatus(200);
             resp.setContentType("image/jpeg");
+            resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
             byte[] b = imageData.get();
             resp.setContentLength(b.length);
             resp.getOutputStream().write(b, 0, b.length);
             resp.getOutputStream().flush();
         } else {
             this.sendResponse(resp, 404, "Portrait with ID " + portraitId + " not found");
+        }
+    }
+
+    private static boolean isWebp(byte[] data) {
+        return data != null && data.length >= 12
+            && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F'
+            && data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P';
+    }
+
+    private Process startFfmpeg() throws IOException {
+        java.util.List<String> command = java.util.Arrays.asList(
+            "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-vf", "scale=256:256:force_original_aspect_ratio=increase,crop=256:256",
+            "-frames:v", "1", "-f", "image2", "-vcodec", "mjpeg", "-q:v", "3", "pipe:1");
+        try {
+            java.util.List<String> full = new java.util.ArrayList<>();
+            full.add("ffmpeg");
+            full.addAll(command);
+            return new ProcessBuilder(full).start();
+        }
+        catch (IOException first) {
+            java.util.List<String> full = new java.util.ArrayList<>();
+            full.add("/opt/ctbrec/ffmpeg/ffmpeg");
+            full.addAll(command);
+            return new ProcessBuilder(full).start();
+        }
+    }
+
+    private byte[] convertWebpToJpeg(byte[] data) {
+        if (!ImageServlet.isWebp(data)) {
+            return data;
+        }
+        Process process = null;
+        try {
+            process = this.startFfmpeg();
+            final byte[] input = data;
+            final Process running = process;
+            Thread writer = new Thread(() -> {
+                try (OutputStream stdin = running.getOutputStream()) {
+                    stdin.write(input);
+                }
+                catch (IOException iOException) {
+                    // ffmpeg exited early; the exit status is checked below
+                }
+            }, "portrait-webp-encoder");
+            writer.setDaemon(true);
+            writer.start();
+            ByteArrayOutputStream output = new ByteArrayOutputStream();
+            try (InputStream stdout = process.getInputStream()) {
+                byte[] buffer = new byte[8192];
+                int read;
+                while ((read = stdout.read(buffer)) > 0) {
+                    output.write(buffer, 0, read);
+                }
+            }
+            if (!process.waitFor(30L, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                log.warn("ffmpeg webp conversion timed out, keeping original bytes");
+                return data;
+            }
+            writer.join(2000L);
+            if (process.exitValue() != 0 || output.size() == 0) {
+                log.warn("ffmpeg webp conversion failed with status {}, keeping original bytes", (Object)process.exitValue());
+                return data;
+            }
+            return output.toByteArray();
+        }
+        catch (Exception e) {
+            if (process != null) {
+                process.destroyForcibly();
+            }
+            log.warn("Could not convert webp portrait to JPEG: {}", (Object)e.getMessage());
+            return data;
         }
     }
 
@@ -177,38 +251,45 @@ extends AbstractCtbrecServlet {
                 return;
             }
             Model model = modelOpt.get();
-            String previewUrl = model.getPreview();
-            // Sites such as Stripchat expose a dedicated live-snapshot portrait
-            // URL that is much better than the profile avatar returned by the
-            // search fallback.  Prefer it when the model provides one.
-            if ((previewUrl == null || previewUrl.isEmpty() || !previewUrl.toLowerCase().startsWith("http")) && model instanceof PortraitUrlProvider) {
+            String previewUrl;
+            if (model instanceof PortraitUrlProvider) {
+                // Sites such as Stripchat expose a dedicated live-snapshot
+                // portrait URL.  Never fall back to the site avatar for these
+                // models: the avatar is the default offline picture and looks
+                // nothing like the stream.
+                previewUrl = null;
                 try {
-                    String portraitUrl = ((PortraitUrlProvider)model).getPortraitUrl(false);
-                    if (portraitUrl != null && !portraitUrl.isEmpty() && portraitUrl.toLowerCase().startsWith("http")) {
-                        previewUrl = portraitUrl;
-                        log.debug("Using portrait URL provider for model: {}", (Object)model.getName());
-                    }
+                    previewUrl = ((PortraitUrlProvider)model).getPortraitUrl(false);
                 }
                 catch (Exception e) {
                     log.warn("Portrait URL provider failed for {}: {}", (Object)model.getName(), (Object)e.getMessage());
                 }
-            }
-            if ((previewUrl == null || previewUrl.isEmpty() || !previewUrl.toLowerCase().startsWith("http")) && (site = model.getSite()) != null && site.supportsSearch()) {
-                try {
-                    List<Model> results = site.search(model.getName());
-                    Optional<Model> freshModel = results.stream().filter(m -> m.getUrl().equals(model.getUrl()) || m.getName().equalsIgnoreCase(model.getName())).findFirst();
-                    if (freshModel.isPresent() && freshModel.get().getPreview() != null && freshModel.get().getPreview().startsWith("http")) {
-                        previewUrl = freshModel.get().getPreview();
-                        log.debug("Found preview URL from search: {}", (Object)previewUrl);
+                if (previewUrl == null || !previewUrl.toLowerCase().startsWith("http")
+                        || previewUrl.toLowerCase().contains("/avatars/")) {
+                    log.info("No stream snapshot available for model: {}", (Object)model.getName());
+                    this.sendResponse(resp, 404, "{\"status\": \"error\", \"msg\": \"No stream snapshot available\"}");
+                    return;
+                }
+                log.debug("Using portrait URL provider for model: {}", (Object)model.getName());
+            } else {
+                previewUrl = model.getPreview();
+                if ((previewUrl == null || previewUrl.isEmpty() || !previewUrl.toLowerCase().startsWith("http")) && (site = model.getSite()) != null && site.supportsSearch()) {
+                    try {
+                        List<Model> results = site.search(model.getName());
+                        Optional<Model> freshModel = results.stream().filter(m -> m.getUrl().equals(model.getUrl()) || m.getName().equalsIgnoreCase(model.getName())).findFirst();
+                        if (freshModel.isPresent() && freshModel.get().getPreview() != null && freshModel.get().getPreview().startsWith("http")) {
+                            previewUrl = freshModel.get().getPreview();
+                            log.debug("Found preview URL from search: {}", (Object)previewUrl);
+                        }
+                    }
+                    catch (Exception e) {
+                        log.warn("Failed to search for fresh preview URL", (Throwable)e);
                     }
                 }
-                catch (Exception e) {
-                    log.warn("Failed to search for fresh preview URL", (Throwable)e);
+                if (previewUrl == null || previewUrl.isEmpty() || !previewUrl.toLowerCase().startsWith("http")) {
+                    this.sendResponse(resp, 404, "{\"status\": \"error\", \"msg\": \"No preview URL available\"}");
+                    return;
                 }
-            }
-            if (previewUrl == null || previewUrl.isEmpty() || !previewUrl.toLowerCase().startsWith("http")) {
-                this.sendResponse(resp, 404, "{\"status\": \"error\", \"msg\": \"No preview URL available\"}");
-                return;
             }
             site = model.getSite();
             if (site == null) {
@@ -229,6 +310,11 @@ extends AbstractCtbrecServlet {
                 }
                 byte[] rawImageData = this.readLimited(response.body().byteStream(), 0xA00000);
                 String contentType = response.header("Content-Type", "image/jpeg");
+                byte[] converted = this.convertWebpToJpeg(rawImageData);
+                if (converted != rawImageData) {
+                    rawImageData = converted;
+                    contentType = "image/jpeg";
+                }
                 try {
                     BufferedImage original = this.readBoundedImage(rawImageData);
                     if (original == null) {
@@ -255,6 +341,7 @@ extends AbstractCtbrecServlet {
                 }
                 resp.setStatus(200);
                 resp.setContentType(contentType);
+                resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
                 resp.setContentLength(imageData.length);
                 resp.getOutputStream().write(imageData, 0, imageData.length);
                 resp.getOutputStream().flush();

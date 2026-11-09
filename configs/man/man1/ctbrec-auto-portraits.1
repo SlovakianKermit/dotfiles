@@ -131,6 +131,12 @@ Where the model exposes a dedicated portrait URL through
 over the profile avatar. This is what makes a Stripchat portrait resemble the
 stream instead of the default offline picture.
 .IP \(bu 2
+If the provider fails or has no snapshot, the server now refuses to store the
+profile avatar and answers 404. The script records that model in its failure
+state and retries it after
+.BR \-\-retry\-after
+hours, rather than leaving a misleading avatar behind.
+.IP \(bu 2
 JPEG previews are stored by the server exactly as returned, already cropped to
 256x256.
 .IP \(bu 2

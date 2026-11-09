@@ -12,7 +12,9 @@ installs a small override of the ctbrec web interface that adds a
 button to the portrait popup. The button asks the running server to download
 the model's current preview, save it as the portrait, and show it in the
 popup immediately. On Stripchat this is the latest live snapshot, not the
-default profile avatar, provided the companion
+default profile avatar (the server also converts Stripchat's webp to JPEG, so
+both the browser and the desktop client can display it), provided the
+companion
 .BR ImageServlet
 patch is installed (see
 .I ~/.local/share/ctbrec/README.md

@@ -47,7 +47,7 @@ INDEX_PATCHED = """            <p class="text-muted mt-2">No portrait available<
         </div>"""
 
 SCRIPT_TAG = '<script src="models.js"></script>'
-SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch"></script>'
+SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch2"></script>'
 
 MODELS_ANCHOR = "function showPortraitPopup(model) {"
 MODELS_PATCHED = """// ctbrec-webui-patch: model currently shown in the portrait popup
@@ -82,6 +82,7 @@ function fetchPortraitForPopup() {
     }
     fetch('../image/portrait/fetch/' + encodeURIComponent(modelUrl), {
         method: 'GET',
+        cache: 'no-store',
         headers: headers
     })
     .then(response => {
@@ -175,6 +176,11 @@ def patch_models(source: str, dry_run: bool) -> str:
         return source
     source = source.replace(MODELS_ANCHOR, MODELS_PATCHED)
     source = source.replace(MODELS_URL_ANCHOR, MODELS_URL_PATCHED)
+    # Never let the browser reuse a portrait that has since been refreshed.
+    source = source.replace(
+        "        method: 'GET',\n        headers: headers",
+        "        method: 'GET',\n        cache: 'no-store',\n        headers: headers",
+    )
     if not source.endswith("\n"):
         source += "\n"
     source += MODELS_APPEND
