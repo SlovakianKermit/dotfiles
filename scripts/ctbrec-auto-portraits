@@ -1,0 +1,514 @@
+#!/usr/bin/env python3
+"""ctbrec-auto-portraits - backfill missing model portraits on a ctbrec server.
+
+Runs on the ctbrec server host (normally inside the ctbrec container).  It
+scans the recording metadata, finds every model that has been recorded but has
+no portrait yet, and asks the running ctbrec server to download that model's
+site preview thumbnail and store it as the portrait.
+
+The server crops and scales the image to a 256x256 JPEG itself, so this script
+only has to issue one authenticated HTTP GET per model.  Models that already
+have a portrait are skipped, and failures are remembered for a while so hourly
+runs do not hammer a site that is rate limiting the server.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import glob
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+DEFAULT_STATE = os.path.expanduser("~/.local/state/ctbrec-auto-portraits.json")
+PORTRAIT_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".bin")
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def die(message: str) -> "NoReturn":
+    eprint(f"ctbrec-auto-portraits: {message}")
+    sys.exit(1)
+
+
+def load_json(path: str, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return default
+
+
+def save_json(path: str, data: object) -> None:
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    temp = f"{path}.tmp.{os.getpid()}"
+    with open(temp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=1, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp, path)
+
+
+def find_config_dir(explicit: str | None, quiet: bool = False) -> str:
+    if explicit:
+        path = os.path.abspath(os.path.expanduser(explicit))
+        if not os.path.isfile(os.path.join(path, "models.json")):
+            die(f"{path} does not contain models.json")
+        return path
+
+    env = os.environ.get("CTBREC_CONFIG_DIR")
+    if env:
+        return find_config_dir(env, quiet)
+
+    base = os.path.expanduser("~/.config/ctbrec")
+    candidates = []
+    for entry in glob.glob(os.path.join(base, "*")):
+        if not os.path.isdir(entry):
+            continue
+        if "_backup_" in os.path.basename(entry):
+            continue
+        if os.path.isfile(os.path.join(entry, "models.json")) and os.path.isfile(
+            os.path.join(entry, "server.json")
+        ):
+            candidates.append(entry)
+
+    if not candidates:
+        die(f"no ctbrec config directory found under {base}; pass --config-dir")
+
+    chosen = max(candidates, key=lambda p: os.path.getmtime(os.path.join(p, "models.json")))
+    if not quiet and len(candidates) > 1:
+        eprint(f"ctbrec-auto-portraits: using config directory {chosen}")
+    return chosen
+
+
+def collect_recorded_models(config_dir: str) -> dict[str, tuple[str, int]]:
+    """Return {model_url: (display_name, newest_start_ms)} for recorded models."""
+    newest: dict[str, tuple[str, int]] = {}
+    for path in glob.glob(os.path.join(config_dir, "recordings", "*.json")):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                recording = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+
+        model = recording.get("model") or {}
+        url = model.get("url")
+        if not url:
+            continue
+        name = model.get("displayName") or model.get("name") or url
+        start = recording.get("startDate") or 0
+        try:
+            start = int(start)
+        except (TypeError, ValueError):
+            start = 0
+
+        previous = newest.get(url)
+        if previous is None or start > previous[1]:
+            newest[url] = (name, start)
+    return newest
+
+
+def portrait_exists(models_doc: dict, portraits_dir: str, model_url: str) -> bool:
+    portrait_id = (models_doc.get("modelPortraits") or {}).get(model_url)
+    if not portrait_id:
+        return False
+    return any(
+        os.path.isfile(os.path.join(portraits_dir, portrait_id + extension))
+        for extension in PORTRAIT_EXTENSIONS
+    )
+
+
+def hmac_header(secret: str, body: bytes = b"") -> str | None:
+    if not secret:
+        return None
+    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    return digest
+
+
+def make_ssl_context(verify: bool) -> ssl.SSLContext:
+    if verify:
+        return ssl.create_default_context()
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def fetch_portrait(
+    base_url: str,
+    model_url: str,
+    timeout: float,
+    secret: str,
+    context: ssl.SSLContext,
+) -> tuple[int, bytes, bytes]:
+    endpoint = (
+        base_url.rstrip("/")
+        + "/image/portrait/fetch/"
+        + urllib.parse.quote(model_url, safe="")
+    )
+    request = urllib.request.Request(endpoint, method="GET")
+    header = hmac_header(secret)
+    if header:
+        request.add_header("CTBREC-HMAC", header)
+
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return response.status, response.headers.get("Content-Type", "").encode(), response.read()
+
+
+def post_portrait(
+    base_url: str,
+    model_url: str,
+    data: bytes,
+    timeout: float,
+    secret: str,
+    context: ssl.SSLContext,
+) -> int:
+    endpoint = (
+        base_url.rstrip("/")
+        + "/image/portrait/url/"
+        + urllib.parse.quote(model_url, safe="")
+    )
+    request = urllib.request.Request(endpoint, data=data, method="POST")
+    request.add_header("Content-Type", "image/jpeg")
+    header = hmac_header(secret, data)
+    if header:
+        request.add_header("CTBREC-HMAC", header)
+
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        response.read()
+        return response.status
+
+
+def looks_like_webp(data: bytes) -> bool:
+    return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+def convert_to_jpeg(data: bytes, ffmpeg: str, size: int = 256) -> bytes:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-vf",
+        f"scale={size}:{size}:force_original_aspect_ratio=increase,crop={size}:{size}",
+        "-frames:v",
+        "1",
+        "-f",
+        "image2",
+        "-vcodec",
+        "mjpeg",
+        "-q:v",
+        "3",
+        "pipe:1",
+    ]
+    process = subprocess.run(command, input=data, capture_output=True, check=False)
+    if process.returncode != 0 or not process.stdout:
+        message = process.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"ffmpeg conversion failed: {message or 'no output'}")
+    return process.stdout
+
+
+def describe_error(error: Exception) -> str:
+    if isinstance(error, urllib.error.HTTPError):
+        detail = ""
+        try:
+            detail = error.read().decode("utf-8", "replace").strip()
+        except Exception:
+            pass
+        if len(detail) > 160:
+            detail = detail[:157] + "..."
+        return f"HTTP {error.code}" + (f" {detail}" if detail else "")
+    if isinstance(error, urllib.error.URLError):
+        return f"{error.reason}"
+    return str(error) or error.__class__.__name__
+
+
+def normalize_portraits(portraits_dir: str, ffmpeg: str, quiet: bool) -> int:
+    if not os.path.isdir(portraits_dir):
+        print("normalize: no portraits directory; nothing to do")
+        return 0
+
+    converted = 0
+    skipped = 0
+    failed = 0
+    for name in sorted(os.listdir(portraits_dir)):
+        path = os.path.join(portraits_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError as error:
+            failed += 1
+            eprint(f"{name}: {error}")
+            continue
+        if not looks_like_webp(data):
+            skipped += 1
+            continue
+        try:
+            jpeg = convert_to_jpeg(data, ffmpeg)
+        except Exception as error:  # noqa: BLE001 - report and keep going
+            failed += 1
+            eprint(f"{name}: {error}")
+            continue
+        temp = f"{path}.tmp.{os.getpid()}"
+        with open(temp, "wb") as handle:
+            handle.write(jpeg)
+        os.replace(temp, path)
+        converted += 1
+        if not quiet:
+            print(f"converted {name}")
+
+    print(f"normalize: {converted} converted, {skipped} already JPEG/other, {failed} failed")
+    return 0 if failed == 0 else 1
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="ctbrec-auto-portraits",
+        description="Fetch a portrait for every recorded ctbrec model that lacks one.",
+    )
+    parser.add_argument(
+        "--config-dir",
+        metavar="PATH",
+        help="ctbrec version config directory containing models.json and server.json "
+        "(default: newest non-backup directory under ~/.config/ctbrec)",
+    )
+    parser.add_argument(
+        "--server",
+        default="https://127.0.0.1:8443",
+        metavar="URL",
+        help="base URL of the running ctbrec server (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=1.5,
+        metavar="SECONDS",
+        help="pause between models (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=90.0,
+        metavar="SECONDS",
+        help="per-model HTTP timeout (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="process at most N models this run (default: 0 = no limit)",
+    )
+    parser.add_argument(
+        "--retry-after",
+        type=float,
+        default=6.0,
+        metavar="HOURS",
+        help="do not retry a failed model for this many hours (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ffmpeg",
+        default="ffmpeg",
+        metavar="PATH",
+        help="ffmpeg executable used to convert webp previews to JPEG (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="convert existing webp portrait files to 256x256 JPEG and exit; "
+        "makes no network requests",
+    )
+    parser.add_argument(
+        "--state-file",
+        default=DEFAULT_STATE,
+        metavar="PATH",
+        help="failure backoff state file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="ignore existing portraits and failure backoff (re-fetch everything)",
+    )
+    parser.add_argument(
+        "--verify-tls",
+        action="store_true",
+        help="verify the server TLS certificate (default: accept self-signed)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be fetched without changing anything",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="only print the summary",
+    )
+    parser.add_argument("--version", action="version", version="ctbrec-auto-portraits 1.0")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    config_dir = find_config_dir(args.config_dir, args.quiet)
+
+    state_path = os.path.abspath(os.path.expanduser(args.state_file))
+    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+    lock_path = state_path + ".lock"
+    lock_handle = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0  # another run is already working; nothing to do
+
+    state = load_json(state_path, {}) or {}
+    if not isinstance(state, dict):
+        state = {}
+
+    models_doc = load_json(os.path.join(config_dir, "models.json"))
+    if not isinstance(models_doc, dict):
+        die(f"could not parse {os.path.join(config_dir, 'models.json')}")
+
+    server_doc = load_json(os.path.join(config_dir, "server.json"), {}) or {}
+    secret = server_doc.get("key") or ""
+
+    portraits_dir = os.path.join(os.path.dirname(config_dir.rstrip("/")), "portraits")
+
+    ffmpeg = shutil.which(args.ffmpeg)
+    if ffmpeg is None and os.path.isfile(args.ffmpeg):
+        ffmpeg = args.ffmpeg
+
+    if args.normalize:
+        if not ffmpeg:
+            die(f"ffmpeg not found: {args.ffmpeg}")
+        return normalize_portraits(portraits_dir, ffmpeg, args.quiet)
+
+    recorded = collect_recorded_models(config_dir)
+
+    now = time.time()
+    retry_after = max(0.0, args.retry_after) * 3600.0
+
+    pending: list[tuple[int, str, str]] = []
+    skipped_portrait = 0
+    skipped_backoff = 0
+    for model_url, (name, start) in recorded.items():
+        if not args.force and portrait_exists(models_doc, portraits_dir, model_url):
+            skipped_portrait += 1
+            continue
+        if not args.force:
+            failure = state.get(model_url)
+            if isinstance(failure, dict):
+                attempted = failure.get("attempted") or 0
+                try:
+                    attempted = float(attempted)
+                except (TypeError, ValueError):
+                    attempted = 0
+                if retry_after and now - attempted < retry_after:
+                    skipped_backoff += 1
+                    continue
+        pending.append((start, model_url, name))
+
+    pending.sort(reverse=True)
+    if args.limit and args.limit > 0:
+        pending = pending[: args.limit]
+
+    if not args.quiet:
+        print(
+            f"recorded models: {len(recorded)} | with portrait: {skipped_portrait} | "
+            f"in backoff: {skipped_backoff} | to fetch: {len(pending)}"
+        )
+
+    if args.dry_run or not pending:
+        if not args.quiet:
+            for _, model_url, name in pending:
+                print(f"  would fetch {name} <{model_url}>")
+        return 0
+
+    context = make_ssl_context(args.verify_tls)
+    ok = 0
+    failed = 0
+    started = time.time()
+    warned_no_ffmpeg = False
+
+    for index, (_, model_url, name) in enumerate(pending, start=1):
+        if index > 1 and args.delay > 0:
+            time.sleep(args.delay)
+        if not args.quiet:
+            print(f"[{index}/{len(pending)}] {name} ... ", end="", flush=True)
+        try:
+            status, _content_type, data = fetch_portrait(
+                args.server, model_url, args.timeout, secret, context
+            )
+            if status != 200:
+                raise RuntimeError(f"HTTP {status}")
+            # Stripchat (and some other sites) return webp.  The server passes
+            # it through unchanged because Java ImageIO has no webp decoder,
+            # which leaves a .jpg file the desktop client cannot read.  Convert
+            # it here and upload the real JPEG, overwriting the same id.
+            if looks_like_webp(data):
+                if not ffmpeg:
+                    if not warned_no_ffmpeg:
+                        eprint(
+                            "ctbrec-auto-portraits: warning: ffmpeg not found; "
+                            "webp portraits will be stored unconverted"
+                        )
+                        warned_no_ffmpeg = True
+                else:
+                    jpeg = convert_to_jpeg(data, ffmpeg)
+                    post_status = post_portrait(
+                        args.server, model_url, jpeg, args.timeout, secret, context
+                    )
+                    if post_status != 200:
+                        raise RuntimeError(f"portrait upload returned HTTP {post_status}")
+        except Exception as error:  # noqa: BLE001 - reported and retried later
+            failed += 1
+            message = describe_error(error)
+            state[model_url] = {"attempted": time.time(), "error": message}
+            if not args.quiet:
+                print(f"failed: {message}")
+        else:
+            ok += 1
+            state.pop(model_url, None)
+            if not args.quiet:
+                print("ok")
+
+    # Drop stale backoff entries so the state file does not grow forever.
+    for model_url in list(state):
+        entry = state[model_url]
+        if not isinstance(entry, dict):
+            del state[model_url]
+            continue
+        try:
+            attempted = float(entry.get("attempted", 0) or 0)
+        except (TypeError, ValueError):
+            attempted = 0
+        if model_url not in recorded and now - attempted > 30 * 86400:
+            del state[model_url]
+
+    save_json(state_path, state)
+    elapsed = time.time() - started
+    print(f"done: {ok} fetched, {failed} failed, {skipped_portrait} already present, {elapsed:.1f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

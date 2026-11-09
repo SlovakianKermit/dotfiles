@@ -1,0 +1,206 @@
+.TH CTBREC-AUTO-PORTRAITS 1 "2026-11-09" "ctbrec-auto-portraits" "User Commands"
+.SH NAME
+ctbrec-auto-portraits \- backfill missing model portraits on a ctbrec server
+.SH SYNOPSIS
+.B ctbrec-auto-portraits
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-auto-portraits
+runs on the ctbrec server host (normally inside the Proxmox container) and
+gives every recorded model a portrait. It reads the recording metadata under
+the ctbrec config directory, collects the newest recording for each model URL,
+and skips models that already have a portrait.
+.P
+For each missing model it issues one authenticated
+.B GET
+request to the ctbrec server's
+.B /image/portrait/fetch/
+endpoint. The server downloads the model's site preview thumbnail, crops and
+scales it to a 256x256 JPEG, writes it to the portrait store and records the
+mapping in
+.IR models.json .
+The script itself never writes the config; the running server owns that file.
+.P
+Some sites, notably Stripchat, serve previews as webp. Java's image library has
+no webp decoder, so the server passes those bytes through untouched and stores
+them in a file named
+.IR .jpg ,
+which the desktop client cannot read. When the downloaded bytes are webp the
+script converts them with
+.BR ffmpeg (1)
+to a real 256x256 centre-cropped JPEG and uploads that over the same portrait
+id. The
+.B \-\-normalize
+mode repairs portraits that were fetched before this conversion existed.
+.P
+Only models that appear in recording metadata are considered. A failure is
+remembered in a small state file and that model is skipped for
+.B \-\-retry\-after
+hours, so frequent runs do not hammer a site that is rate limiting the server.
+.P
+The script talks to the server over HTTPS with certificate verification
+disabled by default, because a stock ctbrec installation uses a self-signed
+certificate. It requires Python 3 and no third-party modules.
+.SH OPTIONS
+.TP
+.BI \-\-config\-dir " PATH"
+ctbrec version config directory containing
+.I models.json
+and
+.IR server.json .
+By default the newest non-backup directory under
+.I ~/.config/ctbrec
+that contains both files is used.
+.TP
+.BI \-\-server " URL"
+Base URL of the running ctbrec server. Default:
+.IR https://127.0.0.1:8443 .
+.TP
+.BI \-\-delay " SECONDS"
+Pause between models. Default:
+.IR 1.5 .
+.TP
+.BI \-\-timeout " SECONDS"
+Per-model HTTP timeout. Default:
+.IR 90 .
+.TP
+.BI \-\-limit " N"
+Process at most
+.I N
+models this run. Default:
+.B 0
+(no limit). The bundled systemd timer uses 100.
+.TP
+.BI \-\-retry\-after " HOURS"
+Do not retry a failed model for this many hours. Default:
+.IR 6 .
+.TP
+.BI \-\-state\-file " PATH"
+Failure backoff state file. Default:
+.IR ~/.local/state/ctbrec-auto-portraits.json .
+.TP
+.BI \-\-ffmpeg " PATH"
+ffmpeg executable used to convert webp previews. Default:
+.IR ffmpeg
+from
+.IR PATH .
+If it is not found, webp portraits are stored unconverted (with a warning).
+.TP
+.B \-\-normalize
+Convert every existing webp file in the portraits directory to a 256x256 JPEG
+in place, then exit. Makes no network requests and does not touch
+.IR models.json .
+.TP
+.B \-\-force
+Ignore existing portraits and the failure backoff and re-fetch every recorded
+model.
+.TP
+.B \-\-verify\-tls
+Verify the server certificate instead of accepting a self-signed one.
+.TP
+.B \-\-dry\-run
+Print which models would be fetched and change nothing.
+.TP
+.B \-\-quiet
+Print only the final summary line.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH BEHAVIOUR
+.SS Model selection
+.IP \(bu 2
+Recorded means: at least one JSON file in
+.IR <config-dir>/recordings/ ,
+which contains the model URL. The newest recording per URL is kept only to
+order the work; the portrait itself comes from the site, not the file.
+.IP \(bu 2
+Models whose portrait mapping exists and whose portrait file is present are
+skipped even if the mapping points at a stale id without a file: the missing
+file makes them eligible again.
+.IP \(bu 2
+Work is ordered newest recording first, so models recorded today get a
+portrait before long-dormant ones.
+.SS Concurrency
+A lock file next to the state file prevents two runs from overlapping. A
+second invocation exits immediately with status 0.
+.SS Image format
+.IP \(bu 2
+JPEG previews are stored by the server exactly as returned, already cropped to
+256x256.
+.IP \(bu 2
+webp previews are converted locally and re-uploaded, so the stored file is a
+real JPEG that both the web interface and the desktop client can decode.
+.IP \(bu 2
+If ffmpeg is unavailable the webp bytes are kept; run
+.B \-\-normalize
+after installing ffmpeg to repair them.
+.SS Authentication
+If
+.I server.json
+contains a non-empty
+.B key
+(ctbrec HMAC authentication), every request is signed with
+.B CTBREC-HMAC
+using HMAC-SHA256 in hex, matching the web interface.
+.SH EXAMPLES
+See what would be fetched:
+.IP
+.EX
+ctbrec-auto-portraits \-\-dry\-run \-\-limit 10
+.EE
+.P
+Fetch portraits for up to 25 models:
+.IP
+.EX
+ctbrec-auto-portraits \-\-limit 25
+.EE
+.P
+Re-fetch everything, including models that already have a portrait:
+.IP
+.EX
+ctbrec-auto-portraits \-\-force
+.EE
+.P
+Repair webp portraits fetched by an older version of the script:
+.IP
+.EX
+ctbrec-auto-portraits \-\-normalize
+.EE
+.P
+Run from the desktop through the SSH wrapper:
+.IP
+.EX
+ctbrec-auto-portraits-remote \-\-dry\-run
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including runs where individual models failed (those are recorded in
+the state file and retried later).
+.TP
+.B 1
+Fatal error: no config directory, unreadable
+.IR models.json ,
+or a missing remote executable.
+.TP
+.B 130
+Interrupted.
+.SH FILES
+.TP
+.I ~/.config/ctbrec/<version>/models.json
+Model list and portrait id map. Read only.
+.TP
+.I ~/.config/ctbrec/<version>/recordings/*.json
+Recording metadata used to enumerate recorded models.
+.TP
+.I ~/.config/ctbrec/portraits/<uuid>.jpg
+Portrait files written by the server.
+.TP
+.I ~/.local/state/ctbrec-auto-portraits.json
+Failure backoff state.
+.SH SEE ALSO
+.BR ctbrec-auto-portraits-remote (1),
+.BR ctbrec-webui-patch (1),
+.BR ctbrec-merge (1),
+.BR ffmpeg (1),
+.BR systemd.timer (5)

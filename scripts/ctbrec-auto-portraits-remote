@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run ctbrec-auto-portraits on the ctbrec server (Proxmox LXC 109).
+set -euo pipefail
+
+SERVER="${CTBREC_AUTO_PORTRAITS_SERVER:-proxmox}"
+REMOTE_BIN="${CTBREC_AUTO_PORTRAITS_BIN:-/usr/local/bin/ctbrec-auto-portraits}"
+VMID="${CTBREC_AUTO_PORTRAITS_VMID:-109}"
+
+SSH_OPTS=(-o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
+
+extra=""
+if (( $# )); then
+  extra=$(printf '%q ' "$@")
+fi
+exec ssh "${SSH_OPTS[@]}" "$SERVER" \
+  "pct exec ${VMID} -- runuser -u ctbrec -- env HOME=/home/ctbrec ${REMOTE_BIN} ${extra}"

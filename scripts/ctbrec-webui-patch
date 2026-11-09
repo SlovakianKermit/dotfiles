@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""ctbrec-webui-patch - add a "Fetch from stream" button to the ctbrec WebUI.
+
+The ctbrec server serves its web interface from resources inside the server
+jar.  Its launcher puts /opt/ctbrec/patch first on the classpath, so a file at
+/opt/ctbrec/patch/html/static/<name> overrides the jar copy without touching
+the jar and without restarting the server.
+
+This script extracts the pristine index.html and models.js from the installed
+jar, applies a small, anchored patch (a button in the portrait popup which
+saves a fresh portrait), deploys the overrides to the server and verifies the
+marker is present.  Re-run it after a ctbrec upgrade; the patch is idempotent.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+
+SSH_OPTS = (
+    "-o",
+    "RemoteCommand=none",
+    "-o",
+    "RequestTTY=no",
+    "-o",
+    "BatchMode=yes",
+)
+MARKER = "ctbrec-webui-patch"
+
+INDEX_ANCHOR = """            <p class="text-muted mt-2">No portrait available</p>
+          </div>
+        </div>"""
+
+INDEX_PATCHED = """            <p class="text-muted mt-2">No portrait available</p>
+          </div>
+        </div>
+        <!-- ctbrec-webui-patch: fetch/save a portrait from the popup -->
+        <div class="modal-footer py-2">
+          <button type="button" class="btn btn-sm btn-primary" id="portraitPopupFetchBtn"
+                  onclick="fetchPortraitForPopup()" title="Fetch a new portrait from the model stream">
+            <i class="fas fa-camera me-1"></i>Fetch from stream
+          </button>
+        </div>"""
+
+SCRIPT_TAG = '<script src="models.js"></script>'
+SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch"></script>'
+
+MODELS_ANCHOR = "function showPortraitPopup(model) {"
+MODELS_PATCHED = """// ctbrec-webui-patch: model currently shown in the portrait popup
+let currentPortraitPopupUrl = null;
+
+function showPortraitPopup(model) {"""
+
+MODELS_URL_ANCHOR = "    document.getElementById('portraitPopupModalLabel').textContent = modelName;"
+MODELS_URL_PATCHED = (
+    MODELS_URL_ANCHOR
+    + "\n    currentPortraitPopupUrl = modelUrl; // ctbrec-webui-patch"
+)
+
+MODELS_APPEND = """
+
+// ctbrec-webui-patch: fetch and save a fresh portrait for the popup's model
+function fetchPortraitForPopup() {
+    const modelUrl = currentPortraitPopupUrl;
+    if (!modelUrl) {
+        notify('No model URL available', 'warning');
+        return;
+    }
+    const btn = document.getElementById('portraitPopupFetchBtn');
+    const img = document.getElementById('portraitPopupImage');
+    const placeholder = document.getElementById('portraitPopupPlaceholder');
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Fetching...';
+    const headers = {};
+    if (hmac && hmac.length > 0) {
+        headers['CTBREC-HMAC'] = CryptoJS.HmacSHA256('', hmac).toString(CryptoJS.enc.Hex);
+    }
+    fetch('../image/portrait/fetch/' + encodeURIComponent(modelUrl), {
+        method: 'GET',
+        headers: headers
+    })
+    .then(response => {
+        if (response.ok) {
+            return response.blob();
+        }
+        return response.text().then(text => {
+            throw new Error(text || ('HTTP ' + response.status));
+        });
+    })
+    .then(blob => {
+        img.src = URL.createObjectURL(blob);
+        img.style.display = 'block';
+        placeholder.style.display = 'none';
+        notify('Portrait fetched and saved', 'info');
+        updateModels();
+    })
+    .catch(error => {
+        notify('Failed to fetch portrait: ' + error.message, 'error');
+    })
+    .finally(() => {
+        btn.disabled = false;
+        btn.innerHTML = original;
+    });
+}
+"""
+
+
+def fail(message: str) -> "NoReturn":
+    print(f"ctbrec-webui-patch: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ssh(server: str, command: str, data: bytes | None = None) -> bytes:
+    process = subprocess.run(
+        ["ssh", *SSH_OPTS, server, command],
+        input=data,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        stderr = process.stderr.decode("utf-8", "replace").strip()
+        fail(f"remote command failed ({process.returncode}): {stderr or command}")
+    return process.stdout
+
+
+def container(server: str, vmid: str, script: str) -> bytes:
+    return ssh(server, f"pct exec {vmid} -- bash -lc {shlex.quote(script)}")
+
+
+def find_jar(server: str, vmid: str, remote_dir: str) -> str:
+    listing = container(
+        server, vmid, f"ls -1 {remote_dir}/ctbrec-server-*.jar 2>/dev/null | head -1"
+    )
+    jar = listing.decode("utf-8", "replace").strip()
+    if not jar:
+        fail(f"no ctbrec server jar found under {remote_dir}")
+    return jar
+
+
+def extract(server: str, vmid: str, jar: str, resource: str) -> bytes:
+    script = f"unzip -p {shlex.quote(jar)} {shlex.quote(resource)}"
+    data = container(server, vmid, script)
+    if not data:
+        fail(f"could not extract {resource} from {jar}")
+    return data
+
+
+def patch_index(source: str, dry_run: bool) -> str:
+    if MARKER in source:
+        fail("index.html from the jar is already patched; refusing to double-patch")
+    if source.count(INDEX_ANCHOR) != 1:
+        fail("index.html anchor not unique; the upstream layout changed")
+    if source.count(SCRIPT_TAG) != 1:
+        fail("index.html script tag anchor not unique; the upstream layout changed")
+    if dry_run:
+        return source
+    source = source.replace(INDEX_ANCHOR, INDEX_PATCHED)
+    source = source.replace(SCRIPT_TAG, SCRIPT_TAG_PATCHED)
+    return source
+
+
+def patch_models(source: str, dry_run: bool) -> str:
+    if MARKER in source:
+        fail("models.js from the jar is already patched; refusing to double-patch")
+    if source.count(MODELS_ANCHOR) != 1:
+        fail("models.js function anchor not unique; the upstream layout changed")
+    if source.count(MODELS_URL_ANCHOR) != 1:
+        fail("models.js modal anchor not unique; the upstream layout changed")
+    if dry_run:
+        return source
+    source = source.replace(MODELS_ANCHOR, MODELS_PATCHED)
+    source = source.replace(MODELS_URL_ANCHOR, MODELS_URL_PATCHED)
+    if not source.endswith("\n"):
+        source += "\n"
+    source += MODELS_APPEND
+    return source
+
+
+def check_js(path: str) -> None:
+    try:
+        process = subprocess.run(
+            ["node", "--check", path], capture_output=True, check=False
+        )
+    except FileNotFoundError:
+        return
+    if process.returncode != 0:
+        fail(
+            "patched models.js failed a JavaScript syntax check:\n"
+            + process.stderr.decode("utf-8", "replace")
+        )
+
+
+def deploy(server: str, vmid: str, remote_dir: str, files: dict[str, bytes]) -> None:
+    container(
+        server, vmid, f"mkdir -p {remote_dir}/patch/html/static"
+    )
+    for name, data in files.items():
+        remote_temp = f"/tmp/ctbrec-webui-{name}"
+        ssh(server, f"cat > {shlex.quote(remote_temp)}", data=data)
+        ssh(
+            server,
+            f"pct push {vmid} {shlex.quote(remote_temp)} "
+            f"{shlex.quote(remote_dir + '/patch/html/static/' + name)}",
+        )
+        ssh(server, f"rm -f {shlex.quote(remote_temp)}")
+    container(
+        server,
+        vmid,
+        f"chown ctbrec:ctbrec {remote_dir}/patch/html/static/index.html "
+        f"{remote_dir}/patch/html/static/models.js",
+    )
+
+
+def deployed_has_marker(server: str, vmid: str, remote_dir: str, name: str) -> bool:
+    path = f"{remote_dir}/patch/html/static/{name}"
+    result = container(server, vmid, f"grep -c {shlex.quote(MARKER)} {shlex.quote(path)} 2>/dev/null || true")
+    try:
+        return int(result.decode().strip() or 0) > 0
+    except ValueError:
+        return False
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ctbrec-webui-patch",
+        description='Install or remove the "Fetch from stream" button in the ctbrec WebUI.',
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("apply", "revert", "status"),
+        default="apply",
+        help="apply (default), revert, or status",
+    )
+    parser.add_argument(
+        "--server",
+        default=os.environ.get("CTBREC_WEBUI_SERVER", "proxmox"),
+        help="SSH host running the ctbrec container (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--vmid",
+        default=os.environ.get("CTBREC_WEBUI_VMID", "109"),
+        help="Proxmox container ID (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--remote-dir",
+        default=os.environ.get("CTBREC_WEBUI_DIR", "/opt/ctbrec"),
+        help="ctbrec installation directory in the container (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="check the anchors and print the plan"
+    )
+    args = parser.parse_args(argv)
+
+    if args.action == "status":
+        index_ok = deployed_has_marker(args.server, args.vmid, args.remote_dir, "index.html")
+        models_ok = deployed_has_marker(args.server, args.vmid, args.remote_dir, "models.js")
+        state = "applied" if index_ok and models_ok else "not applied"
+        print(f"{state}: index.html={'patched' if index_ok else 'stock'}, "
+              f"models.js={'patched' if models_ok else 'stock'}")
+        return 0 if state == "applied" else 1
+
+    if args.action == "revert":
+        if args.dry_run:
+            print("would remove the web UI overrides from patch/html/static/")
+            return 0
+        for name in ("index.html", "models.js"):
+            if deployed_has_marker(args.server, args.vmid, args.remote_dir, name):
+                ssh(
+                    args.server,
+                    f"pct exec {args.vmid} -- rm -f "
+                    f"{args.remote_dir}/patch/html/static/{name}",
+                )
+                print(f"removed {name} override")
+            else:
+                print(f"{name}: no ctbrec-webui-patch override present, leaving it alone")
+        print("Stock web UI restored. Hard-refresh the browser (Ctrl+Shift+R).")
+        return 0
+
+    jar = find_jar(args.server, args.vmid, args.remote_dir)
+    index = extract(args.server, args.vmid, jar, "html/static/index.html").decode("utf-8")
+    models = extract(args.server, args.vmid, jar, "html/static/models.js").decode("utf-8")
+
+    patched_index = patch_index(index, args.dry_run)
+    patched_models = patch_models(models, args.dry_run)
+
+    if args.dry_run:
+        print(f"jar: {jar}")
+        print("anchors OK; would deploy index.html and models.js overrides")
+        return 0
+
+    with tempfile.TemporaryDirectory(prefix="ctbrec-webui-") as temp_dir:
+        models_path = os.path.join(temp_dir, "models.js")
+        with open(models_path, "w", encoding="utf-8") as handle:
+            handle.write(patched_models)
+        check_js(models_path)
+
+    deploy(
+        args.server,
+        args.vmid,
+        args.remote_dir,
+        {"index.html": patched_index.encode("utf-8"), "models.js": patched_models.encode("utf-8")},
+    )
+
+    if not deployed_has_marker(args.server, args.vmid, args.remote_dir, "index.html"):
+        fail("deployed index.html is missing the patch marker")
+    print("patch applied: portrait popup now has a 'Fetch from stream' button")
+    print("Reload the WebUI (Ctrl+Shift+R if the browser cached models.js).")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

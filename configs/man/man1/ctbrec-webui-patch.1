@@ -1,0 +1,164 @@
+.TH CTBREC-WEBUI-PATCH 1 "2026-11-09" "ctbrec-webui-patch" "User Commands"
+.SH NAME
+ctbrec-webui-patch \- add a fetch-portrait button to the ctbrec web interface
+.SH SYNOPSIS
+.B ctbrec-webui-patch
+[\fBapply\fP|\fBrevert\fP|\fBstatus\fP]
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-webui-patch
+installs a small override of the ctbrec web interface that adds a
+.B "Fetch from stream"
+button to the portrait popup. The button asks the running server to download
+the model's current site preview, save it as the portrait, and show it in the
+popup immediately. This is the same operation as clicking the portrait box in
+the Edit Model dialog, but reachable from the portrait viewer itself.
+.P
+ctbrec serves its web interface from resources inside the server jar. Its
+launcher puts
+.I /opt/ctbrec/patch
+first on the classpath, and the static file servlet resolves resources through
+the class loader, so a file placed at
+.I /opt/ctbrec/patch/html/static/index.html
+or
+.I models.js
+silently overrides the jar copy. No jar modification and no server restart is
+needed; a normal browser reload picks it up.
+.P
+The script extracts the pristine files from the installed jar, checks that the
+patch anchors are present and unique, applies the changes, verifies the
+JavaScript syntax with
+.BR node (1)
+when available, pushes the files through
+.BR pct (1)
+and makes them owned by the
+.B ctbrec
+user.
+.P
+Because the override survives package changes, re-run
+.B ctbrec-webui-patch apply
+after every ctbrec upgrade. If an upgrade changes the relevant markup or
+JavaScript, the anchor check fails and nothing is deployed; use
+.B status
+or
+.B revert
+to inspect or remove a stale override.
+.SH ACTIONS
+.TP
+.B apply
+Extract, patch and deploy the two override files. This is the default action.
+Safe to repeat.
+.TP
+.B status
+Report whether the deployed override files carry the patch marker. Exits 0 when
+both are patched, 1 otherwise.
+.TP
+.B revert
+Remove the two override files if (and only if) they carry the patch marker,
+restoring the stock web interface. Other files under the patch directory are
+left untouched.
+.SH OPTIONS
+.TP
+.B \-\-server " HOST"
+SSH host running the ctbrec container. Default:
+.BR proxmox ,
+overridable with
+.BR CTBREC_WEBUI_SERVER .
+.TP
+.B \-\-vmid " ID"
+Proxmox container ID. Default:
+.BR 109 ,
+overridable with
+.BR CTBREC_WEBUI_VMID .
+.TP
+.BI \-\-remote\-dir " PATH"
+ctbrec installation directory inside the container. Default:
+.BR /opt/ctbrec ,
+overridable with
+.BR CTBREC_WEBUI_DIR .
+.TP
+.B \-\-dry\-run
+Find the jar and verify the anchors without deploying anything.
+.SH WHAT CHANGES
+.IP \(bu 2
+.I index.html
+gains a footer in the portrait popup containing the button, and the
+.I models.js
+script tag gets a version query so browsers pick up the new file.
+.IP \(bu 2
+.I models.js
+gains a global holding the popup's model URL and a
+.B fetchPortraitForPopup()
+function which calls
+.B ../image/portrait/fetch/<url>
+and refreshes the image, with a spinner and a notification.
+.IP \(bu 2
+Every inserted line carries a
+.B ctbrec-webui-patch
+marker, which is how
+.B status
+and
+.B revert
+recognise the overrides.
+.SH EXAMPLES
+Install or refresh the button:
+.IP
+.EX
+ctbrec-webui-patch apply
+.EE
+.P
+Check that it is deployed:
+.IP
+.EX
+ctbrec-webui-patch status
+.EE
+.P
+Validate anchors before a real run:
+.IP
+.EX
+ctbrec-webui-patch apply \-\-dry\-run
+.EE
+.P
+Return to the stock web interface:
+.IP
+.EX
+ctbrec-webui-patch revert
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success; for
+.B status
+this means the override is present.
+.TP
+.B 1
+Failure: no jar found, anchor missing or duplicated, remote command failed, or
+(for
+.B status
+) the override is absent.
+.TP
+.B 130
+Interrupted.
+.SH FILES
+.TP
+.I /opt/ctbrec/patch/html/static/index.html
+Patched page override.
+.TP
+.I /opt/ctbrec/patch/html/static/models.js
+Patched script override.
+.TP
+.I /opt/ctbrec/ctbrec-server-*-final.jar
+Pristine source of both files; never modified.
+.SH SEE ALSO
+.BR ctbrec-auto-portraits (1),
+.BR ctbrec-auto-portraits-remote (1),
+.BR ssh (1),
+.BR pct (1)
+.SH NOTES
+After deploying, hard-refresh the browser
+(for example with
+.BR Ctrl+Shift+R )
+if the old
+.I models.js
+is still cached. The stock image popup is otherwise unchanged: the camera
+button only appears in the portrait dialog.

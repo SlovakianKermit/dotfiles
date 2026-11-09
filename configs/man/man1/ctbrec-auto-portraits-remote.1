@@ -1,0 +1,83 @@
+.TH CTBREC-AUTO-PORTRAITS-REMOTE 1 "2026-11-09" "ctbrec-auto-portraits-remote" "User Commands"
+.SH NAME
+ctbrec-auto-portraits-remote \- run ctbrec-auto-portraits in the ctbrec container over ssh
+.SH SYNOPSIS
+.B ctbrec-auto-portraits-remote
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B ctbrec-auto-portraits-remote
+is a thin local wrapper that executes
+.B /usr/local/bin/ctbrec-auto-portraits
+inside the ctbrec Proxmox container (VMID 109 by default) as the
+.B ctbrec
+user, with
+.B HOME=/home/ctbrec
+so that config and state paths resolve identically to the running server.
+.P
+It connects with
+.BR ssh (1)
+in non-interactive mode (no TTY, host
+.B RemoteCommand
+disabled, batch mode) and then uses
+.BR pct (1)
+to enter the container. All argument parsing, HTTP requests and portrait
+writes happen on the server; only the progress output is streamed back.
+.P
+Arguments are shell-quoted on the way through, so values containing spaces are
+safe. The remote exit status becomes the wrapper's exit status.
+.SH OPTIONS
+All options are forwarded verbatim to
+.BR ctbrec-auto-portraits (1).
+The most useful are
+.BR \-\-dry\-run ,
+.BR \-\-limit ,
+.BR \-\-normalize ,
+.BR \-\-force
+and
+.BR \-\-quiet ;
+see that page for the full list.
+.SH ENVIRONMENT
+.TP
+.B CTBREC_AUTO_PORTRAITS_SERVER
+SSH host to run on. Defaults to
+.BR proxmox .
+.TP
+.B CTBREC_AUTO_PORTRAITS_VMID
+Proxmox container ID. Defaults to
+.BR 109 .
+.TP
+.B CTBREC_AUTO_PORTRAITS_BIN
+Path to the remote executable. Defaults to
+.BR /usr/local/bin/ctbrec-auto-portraits .
+.SH EXAMPLES
+Preview the backfill plan:
+.IP
+.EX
+ctbrec-auto-portraits-remote \-\-dry\-run
+.EE
+.P
+Fetch at most 25 portraits now:
+.IP
+.EX
+ctbrec-auto-portraits-remote \-\-limit 25
+.EE
+.P
+Convert existing webp portraits to JPEG:
+.IP
+.EX
+ctbrec-auto-portraits-remote \-\-normalize
+.EE
+.P
+Re-fetch every recorded model:
+.IP
+.EX
+ctbrec-auto-portraits-remote \-\-force \-\-quiet
+.EE
+.SH EXIT STATUS
+The exit status of the remote
+.BR ctbrec-auto-portraits (1).
+.SH SEE ALSO
+.BR ctbrec-auto-portraits (1),
+.BR ctbrec-webui-patch (1),
+.BR ssh (1),
+.BR pct (1)
