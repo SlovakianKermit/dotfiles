@@ -1,0 +1,13 @@
+[Unit]
+Description=Hourly backfill of missing ctbrec model portraits
+
+[Timer]
+OnBootSec=10min
+OnActiveSec=5min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

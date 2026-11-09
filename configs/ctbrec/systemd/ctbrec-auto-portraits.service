@@ -1,0 +1,16 @@
+[Unit]
+Description=Fill missing ctbrec model portraits
+After=ctbrec.service
+Wants=ctbrec.service
+
+[Service]
+Type=oneshot
+User=ctbrec
+Group=ctbrec
+Environment=HOME=/home/ctbrec
+ExecStartPre=-/usr/local/bin/ctbrec-auto-portraits --normalize --quiet
+ExecStart=/usr/local/bin/ctbrec-auto-portraits --quiet --limit 100 --delay 1.5
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

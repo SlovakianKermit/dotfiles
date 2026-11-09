@@ -127,6 +127,7 @@ COPIES=(
   "${HOME}/.config/jellyfin-mpv-shim:configs/jellyfin-mpv-shim"
   "${HOME}/.config/micro:configs/micro"
   "${HOME}/.local/share/man:configs/man"
+  "${HOME}/.local/share/ctbrec:configs/ctbrec"
   "${HOME}/.config/opencode:configs/opencode"
 )
 

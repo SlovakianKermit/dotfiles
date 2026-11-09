@@ -125,6 +125,12 @@ A lock file next to the state file prevents two runs from overlapping. A
 second invocation exits immediately with status 0.
 .SS Image format
 .IP \(bu 2
+Where the model exposes a dedicated portrait URL through
+.BR ctbrec.PortraitUrlProvider
+(Stripchat does: its latest live-stream snapshot), that image is preferred
+over the profile avatar. This is what makes a Stripchat portrait resemble the
+stream instead of the default offline picture.
+.IP \(bu 2
 JPEG previews are stored by the server exactly as returned, already cropped to
 256x256.
 .IP \(bu 2
