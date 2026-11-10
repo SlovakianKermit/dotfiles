@@ -60,6 +60,21 @@ Show recent service log lines from the journal. Default: 80 lines.
 .B config
 Print the remote configuration file.
 .TP
+.B allowlist
+List the local allowlist, one model name per line.
+.TP
+.BI "allowlist add " "NAME..."
+Add one or more model names to the allowlist and deploy the updated
+configuration to the container. Names are matched case\-insensitively and
+duplicate entries are ignored. If the mode is active, a model that this tool
+had suspended is resumed within one timer interval.
+.TP
+.BI "allowlist remove " "NAME..."
+Remove one or more model names from the allowlist and deploy the updated
+configuration. Removing a name that is not present is not an error. The last
+remaining entry cannot be removed, because the engine requires a non\-empty
+allowlist.
+.TP
 .B uninstall [\-\-purge] [\-\-no\-reset]
 Leave the mode (unless
 .BR \-\-no\-reset ),
@@ -106,6 +121,18 @@ Leave the mode now:
 .IP
 .EX
 ctbrec-disk-mode-remote reset
+.EE
+.P
+Add two models to the allowlist and deploy the change:
+.IP
+.EX
+ctbrec-disk-mode-remote allowlist add jadetorres_ KamiKiss
+.EE
+.P
+Remove a model from the allowlist:
+.IP
+.EX
+ctbrec-disk-mode-remote allowlist remove MilkMeSoftly
 .EE
 .P
 Remove everything, including the deployed engine and config:

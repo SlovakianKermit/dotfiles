@@ -16,7 +16,10 @@ LOCAL_CONFIG="${SCRIPT_DIR}/ctbrec-disk-mode.json"
 
 SSH=(ssh -o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
 TMPDIR=""
-cleanup() { [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]] && rm -rf "${TMPDIR}"; }
+cleanup() {
+  if [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]]; then rm -rf "${TMPDIR}"; fi
+  return 0
+}
 trap cleanup EXIT
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -142,6 +145,99 @@ cmd_config() {
   pct_exec cat "${REMOTE_CONFIG}"
 }
 
+print_local_allowlist() {
+  python3 - "${LOCAL_CONFIG}" <<'PY'
+import json, sys
+cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+for name in cfg["allowlist"]:
+    print(name)
+PY
+}
+
+edit_local_allowlist() {
+  local action="$1"; shift
+  python3 - "${LOCAL_CONFIG}" "${action}" "$@" <<'PY'
+import json
+import sys
+
+path, action, *names = sys.argv[1:]
+names = [n.strip() for n in names if n.strip()]
+if not names:
+    sys.exit(f"error: {action} needs at least one model name")
+if action not in ("add", "remove"):
+    sys.exit(f"error: unknown allowlist action: {action}")
+
+with open(path, encoding="utf-8") as handle:
+    cfg = json.load(handle)
+current = cfg["allowlist"]
+lower = {name.casefold() for name in current}
+
+if action == "add":
+    changed = []
+    for name in names:
+        if name.casefold() in lower:
+            print(f"already present: {name}")
+            continue
+        current.append(name)
+        lower.add(name.casefold())
+        changed.append(name)
+else:
+    changed = []
+    for name in names:
+        hits = [x for x in current if x.casefold() == name.casefold()]
+        if not hits:
+            print(f"not present: {name}")
+            continue
+        current[:] = [x for x in current if x.casefold() != name.casefold()]
+        changed.extend(hits)
+
+if not current:
+    sys.exit("error: refusing to leave the allowlist empty")
+
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(cfg, handle, indent=2)
+    handle.write("\n")
+
+verb = {"add": "added", "remove": "removed"}[action]
+for name in changed:
+    print(f"{verb}: {name}")
+if not changed:
+    sys.exit(3)
+PY
+}
+
+deploy_local_config() {
+  if ! "${SSH[@]}" "${SERVER}" pct exec "${VMID}" -- test -f "${REMOTE_CONFIG}" 2>/dev/null; then
+    info "local config updated; the timer is not installed remotely (run install)"
+    return 0
+  fi
+  push_remote "${LOCAL_CONFIG}" "${REMOTE_CONFIG}" 644
+  info "deployed allowlist to ${SERVER} LXC ${VMID}:${REMOTE_CONFIG}"
+}
+
+cmd_allowlist() {
+  local action="${1:-list}"
+  if (($#)); then shift; fi
+  case "${action}" in
+    list)
+      print_local_allowlist
+      ;;
+    add|remove)
+      local rc=0
+      edit_local_allowlist "${action}" "$@" || rc=$?
+      if (( rc == 3 )); then
+        info "allowlist unchanged"
+        return 0
+      fi
+      (( rc == 0 )) || return "${rc}"
+      deploy_local_config
+      ;;
+    *)
+      die "unknown allowlist action: ${action} (use list, add, or remove)"
+      ;;
+  esac
+}
+
 cmd_uninstall() {
   local purge=0 nreset=0
   while (($#)); do
@@ -182,6 +278,9 @@ Commands:
   reset [--dry-run]         force the mode off and resume suspended models
   logs [--lines N]          show recent service log lines (default 80)
   config                    print the remote config file
+  allowlist                 list the local allowlist
+  allowlist add NAME...     add model(s) to the allowlist and deploy
+  allowlist remove NAME...  remove model(s) from the allowlist and deploy
   uninstall [--purge] [--no-reset]
                             stop and remove the timer; --purge removes everything
 
@@ -193,7 +292,7 @@ EOF
 
 main() {
   local command="${1:-}"
-  [[ $# -gt 0 ]] && shift
+  if (($#)); then shift; fi
   case "${command}" in
     install) cmd_install "$@" ;;
     status) cmd_status ;;
@@ -201,6 +300,7 @@ main() {
     reset) cmd_reset "$@" ;;
     logs) cmd_logs "$@" ;;
     config) cmd_config ;;
+    allowlist) cmd_allowlist "$@" ;;
     uninstall) cmd_uninstall "$@" ;;
     ""|-h|--help|help) usage ;;
     *) usage >&2; die "unknown command: ${command}" ;;

@@ -261,14 +261,39 @@ def enter_mode(
 
 
 def enforce_mode(client: Client, cfg: dict[str, Any], state: dict[str, Any], dry_run: bool) -> None:
-    """Keep every non-allowlisted model suspended while the mode is active."""
+    """Keep every non-allowlisted model suspended while the mode is active.
+
+    An allowlisted model that this tool suspended earlier (for example a model
+    added to the allowlist while the mode was already active) is resumed again,
+    but only if this tool is the one that paused it.
+    """
     allowed = allowlist_set(cfg)
     models = client.models()
+    known = set(state.get("suspended_urls", []))
+
+    for model in models:
+        if (
+            is_allowed(model, allowed)
+            and model.get("suspended", False)
+            and model["url"] in known
+        ):
+            if dry_run:
+                LOG.info("dry-run: would resume allowlisted %s (%s)", model["displayName"], model["url"])
+                continue
+            try:
+                client.resume(model)
+                known.discard(model["url"])
+                LOG.info("resumed allowlisted %s", model["displayName"])
+            except ApiError as exc:
+                LOG.error("could not resume allowlisted %s: %s", model["displayName"], exc)
+
     targets = [
         m for m in models if not m.get("suspended", False) and not is_allowed(m, allowed)
     ]
-    known = set(state.get("suspended_urls", []))
     if not targets:
+        if not dry_run and known != set(state.get("suspended_urls", [])):
+            state["suspended_urls"] = sorted(known)
+            save_state(state)
         return
     LOG.info("low-space mode: re-suspending %d non-allowlisted model(s)", len(targets))
     if dry_run:

@@ -18,7 +18,9 @@ When free space reaches the exit threshold, only the models that this tool
 suspended are resumed. Models the user had already paused before the mode was
 entered are never touched. While the mode is active, every run re\-suspends any
 non\-allowlisted model that has become active, for example a new model or one
-resumed by hand in the WebUI.
+resumed by hand in the WebUI, and re\-admits an allowlisted model that this
+tool had suspended earlier, so adding a model to the allowlist takes effect
+without leaving the mode.
 .P
 The tool is normally started every minute by the
 .I ctbrec-disk-mode.timer
