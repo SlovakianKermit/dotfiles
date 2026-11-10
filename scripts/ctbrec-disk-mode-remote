@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# ctbrec-disk-mode-remote - manage ctbrec low-disk allowlist mode in LXC 109.
+set -euo pipefail
+
+SERVER="${CTBREC_DISK_MODE_SERVER:-proxmox}"
+VMID="${CTBREC_DISK_MODE_VMID:-109}"
+REMOTE_BIN="/usr/local/bin/ctbrec-disk-mode"
+REMOTE_CONFIG="/etc/ctbrec-disk-mode.json"
+REMOTE_STATE_DIR="/var/lib/ctbrec-disk-mode"
+SERVICE="ctbrec-disk-mode.service"
+TIMER="ctbrec-disk-mode.timer"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+LOCAL_BIN="${SCRIPT_DIR}/ctbrec-disk-mode"
+LOCAL_CONFIG="${SCRIPT_DIR}/ctbrec-disk-mode.json"
+
+SSH=(ssh -o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
+TMPDIR=""
+cleanup() { [[ -n "${TMPDIR}" && -d "${TMPDIR}" ]] && rm -rf "${TMPDIR}"; }
+trap cleanup EXIT
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+pct_exec() { "${SSH[@]}" "${SERVER}" pct exec "${VMID}" -- "$@"; }
+
+push_remote() {
+  # push_remote <local-file> <remote-path> <mode>
+  local src="$1" dest="$2" mode="$3" staging
+  staging="/tmp/ctbrec-disk-mode-push.$$.$RANDOM"
+  "${SSH[@]}" "${SERVER}" "cat > '${staging}'" < "${src}"
+  "${SSH[@]}" "${SERVER}" pct push "${VMID}" "${staging}" "${dest}" --perms "${mode}"
+  "${SSH[@]}" "${SERVER}" rm -f -- "${staging}"
+}
+
+make_units() {
+  mkdir -p "${TMPDIR}"
+  cat > "${TMPDIR}/${SERVICE}" <<'EOF'
+[Unit]
+Description=ctbrec low-disk allowlist mode
+Documentation=man:ctbrec-disk-mode(1)
+After=ctbrec.service
+Wants=ctbrec.service
+
+[Service]
+Type=oneshot
+User=ctbrec
+Group=ctbrec
+StateDirectory=ctbrec-disk-mode
+StateDirectoryMode=0750
+ExecStart=/usr/local/bin/ctbrec-disk-mode --config /etc/ctbrec-disk-mode.json --once
+Nice=10
+TimeoutStartSec=30min
+EOF
+
+  cat > "${TMPDIR}/${TIMER}" <<'EOF'
+[Unit]
+Description=Run ctbrec low-disk allowlist mode every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+require_local_files() {
+  [[ -f "${LOCAL_BIN}" ]] || die "engine not found: ${LOCAL_BIN}"
+  [[ -x "${LOCAL_BIN}" ]] || die "engine is not executable: ${LOCAL_BIN}"
+  [[ -f "${LOCAL_CONFIG}" ]] || die "config not found: ${LOCAL_CONFIG}"
+}
+
+cmd_install() {
+  local keep_config=0
+  while (($#)); do
+    case "$1" in
+      --keep-config) keep_config=1 ;;
+      *) die "unknown install option: $1" ;;
+    esac
+    shift
+  done
+
+  require_local_files
+  python3 -m json.tool "${LOCAL_CONFIG}" >/dev/null || die "invalid JSON: ${LOCAL_CONFIG}"
+  TMPDIR="$(mktemp -d)"
+  make_units
+
+  info "deploying engine to ${REMOTE_BIN}"
+  push_remote "${LOCAL_BIN}" "${REMOTE_BIN}" 755
+
+  if [[ "${keep_config}" == "1" ]] && pct_exec test -f "${REMOTE_CONFIG}"; then
+    info "keeping existing ${REMOTE_CONFIG}"
+  else
+    info "deploying config to ${REMOTE_CONFIG}"
+    push_remote "${LOCAL_CONFIG}" "${REMOTE_CONFIG}" 644
+  fi
+
+  info "deploying systemd units"
+  push_remote "${TMPDIR}/${SERVICE}" "/etc/systemd/system/${SERVICE}" 644
+  push_remote "${TMPDIR}/${TIMER}" "/etc/systemd/system/${TIMER}" 644
+
+  pct_exec install -d -o ctbrec -g ctbrec -m 0750 "${REMOTE_STATE_DIR}"
+  pct_exec systemctl daemon-reload
+  pct_exec systemctl enable --now "${TIMER}"
+
+  info "applying ctbrec hard floor"
+  pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --ensure-floor
+
+  info "installed. current state:"
+  cmd_status
+}
+
+cmd_status() {
+  pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --status
+  echo
+  "${SSH[@]}" "${SERVER}" "pct exec ${VMID} -- systemctl is-active ${TIMER} 2>/dev/null; pct exec ${VMID} -- systemctl show ${TIMER} -p NextElapseUSecRealtime --value 2>/dev/null"
+}
+
+cmd_run() {
+  local dry=()
+  [[ "${1:-}" == "--dry-run" ]] && dry=(--dry-run)
+  pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --once "${dry[@]}"
+}
+
+cmd_reset() {
+  local dry=()
+  [[ "${1:-}" == "--dry-run" ]] && dry=(--dry-run)
+  pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --reset "${dry[@]}"
+}
+
+cmd_logs() {
+  local lines=80
+  if [[ "${1:-}" == "--lines" ]]; then lines="${2:?--lines needs a number}"; fi
+  pct_exec journalctl -u "${SERVICE}" -n "${lines}" --no-pager
+}
+
+cmd_config() {
+  pct_exec cat "${REMOTE_CONFIG}"
+}
+
+cmd_uninstall() {
+  local purge=0 nreset=0
+  while (($#)); do
+    case "$1" in
+      --purge) purge=1 ;;
+      --no-reset) nreset=1 ;;
+      *) die "unknown uninstall option: $1" ;;
+    esac
+    shift
+  done
+
+  if [[ "${nreset}" == "0" ]]; then
+    info "leaving low-space mode (resuming only models it suspended)"
+    pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --reset || true
+  fi
+  pct_exec systemctl disable --now "${TIMER}" || true
+  pct_exec rm -f "/etc/systemd/system/${SERVICE}" "/etc/systemd/system/${TIMER}"
+  pct_exec systemctl daemon-reload
+  if [[ "${purge}" == "1" ]]; then
+    pct_exec rm -f "${REMOTE_BIN}" "${REMOTE_CONFIG}"
+    pct_exec rm -rf "${REMOTE_STATE_DIR}"
+    info "purged engine, config and state"
+  else
+    info "timer disabled; engine and config left in place"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") COMMAND [OPTIONS]
+
+Manage the ctbrec low-disk allowlist mode running in LXC ${VMID} on ${SERVER}.
+
+Commands:
+  install [--keep-config]   deploy engine/config/units and start the timer
+  status                    show free space, mode and allowlist matches
+  run [--dry-run]           evaluate thresholds once, now
+  reset [--dry-run]         force the mode off and resume suspended models
+  logs [--lines N]          show recent service log lines (default 80)
+  config                    print the remote config file
+  uninstall [--purge] [--no-reset]
+                            stop and remove the timer; --purge removes everything
+
+Environment:
+  CTBREC_DISK_MODE_SERVER   SSH host of the Proxmox node (default: proxmox)
+  CTBREC_DISK_MODE_VMID     LXC ID (default: 109)
+EOF
+}
+
+main() {
+  local command="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "${command}" in
+    install) cmd_install "$@" ;;
+    status) cmd_status ;;
+    run) cmd_run "$@" ;;
+    reset) cmd_reset "$@" ;;
+    logs) cmd_logs "$@" ;;
+    config) cmd_config ;;
+    uninstall) cmd_uninstall "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) usage >&2; die "unknown command: ${command}" ;;
+  esac
+}
+
+main "$@"

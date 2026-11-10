@@ -1,0 +1,125 @@
+.TH CTBREC-DISK-MODE-REMOTE 1 "2026-11-10" "ctbrec-disk-mode-remote" "User Commands"
+.SH NAME
+ctbrec-disk-mode-remote \- manage ctbrec low-disk allowlist mode in the LXC
+.SH SYNOPSIS
+.B ctbrec-disk-mode-remote
+\fICOMMAND\fR
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B ctbrec-disk-mode-remote
+is a local wrapper around
+.BR ctbrec-disk-mode (1),
+which runs inside the ctbrec LXC (VMID 109) on the Proxmox node. It uploads
+the engine and configuration, installs the systemd service and timer, and
+exposes status, manual run, reset, log, and uninstall operations from the
+workstation.
+.P
+The local files
+.I ~/.local/bin/ctbrec-disk-mode
+and
+.I ~/.local/bin/ctbrec-disk-mode.json
+are the source of truth. The
+.B install
+command copies them to
+.I /usr/local/bin/ctbrec-disk-mode
+and
+.I /etc/ctbrec-disk-mode.json
+in the container.
+.P
+All container access uses
+.BR ssh (1)
+with
+.B RemoteCommand
+disabled, no TTY, and batch mode, followed by
+.BR pct (1)
+on the Proxmox host.
+.SH COMMANDS
+.TP
+.B install [\-\-keep\-config]
+Deploy the engine, configuration, and systemd units, enable and start the
+timer, and set ctbrec's native reserve to the configured hard floor. With
+.B \-\-keep\-config
+an existing remote configuration is left untouched.
+.TP
+.B status
+Show free space, thresholds, mode, allowlist matches, timer state, and the
+next scheduled run.
+.TP
+.B run [\-\-dry\-run]
+Evaluate the thresholds once, immediately. With
+.B \-\-dry\-run
+only print the intended suspend or resume actions.
+.TP
+.B reset [\-\-dry\-run]
+Force the mode off and resume the models it suspended, regardless of free
+space. Useful before maintenance or before a manual cleanup.
+.TP
+.B logs [\-\-lines \fIN\fR]
+Show recent service log lines from the journal. Default: 80 lines.
+.TP
+.B config
+Print the remote configuration file.
+.TP
+.B uninstall [\-\-purge] [\-\-no\-reset]
+Leave the mode (unless
+.BR \-\-no\-reset ),
+disable and remove the timer and service. With
+.B \-\-purge
+also remove the remote engine, configuration, and state directory.
+.SH ENVIRONMENT
+.TP
+.B CTBREC_DISK_MODE_SERVER
+SSH host or alias of the Proxmox node. Default:
+.IR proxmox .
+.TP
+.B CTBREC_DISK_MODE_VMID
+LXC ID. Default:
+.IR 109 .
+.SH FILES
+.TP
+.I ~/.local/bin/ctbrec-disk-mode
+Engine source, deployed to the container.
+.TP
+.I ~/.local/bin/ctbrec-disk-mode.json
+Configuration source, deployed to
+.IR /etc/ctbrec-disk-mode.json .
+.SH EXAMPLES
+Install and start the timer:
+.IP
+.EX
+ctbrec-disk-mode-remote install
+.EE
+.P
+Check the current decision:
+.IP
+.EX
+ctbrec-disk-mode-remote status
+.EE
+.P
+Preview what a low-disk entry would suspend:
+.IP
+.EX
+ctbrec-disk-mode-remote run \-\-dry\-run
+.EE
+.P
+Leave the mode now:
+.IP
+.EX
+ctbrec-disk-mode-remote reset
+.EE
+.P
+Remove everything, including the deployed engine and config:
+.IP
+.EX
+ctbrec-disk-mode-remote uninstall \-\-purge
+.EE
+.SH EXIT STATUS
+The wrapper exits with the status of the remote command. Bad local options or
+a missing engine/config file exit with status 1.
+.SH SEE ALSO
+.BR ctbrec-disk-mode (1),
+.BR ctbrec-merge (1),
+.BR ssh (1),
+.BR systemctl (1)
+.SH AUTHOR
+Written for local use.

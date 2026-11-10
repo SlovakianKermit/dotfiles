@@ -1,0 +1,149 @@
+.TH CTBREC-DISK-MODE 1 "2026-11-10" "ctbrec-disk-mode" "User Commands"
+.SH NAME
+ctbrec-disk-mode \- strict low-disk allowlist mode for ctbrec
+.SH SYNOPSIS
+.B ctbrec-disk-mode
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B ctbrec-disk-mode
+runs inside the ctbrec LXC and talks to the ctbrec REST API on
+.IR https://127.0.0.1:8443 .
+While free space on the recordings filesystem is above the enter threshold all
+models record normally. At or below the enter threshold every model that is not
+on the allowlist is suspended through the ctbrec API, which immediately stops
+its recording and keeps it paused. Allowlisted models keep recording; an
+allowlisted model that was already paused is left paused.
+.P
+When free space reaches the exit threshold, only the models that this tool
+suspended are resumed. Models the user had already paused before the mode was
+entered are never touched. While the mode is active, every run re\-suspends any
+non\-allowlisted model that has become active, for example a new model or one
+resumed by hand in the WebUI.
+.P
+The tool is normally started every minute by the
+.I ctbrec-disk-mode.timer
+systemd timer inside the container. Do not run it from the Proxmox host
+directly; use
+.BR ctbrec-disk-mode-remote (1)
+for that.
+.SH OPTIONS
+.TP
+.B \-\-config \fIPATH\fR
+Configuration file. Default:
+.IR /etc/ctbrec-disk-mode.json .
+.TP
+.B \-\-once
+Evaluate the thresholds and enter, enforce, or exit the mode. This is the
+default action when no action flag is given.
+.TP
+.B \-\-status
+Print free space, both thresholds, the ctbrec hard floor, the current mode,
+and every allowlisted model with its active/paused state. Changes nothing.
+.TP
+.B \-\-reset
+Force the mode off and resume the models this tool suspended, regardless of
+free space.
+.TP
+.B \-\-dry-run
+With
+.B \-\-once
+or
+.BR \-\-reset ,
+print the intended suspend or resume actions without changing anything.
+.TP
+.B \-\-ensure-floor
+Set ctbrec's own
+.B minimumSpaceLeftInBytes
+setting to the configured hard floor and exit. That is the native stop\-all
+reserve, independent of the allowlist. The installer runs this once.
+.TP
+.B \-\-version
+Print the version and exit.
+.SH BEHAVIOUR
+.SS Thresholds
+.IP \(bu 2
+Enter the mode when free space is less than or equal to
+.BR enter_gib .
+.IP \(bu 2
+Exit the mode when free space is greater than or equal to
+.BR exit_gib .
+.IP \(bu 2
+Between the two thresholds the mode keeps its current state. The gap is
+hysteresis: without it the mode would flap while recordings consume space.
+.SS State
+The set of models suspended by this tool is stored in
+.IR state.json .
+On exit, a stored model is resumed only when it is still suspended. A model
+that the user resumed by hand, or that was already paused before the mode was
+entered, is skipped. Resuming through the ctbrec API also clears the model's
+``marked for later'' flag, because that is what the API's
+.B resume
+action does.
+.SS Concurrency
+The tool does not change
+.BR concurrentRecordings .
+With the default value
+.B 0
+(unlimited) all allowlisted models record simultaneously. Limiting the
+allowlist therefore limits recordings without touching global concurrency.
+.P
+If the allowlist contains duplicate entries for one model, for example the
+same name on two sites, every matching model is treated as allowlisted.
+.SH FILES
+.TP
+.I /etc/ctbrec-disk-mode.json
+Configuration. Keys:
+.BR api_url ,
+.BR enter_gib ,
+.BR exit_gib ,
+.BR allowlist ,
+optional
+.B hard_floor_gib
+(default 1) and
+.B timeout
+(default 60 seconds). The allowlist is a list of model display names and is
+matched case\-insensitively.
+.TP
+.I /var/lib/ctbrec-disk-mode/state.json
+Active mode, entry timestamp, and URLs suspended by the tool. When systemd
+sets
+.BR STATE_DIRECTORY ,
+that directory is used instead.
+.SH EXAMPLES
+Show the current decision without acting:
+.IP
+.EX
+ctbrec-disk-mode \-\-status
+.EE
+.P
+Run one evaluation by hand:
+.IP
+.EX
+ctbrec-disk-mode \-\-once
+.EE
+.P
+See what entering the mode would suspend:
+.IP
+.EX
+ctbrec-disk-mode \-\-once \-\-dry\-run
+.EE
+.P
+Leave the mode immediately:
+.IP
+.EX
+ctbrec-disk-mode \-\-reset
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including ``nothing to do''.
+.TP
+.B 1
+The ctbrec API was unreachable or returned an error, or one or more models
+could not be suspended while entering the mode.
+.SH SEE ALSO
+.BR ctbrec-disk-mode-remote (1),
+.BR systemctl (1),
+.BR journalctl (1)
+.SH AUTHOR
+Written for local use.

@@ -2,9 +2,9 @@
 """ctbrec-auto-portraits - backfill missing model portraits on a ctbrec server.
 
 Runs on the ctbrec server host (normally inside the ctbrec container).  It
-scans the recording metadata, finds every model that has been recorded but has
-no portrait yet, and asks the running ctbrec server to download that model's
-site preview thumbnail and store it as the portrait.
+scans the configured model list, finds every model that has no portrait yet
+(recorded or not, paused or not), and asks the running ctbrec server to
+download that model's site preview thumbnail and store it as the portrait.
 
 The server crops and scales the image to a 256x256 JPEG itself, so this script
 only has to issue one authenticated HTTP GET per model.  Models that already
@@ -118,6 +118,48 @@ def collect_recorded_models(config_dir: str) -> dict[str, tuple[str, int]]:
         if previous is None or start > previous[1]:
             newest[url] = (name, start)
     return newest
+
+
+def ignored_model_urls(models_doc: dict) -> set[str]:
+    """Return the URLs the user has removed/ignored in the web interface."""
+    ignored: set[str] = set()
+    for key in ("ignoredModels", "modelsIgnored"):
+        for entry in models_doc.get(key) or []:
+            if isinstance(entry, str):
+                ignored.add(entry)
+            elif isinstance(entry, dict) and entry.get("url"):
+                ignored.add(entry["url"])
+    return ignored
+
+
+def collect_models(models_doc: dict, config_dir: str, recorded_only: bool = False):
+    """Return {model_url: (display_name, newest_start_ms)} for every known model.
+
+    The configured model list is authoritative: it includes paused models and
+    models that were never recorded.  Recording metadata is still used to order
+    the work (newest recording first) and, with --recorded-only, to restrict
+    the set.
+    """
+    recorded = collect_recorded_models(config_dir)
+    if recorded_only:
+        return recorded
+
+    ignored = ignored_model_urls(models_doc)
+    models: dict[str, tuple[str, int]] = {}
+    for entry in models_doc.get("models") or []:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        if not url or url in ignored:
+            continue
+        name = entry.get("displayName") or entry.get("name") or url
+        start = recorded.get(url, (name, 0))[1]
+        models[url] = (name, start)
+
+    # Do not lose a recorded model that is missing from models.json.
+    for url, (name, start) in recorded.items():
+        models.setdefault(url, (name, start))
+    return models
 
 
 def portrait_exists(models_doc: dict, portraits_dir: str, model_url: str) -> bool:
@@ -280,7 +322,7 @@ def normalize_portraits(portraits_dir: str, ffmpeg: str, quiet: bool) -> int:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ctbrec-auto-portraits",
-        description="Fetch a portrait for every recorded ctbrec model that lacks one.",
+        description="Fetch a portrait for every ctbrec model that lacks one.",
     )
     parser.add_argument(
         "--config-dir",
@@ -346,6 +388,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="ignore existing portraits and failure backoff (re-fetch everything)",
     )
     parser.add_argument(
+        "--recorded-only",
+        action="store_true",
+        help="only consider models with at least one recording "
+        "(old behaviour; paused, never-recorded models are skipped)",
+    )
+    parser.add_argument(
         "--verify-tls",
         action="store_true",
         help="verify the server TLS certificate (default: accept self-signed)",
@@ -360,7 +408,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="only print the summary",
     )
-    parser.add_argument("--version", action="version", version="ctbrec-auto-portraits 1.0")
+    parser.add_argument("--version", action="version", version="ctbrec-auto-portraits 1.1")
     return parser.parse_args(argv)
 
 
@@ -399,7 +447,7 @@ def main(argv: list[str]) -> int:
             die(f"ffmpeg not found: {args.ffmpeg}")
         return normalize_portraits(portraits_dir, ffmpeg, args.quiet)
 
-    recorded = collect_recorded_models(config_dir)
+    targets = collect_models(models_doc, config_dir, args.recorded_only)
 
     now = time.time()
     retry_after = max(0.0, args.retry_after) * 3600.0
@@ -407,7 +455,7 @@ def main(argv: list[str]) -> int:
     pending: list[tuple[int, str, str]] = []
     skipped_portrait = 0
     skipped_backoff = 0
-    for model_url, (name, start) in recorded.items():
+    for model_url, (name, start) in targets.items():
         if not args.force and portrait_exists(models_doc, portraits_dir, model_url):
             skipped_portrait += 1
             continue
@@ -430,7 +478,7 @@ def main(argv: list[str]) -> int:
 
     if not args.quiet:
         print(
-            f"recorded models: {len(recorded)} | with portrait: {skipped_portrait} | "
+            f"models: {len(targets)} | with portrait: {skipped_portrait} | "
             f"in backoff: {skipped_backoff} | to fetch: {len(pending)}"
         )
 
@@ -498,7 +546,7 @@ def main(argv: list[str]) -> int:
             attempted = float(entry.get("attempted", 0) or 0)
         except (TypeError, ValueError):
             attempted = 0
-        if model_url not in recorded and now - attempted > 30 * 86400:
+        if model_url not in targets and now - attempted > 30 * 86400:
             del state[model_url]
 
     save_json(state_path, state)
