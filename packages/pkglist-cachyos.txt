@@ -60,7 +60,6 @@ ryujinx
 shelly
 shelly-flatpak-backend
 speedtest++
-sunshine
 ventoy-bin
 vulkan-radeon
 xpadneo-dkms

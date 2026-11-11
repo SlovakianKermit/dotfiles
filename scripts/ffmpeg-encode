@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Batch VAAPI encoder (HEVC or AV1) with curses TUI — pause, resume, live queue.
+"""Batch VAAPI HEVC encoder with curses TUI — pause, resume, live queue.
 
-Both codecs use constant-quality mode: HEVC via -qp (0-51), AV1 via VAAPI
-CQP -global_quality (0-255).  Select the codec with --codec hevc|av1 (the
-ffmpeg-encode-av1 wrapper passes --codec av1).
+Encoding is constant-quality: hevc_vaapi with -qp (0-51).  The AV1 entries in
+CODECS are not exposed on the command line any more; they only exist so
+encode-bench can reuse _build_ffmpeg_cmd for its quality sweep.
 
 --vr switches to a conservative quality default suited to stereoscopic
 VR180/VR360 captures (which arrive already heavily compressed as one
@@ -49,8 +49,8 @@ VR_SUBDIR = "VR"
 
 # Per-codec settings.  Both encoders run in constant-quality mode: HEVC via
 # its native -qp (0-51), AV1 via VAAPI CQP -global_quality (0-255, roughly
-# 4x the HEVC QP).  The quality scale differs per codec, so the default and
-# the meaning of -q change with --codec.
+# 4x the HEVC QP).  The CLI always encodes HEVC; the AV1 entry is kept only
+# for encode-bench, which imports the codec table and command builder.
 CODECS = {
     "hevc": {
         "encoder": "hevc_vaapi",
@@ -214,15 +214,28 @@ def collect_all(directories: List[str]) -> List[str]:
                 files.append(f)
     return files
 
-def check_vaapi() -> bool:
+def check_vaapi() -> Tuple[bool, str]:
+    """(usable, reason).  Verifies both the hwaccel and our encoder, so the
+    failure message names the real problem instead of a generic one."""
     try:
         r = subprocess.run(
             ["ffmpeg", "-hide_banner", "-hwaccels"],
             capture_output=True, text=True, timeout=10,
         )
-        return "vaapi" in r.stdout
-    except Exception:
-        return False
+        if "vaapi" not in r.stdout:
+            return False, "ffmpeg was built without VAAPI support."
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if CODECS[DEFAULT_CODEC]["encoder"] not in r.stdout:
+            return False, (f"ffmpeg has no "
+                           f"{CODECS[DEFAULT_CODEC]['encoder']} encoder.")
+        if not any(pathlib.Path("/dev/dri").glob("renderD*")):
+            return False, "no VAAPI render node found under /dev/dri."
+        return True, ""
+    except Exception as exc:
+        return False, f"VAAPI probe failed: {exc}"
 
 def _first_line(text: str) -> str:
     """First non-empty line of an ffprobe result.
@@ -274,8 +287,11 @@ def _ts_scan_window(fh, offset: int, pid: int,
                     nbytes: int = TS_SAMPLE_BYTES) -> Optional[Tuple[int, float, float]]:
     """Count video PES packets and their PTS span in one packet-aligned window.
 
-    Returns (frames, first_pts, last_pts) with PTS in seconds, or None when
-    the window does not contain at least two timestamped video packets.
+    Returns (frames, first_pts, last_pts, bytes_read) with PTS in seconds, or
+    None when the window does not contain at least two timestamped video
+    packets.  bytes_read is the amount actually scanned, which is shorter than
+    the requested window near the end of the file and must be used for the
+    bytes-per-frame estimate.
     """
     fh.seek(offset)
     data = fh.read(nbytes)
@@ -304,7 +320,7 @@ def _ts_scan_window(fh, offset: int, pid: int,
         frames += 1
     if frames < 2 or first is None or last is None:
         return None
-    return frames, first, last
+    return frames, first, last, len(data)
 
 def probe_ts_timeline(path: str, fps: float) -> Tuple[bool, float]:
     """Check an MPEG-TS for a stalled container clock.
@@ -330,12 +346,13 @@ def probe_ts_timeline(path: str, fps: float) -> Tuple[bool, float]:
                 window = _ts_scan_window(fh, start, pid)
                 if window is None:
                     continue
-                frames, first, last = window
-                expected = frames / fps
+                frames, first, last, nbytes = window
+                # The PTS span of N frames covers N-1 frame intervals.
+                expected = (frames - 1) / fps
                 ratio = (last - first) / expected if expected > 0 else 1.0
                 if ratio < TS_PTS_RATIO_MIN or ratio > TS_PTS_RATIO_MAX:
-                    return True, (size / (TS_SAMPLE_BYTES / frames)) / fps
-                bytes_per_frame = TS_SAMPLE_BYTES / frames
+                    return True, (size / (nbytes / frames)) / fps
+                bytes_per_frame = nbytes / frames
         if bytes_per_frame > 0:
             return False, (size / bytes_per_frame) / fps
     except OSError:
@@ -368,11 +385,12 @@ class Queue:
         output_path = str(pathlib.Path(self.output_dir) / rel)
         output_path = str(pathlib.Path(output_path).with_suffix(".mkv"))
 
+        # Duration is probed lazily in the worker: scanning a large tree must
+        # not block the TUI behind one ffprobe per file.
         job = Job(
             input_path=str(p),
             output_path=output_path,
             input_size=os.path.getsize(str(p)),
-            duration=get_duration(str(p)),
         )
         self.jobs.append(job)
         return job
@@ -387,8 +405,11 @@ class Queue:
         failed = sum(1 for j in self.jobs if j.status == "failed")
         skipped = sum(1 for j in self.jobs if j.status == "skipped")
         kept = sum(1 for j in self.jobs if j.status == "kept")
-        total_in = sum(j.input_size for j in self.jobs if j.status in ("done", "failed"))
-        total_out = sum(j.output_size for j in self.jobs if j.status == "done")
+        # Only completed encodes count: a failed (or kept) job contributed no
+        # output size, and counting its input would inflate the reported gain.
+        done_jobs = [j for j in self.jobs if j.status == "done"]
+        total_in = sum(j.input_size for j in done_jobs)
+        total_out = sum(j.output_size for j in done_jobs)
         return done, failed, skipped, kept, total_in, total_out
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -404,16 +425,36 @@ def find_vaapi_device() -> str:
 
 def _hw_decode_failed(stderr_text: str) -> bool:
     markers = ("Failed setup for format vaapi",
+               "Failed to initialise VAAPI",
                "No support for codec",
                "hwaccel initialisation returned error",
-               "Impossible to convert")
+               "Impossible to convert",
+               "Device creation failed",
+               # hw decode gives up mid-stream on damaged captures where the
+               # software decoder just logs and carries on.
+               "Error sending frames to consumers",
+               "Failed to upload frame")
     return any(m in stderr_text for m in markers)
+
+def _is_deep_pix_fmt(pix_fmt: str) -> bool:
+    """True for >8-bit formats, so a software-decode fallback uploads p010
+    instead of silently crushing the depth to nv12.
+
+    ffmpeg names every >8-bit format with an endianness suffix (yuv420p10le,
+    p010le, gray12be, x2rgb10le, ...) while 8-bit ones have none (nv12), so
+    the suffix is a reliable discriminator.
+    """
+    pf = (pix_fmt or "").lower()
+    return any(tag in pf for tag in ("9le", "9be", "10le", "10be",
+                                     "12le", "12be", "14le", "14be",
+                                     "16le", "16be"))
 
 def _audio_mux_failed(stderr_text: str) -> bool:
     # Corrupt/unparseable ADTS AAC (common in MPEG-TS captures) makes the
     # Matroska muxer abort when the audio is stream-copied.  Re-encode it.
     markers = ("Error parsing AAC extradata",
-               "unable to determine samplerate")
+               "unable to determine samplerate",
+               "sample rate not set")
     return any(m in stderr_text for m in markers)
 
 def _rate_control_args(codec: str, preset: str, quality: int) -> List[str]:
@@ -447,7 +488,7 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
     # fix_pts: rebuild the timeline from frame index / sample count for
     # captures whose container clock stalled.
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
         "-vaapi_device", device,
     ]
@@ -460,7 +501,8 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
     if fix_pts:
         vf.append(f"setpts=N/{fps:g}/TB")
     if sw_decode:
-        if is_rgb_pix_fmt(get_pix_fmt(job.input_path)):
+        pix_fmt = get_pix_fmt(job.input_path)
+        if is_rgb_pix_fmt(pix_fmt):
             # Animated WebP/PNG decode to RGB(A).  Left to itself, swscale
             # picks the BT.601 matrix and leaves primaries/transfer untagged,
             # which shifts skin tones once a player applies its own colour
@@ -478,7 +520,10 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
                 "-color_trc", "bt709",
             ]
         else:
-            vf.append("format=nv12,hwupload")
+            # Keep 10-bit sources at 10 bits: nv12 would throw away the depth
+            # the VAAPI decoder could not read in the first place.
+            sw_fmt = "p010" if _is_deep_pix_fmt(pix_fmt) else "nv12"
+            vf.append(f"format={sw_fmt},hwupload")
     if vf:
         cmd.extend(["-vf", ",".join(vf)])
     if color_args:
@@ -490,8 +535,23 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
         cmd.extend(["-fps_mode", "passthrough"])
     cmd.extend(_audio_args(copy_audio, fix_pts))
     cmd.extend(["-map", "0:v?", "-map", "0:a?"])
+    # Stream-copied audio from TS captures can burst ahead of the video and
+    # trip the muxer's default 8-packet interleave limit; give it room.
+    cmd.extend(["-max_muxing_queue_size", "1024"])
     cmd.extend(["-y", job.output_path])
     return cmd
+
+def _unlink(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+def _error_tail(stderr_text: str, max_lines: int = 3, max_chars: int = 300) -> str:
+    """Last few non-empty stderr lines: ffmpeg reports the actual cause of a
+    failure at the end, not in the first 300 characters of the log."""
+    lines = [ln.strip() for ln in (stderr_text or "").splitlines() if ln.strip()]
+    return " | ".join(lines[-max_lines:])[-max_chars:]
 
 def _kill_process(pid: int, sig: int):
     try:
@@ -504,7 +564,9 @@ def _kill_process(pid: int, sig: int):
 
 def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]:
     """Run one ffmpeg encode to completion. Returns (returncode, stderr_text)."""
-    os.makedirs(os.path.dirname(job.output_path), exist_ok=True)
+    out_dir = os.path.dirname(job.output_path)
+    if out_dir:  # --output may be a bare filename, with no directory part
+        os.makedirs(out_dir, exist_ok=True)
 
     with state.lock:
         if state.quit or job.cancel:
@@ -547,6 +609,7 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
 
     out_time_us = 0
     duration = job.duration or get_duration(job.input_path)
+    job.duration = duration
 
     try:
         for line in proc.stdout:
@@ -589,6 +652,9 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     device = find_vaapi_device()
     sw_decode = False
     copy_audio = True
+    # Probed here rather than at queue time so adding hundreds of files does
+    # not stall startup behind one ffprobe per file.
+    job.duration = job.duration or get_duration(job.input_path)
     fps = get_frame_rate(job.input_path) or 30.0
 
     # A stalled capture clock makes the container duration a lie: the encode
@@ -630,67 +696,52 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
             copy_audio = False
             returncode, stderr_text = attempt()
 
+        # Everything below touches the filesystem (and may run ffprobe), so it
+        # stays outside the shared lock: holding it there froze the TUI for
+        # seconds at the end of every VR job.
+        out_size = 0
+        if returncode == 0 and os.path.exists(job.output_path):
+            out_size = os.path.getsize(job.output_path)
+
+        dims_changed = ""
+        if out_size and vr:
+            # VR: never accept a downscaled/re-cropped frame.  The two
+            # fisheye eyes must survive at their source resolution.
+            din = get_dimensions(job.input_path)
+            dout = get_dimensions(job.output_path)
+            if din and dout and din != dout:
+                dims_changed = f"{din[0]}x{din[1]} -> {dout[0]}x{dout[1]}"
+
+        was_cancelled = cancelled()
+
         with state.lock:
-            if state.quit or job.cancel:
+            if was_cancelled:
                 job.status = "skipped"
-                if os.path.exists(job.output_path):
-                    try:
-                        os.remove(job.output_path)
-                    except OSError:
-                        pass
-            elif returncode == 0 and os.path.getsize(job.output_path) > 0:
-                out_size = os.path.getsize(job.output_path)
-                # VR: never accept a downscaled/re-cropped frame.  The two
-                # fisheye eyes must survive at their source resolution.
-                dims_changed = ""
-                if vr:
-                    din = get_dimensions(job.input_path)
-                    dout = get_dimensions(job.output_path)
-                    if din and dout and din != dout:
-                        dims_changed = f"{din[0]}x{din[1]} -> {dout[0]}x{dout[1]}"
-                if dims_changed:
-                    job.status = "failed"
-                    job.error = f"VR resolution changed: {dims_changed}"
-                    try:
-                        os.remove(job.output_path)
-                    except OSError:
-                        pass
-                elif out_size < job.input_size:
-                    job.status = "done"
-                    job.output_size = out_size
-                    job.progress = 100
-                    state.total_in_bytes += job.input_size
-                    state.total_out_bytes += out_size
-                    if delete_original:
-                        try:
-                            os.remove(job.input_path)
-                        except OSError:
-                            pass
-                elif delete_original:
-                    # Encode is not smaller — discard it, keep the original
-                    job.status = "kept"
-                    try:
-                        os.remove(job.output_path)
-                    except OSError:
-                        pass
-                else:
-                    # -k mode: keep both, record as done
-                    job.status = "done"
-                    job.output_size = out_size
-                    job.progress = 100
-                    state.total_in_bytes += job.input_size
-                    state.total_out_bytes += out_size
+                _unlink(job.output_path)
+            elif dims_changed:
+                job.status = "failed"
+                job.error = f"VR resolution changed: {dims_changed}"
+                _unlink(job.output_path)
+            elif out_size >= job.input_size and delete_original:
+                # Encode is not smaller — discard it, keep the original
+                job.status = "kept"
+                _unlink(job.output_path)
+            elif out_size:
+                job.status = "done"
+                job.output_size = out_size
+                job.progress = 100
+                state.total_in_bytes += job.input_size
+                state.total_out_bytes += out_size
+                if delete_original:
+                    _unlink(job.input_path)
             else:
                 job.status = "failed"
                 if returncode != 0:
-                    job.error = stderr_text[:300] if stderr_text else f"exit {returncode}"
+                    job.error = _error_tail(stderr_text) or f"exit {returncode}"
                 else:
                     job.error = "output file empty"
-                if os.path.exists(job.output_path) and os.path.getsize(job.output_path) == 0:
-                    try:
-                        os.remove(job.output_path)
-                    except OSError:
-                        pass
+                if os.path.exists(job.output_path) and out_size == 0:
+                    _unlink(job.output_path)
 
     except Exception as exc:
         job.status = "failed"
@@ -730,6 +781,7 @@ class TUI:
 
         self.q_follow = True   # auto-keep the active job visible
         self.q_scroll = 0      # manual view offset when not following
+        self._last_sig = None  # last rendered frame signature (repaint gate)
 
         self._init_colors()
 
@@ -756,6 +808,14 @@ class TUI:
 
     def run(self):
         self.stdscr.nodelay(True)
+        # Without keypad(), arrow/PageUp/Home keys arrive as raw escape
+        # sequences (27, '[', 'A'): a single arrow press then costs three
+        # frames and never matches curses.KEY_UP.
+        self.stdscr.keypad(True)
+        try:
+            curses.set_escdelay(25)
+        except AttributeError:
+            pass
         curses.curs_set(0)
 
         self._maybe_start_job()
@@ -765,7 +825,7 @@ class TUI:
                 self._handle_input()
                 self._maybe_start_job()
                 self._render()
-                time.sleep(0.05)
+                time.sleep(0.02)
             except KeyboardInterrupt:
                 self.state.quit = True
 
@@ -824,10 +884,16 @@ class TUI:
     # ── Input ────────────────────────────────────────────────────────
 
     def _handle_input(self):
-        key = self.stdscr.getch()
-        if key == -1:
-            return
+        # Drain every pending key each frame.  Handling one key per tick made
+        # held-down arrows and PageDown crawl at the frame rate, which is what
+        # made scrolling a long queue feel sluggish.
+        for _ in range(64):
+            key = self.stdscr.getch()
+            if key == -1:
+                return
+            self._handle_key(key)
 
+    def _handle_key(self, key):
         if self.add_mode:
             self._handle_add_key(key)
             return
@@ -864,6 +930,8 @@ class TUI:
             self.q_scroll = max(0, len(self.queue.jobs) - self._queue_visible())
         elif ch == ord('f'):
             self.q_follow = True
+        elif ch == curses.KEY_RESIZE:
+            self._last_sig = None
         elif ch == ord('q'):
             self.state.quit = True
         elif ch == 3:  # Ctrl+C
@@ -999,7 +1067,35 @@ class TUI:
     # Render
     # ═══════════════════════════════════════════════════════════════════
 
+    def _frame_signature(self):
+        """Cheap fingerprint of everything the frame displays.
+
+        Includes the wall-clock second so the elapsed timer keeps ticking
+        when nothing else changes.
+        """
+        with self.state.lock:
+            status = self.state.status
+            active = self.state.active
+        jobs = self.queue.jobs
+        cur = next((j for j in jobs if j.status in ("encoding", "paused")), None)
+        return (
+            status, active, int(time.time()),
+            self.q_follow, self.q_scroll, self.add_mode,
+            self.add_input, self.add_cursor,
+            tuple((j.status, j.output_size) for j in jobs),
+            (cur.input_path, cur.progress, cur.ous, int(cur.fps),
+             cur.pts_fixed) if cur else None,
+        )
+
     def _render(self):
+        # Only repaint when something visible actually changed.  A full
+        # erase+refresh 50 times a second is a lot of terminal traffic for a
+        # large window, and on a long queue every frame redraws every row.
+        sig = self._frame_signature()
+        if sig == self._last_sig:
+            return
+        self._last_sig = sig
+
         self.stdscr.erase()
         max_y, max_x = self.stdscr.getmaxyx()
 
@@ -1013,7 +1109,7 @@ class TUI:
         row += 1
         row = self._render_current_file(row, max_x)
         row += 1
-        row = self._render_queue(row, max_y, max_x)
+        row = self._render_queue(row, max_x)
 
         # Bottom bar (needs 2 rows: separator + key bar)
         bottom_y = max_y - 2
@@ -1043,7 +1139,10 @@ class TUI:
 
         pending_count = sum(1 for j in self.queue.jobs if j.status == "pending")
 
-        left = f" ffmpeg-encode [{self.args.codec}{' vr' if self.args.vr else ''}] "
+        left = f" ffmpeg-encode [qp {self.args.quality}"
+        if self.args.vr:
+            left += " vr"
+        left += "] "
         right = f" Elapsed: {ts}  Queued: {pending_count} "
 
         # If right side would overflow, shorten left
@@ -1190,7 +1289,7 @@ class TUI:
 
     # ── Queue ────────────────────────────────────────────────────────
 
-    def _render_queue(self, row: int, max_y: int, max_x: int) -> int:
+    def _render_queue(self, row: int, max_x: int) -> int:
         row += 1
         try:
             self.stdscr.addstr(row, 1, "─" * (max_x - 2), self._color(6))
@@ -1208,11 +1307,8 @@ class TUI:
             return row + 1
 
         # fixed: header(1) + label(1) + bar(1) + stats(1) + gap(1) + qheader(1) = 6
-        #        + bottom(2) = 8 fixed rows total
-        fixed_rows = 8
-        visible = max_y - fixed_rows
-        if visible < 1:
-            return row
+        #        + bottom(2) = 8 fixed rows total (see _queue_visible)
+        visible = self._queue_visible()
 
         # Try to show all, or scroll
         total_jobs = len(jobs)
@@ -1332,7 +1428,7 @@ class TUI:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Batch VAAPI encoder (HEVC or AV1) with curses TUI.",
+        description="Batch VAAPI HEVC encoder with curses TUI.",
     )
     p.add_argument("-i", action="append", default=None, metavar="DIR",
                    help="Input directory (batch mode); repeat to encode "
@@ -1343,29 +1439,26 @@ def parse_args() -> argparse.Namespace:
                    help="Single input file")
     p.add_argument("--output",
                    help="Single output file")
-    p.add_argument("--codec", default=DEFAULT_CODEC, choices=sorted(CODECS),
-                   help=f"Video codec (default: {DEFAULT_CODEC})")
     p.add_argument("-p", dest="preset", default=DEFAULT_PRESET,
                    choices=["speed", "balanced", "quality"],
                    help="Speed preset — only affects parallelism (default: balanced)")
     p.add_argument("-q", dest="quality", type=int, default=None,
-                   help="Quality target — lower = better "
-                        "(HEVC 0-51, AV1 0-255; default depends on --codec)")
+                   help="Quality target, lower = better (HEVC 0-51; "
+                        "default 27, or 28 with --vr)")
     p.add_argument("-j", "--jobs", dest="jobs", type=int, default=1,
                    help="Number of files to encode in parallel (default: 1)")
     p.add_argument("-n", dest="dry_run", action="store_true",
-                   help="Dry run: list files and exit")
+                   help="Dry run: list each input with its output path and exit")
     p.add_argument("-k", "--keep", dest="keep", action="store_true",
                    help="Keep both the original and the encoded file "
                         "(no deletion; default: delete the original only when "
                         "the encode is smaller)")
     p.add_argument("--vr", action="store_true",
-                   help="VR mode: conservative quality default (HEVC -qp 28, "
-                        "AV1 -global_quality 130) and fail any encode whose "
-                        "output resolution differs from the source; never "
-                        "downscales. Outputs are written under a VR/ "
-                        "subdirectory of the output root. An explicit -q "
-                        "still overrides the default.")
+                   help="VR mode: conservative quality default (-qp 28) and "
+                        "fail any encode whose output resolution differs from "
+                        "the source; never downscales. Outputs are written "
+                        "under a VR/ subdirectory of the output root. An "
+                        "explicit -q still overrides the default.")
     p.add_argument("--fix-pts", dest="fix_pts", default="auto",
                    choices=["auto", "always", "never"],
                    help="Rebuild the output timeline from decoded frame/sample "
@@ -1385,6 +1478,7 @@ def main():
     if not args.i:
         args.i = [DEFAULT_INPUT_DIR]
     args.delete = not args.keep  # delete is default; -k keeps both files
+    args.codec = DEFAULT_CODEC   # AV1 is no longer offered on the CLI
     if args.jobs < 1:
         print("Error: --jobs must be >= 1", file=sys.stderr)
         sys.exit(1)
@@ -1401,26 +1495,9 @@ def main():
     # --output still wins over this.
     output_dir = os.path.join(args.o, VR_SUBDIR) if args.vr else args.o
 
-    # ── Dry run ─────────────────────────────────────────────────────
-    if args.dry_run:
-        if args.input:
-            files = [args.input]
-        else:
-            files = collect_all(args.i)
-        print(f"Would encode {len(files)} file(s):")
-        for f in files:
-            print(f"  {f}")
-        return
-
-    # ── VAAPI check ─────────────────────────────────────────────────
-    if not check_vaapi():
-        print("Error: VAAPI hwaccel not available in ffmpeg.", file=sys.stderr)
-        print("  Is libva-utils / intel-media-driver installed?", file=sys.stderr)
-        sys.exit(1)
-
     queue = Queue(args.i, output_dir)
 
-    # ── Single-file mode ────────────────────────────────────────────
+    # ── Single-file mode / batch queue ──────────────────────────────
     if args.input:
         job = queue.add_file(args.input)
         if job is None:
@@ -1436,6 +1513,21 @@ def main():
             print("Launching with empty queue — press 'a' to add files.", file=sys.stderr)
         for f in files:
             queue.add_file(f)
+
+    # ── Dry run ─────────────────────────────────────────────────────
+    if args.dry_run:
+        print(f"Would encode {len(queue.jobs)} file(s):")
+        for job in queue.jobs:
+            print(f"  {job.input_path} -> {job.output_path}")
+        return
+
+    # ── VAAPI check ─────────────────────────────────────────────────
+    ok, problem = check_vaapi()
+    if not ok:
+        print(f"Error: {problem}", file=sys.stderr)
+        print("  Is the VAAPI driver (mesa-va-drivers / "
+              "intel-media-driver) installed?", file=sys.stderr)
+        sys.exit(1)
 
     state = SharedState()
     curses.wrapper(main_curses, queue, state, args)

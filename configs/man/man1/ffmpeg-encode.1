@@ -1,6 +1,6 @@
-.TH FFMPEG-ENCODE 1 "2026-10-15" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-11-11" "ffmpeg-encode" "User Commands"
 .SH NAME
-ffmpeg-encode \- VAAPI HEVC/AV1 batch video encoder with curses TUI
+ffmpeg-encode \- VAAPI HEVC batch video encoder with curses TUI
 .SH SYNOPSIS
 .B ffmpeg-encode
 [\fIOPTIONS\fR]
@@ -17,32 +17,23 @@ ffmpeg-encode \- VAAPI HEVC/AV1 batch video encoder with curses TUI
 \fIFILE\fR
 [\fB\-\-output\fR \fIFILE\fR]
 [\fIOPTIONS\fR]
-.P
-.B ffmpeg-encode\-av1
-[\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B ffmpeg-encode
 is a wrapper around
 .BR ffmpeg (1)
 that re-encodes video with hardware-accelerated VAAPI
+.RB ( hevc_vaapi )
 and shows a live
 .BR curses (3)
 interface for pausing, skipping and monitoring the queue.
 It can process a whole directory tree (batch mode) or a single file, and in
 batch mode several input directories can be given in one run.
 .P
-Two codecs are supported, both driven in constant-quality mode:
-.B hevc
-(default) selects
-.BR hevc_vaapi ,
-.B av1
-selects
-.BR av1_vaapi .
-The
-.B ffmpeg-encode\-av1
-command is a thin wrapper that runs
-.B ffmpeg-encode \-\-codec av1
-with the same arguments.
+Encoding is constant-quality: the HEVC encoder runs with
+.BR "\-b:v 0 \-qp" ,
+so
+.B \-q
+is a quality level (lower is better) rather than a bitrate.
 .P
 Still-image sources such as animated WebP and PNG decode to RGB(A). These are
 converted to limited-range BT.709 and tagged with
@@ -86,9 +77,9 @@ still overrides the default.
 .P
 The TUI shows a running percentage, frames per second, a smoothed encoding
 speed multiplier and an estimated time remaining for the current file, the
-per-file size result in the queue, and elapsed / queued counters in the
-header. When the run ends, a summary reports how many files were done,
-failed, skipped or kept, and the total space saved or gained.
+per-file size result in the queue, and the quality level, elapsed and queued
+counters in the header. When the run ends, a summary reports how many files
+were done, failed, skipped or kept, and the total space saved or gained.
 .SH OPTIONS
 .TP
 .BI \-i " DIR"
@@ -121,15 +112,6 @@ The extension is always forced to
 .BR .mkv
 even if another extension is given.
 .TP
-.BI \-\-codec " CODEC"
-Video codec:
-.B hevc
-(default) or
-.BR av1 .
-The two codecs use different quality scales, so the default and meaning of
-.B \-q
-change with this option.
-.TP
 .BI \-p " PRESET"
 Speed preset:
 .BR speed ,
@@ -140,9 +122,9 @@ VAAPI exposes no quality preset, so this only sets
 faster encode with no effect on output quality.
 .TP
 .BI \-q " QP"
-Constant-quality target. Lower means higher quality and larger files. The
-valid range depends on the codec: HEVC 0\-51 (default 27), AV1 0\-255
-(default 97). Out-of-range values are clamped.
+Constant-quality target for HEVC, 0\-51 (default 27, or 28 with
+.BR \-\-vr ).
+Lower means higher quality and larger files. Out-of-range values are clamped.
 .TP
 .BI \-j " N"
 .TP
@@ -156,8 +138,8 @@ startup would otherwise dominate; a value of 2 or 3 is a good fit for a
 VCN-class GPU.
 .TP
 .B \-n
-Dry run. List the files that would be encoded and exit; no encoding or
-deletion is performed.
+Dry run. List the files that would be encoded, with their input and output
+paths, and exit; no encoding or deletion is performed.
 .TP
 .BI \-k ", " \-\-keep
 Keep both the original and the encoded file. This is the opt-out from the
@@ -166,11 +148,8 @@ file even when it is larger than the original.
 .TP
 .B \-\-vr
 VR mode for stereoscopic VR180/VR360 captures. Sets the quality default to
-HEVC
 .B \-qp
-28, or AV1
-.B \-global_quality
-130, writes outputs under a
+28, writes outputs under a
 .B VR
 subdirectory of the output root, and verifies after encoding that the output
 keeps the source's exact width and height; if it does not, the job is reported
@@ -217,11 +196,6 @@ Constant-quality mode:
 .B hevc_vaapi
 with
 .B \-b:v 0 \-qp
-.IR Q ,
-or
-.B av1_vaapi
-with
-.B \-rc_mode CQP \-global_quality
 .IR Q
 .IP \(bu 2
 Decoding uses
@@ -236,8 +210,10 @@ otherwise
 If VAAPI decoding cannot be initialised for a stream (for example a
 malformed 4K SPS), the file is retried once with software decoding followed
 by
-.BR format=nv12,hwupload ;
-the GPU still encodes
+.BR format=nv12,hwupload
+(only for 8-bit sources; 10-bit and deeper sources upload as
+.BR p010 ,
+so their bit depth survives the fallback); the GPU still encodes
 .IP \(bu 2
 Audio streams are
 .B copied
@@ -257,6 +233,10 @@ Existing output files are overwritten (\fB\-y\fR)
 All outputs use the
 .B .mkv
 (Matroska) container, regardless of the input extension
+.IP \(bu 2
+ffmpeg runs with
+.B \-nostdin
+so it never competes with the TUI for keyboard input
 .SS Deletion policy
 After a successful encode the original is deleted
 .B only
@@ -275,9 +255,9 @@ re-encoding at the normal default can grow the file and be discarded as
 .IR kept .
 .B \-\-vr
 raises the quality target to the conservative end that still produces a real
-saving (HEVC QP 28, AV1 CQ 130) and, because VR viewers magnify any
+saving (QP 28) and, because VR viewers magnify any
 resolution loss, fails any encode whose output dimensions differ from the
-input. The HEVC default was calibrated on H.264 VR sources so the re-encode
+input. The default was calibrated on H.264 VR sources so the re-encode
 holds mean VMAF around 95 (visually indistinguishable from the source) while
 still roughly halving high-motion clips.
 .P
@@ -332,8 +312,14 @@ flags are given. Overlapping directories are de-duplicated.
 .SS Requirements
 .IP \(bu 2
 .B ffmpeg
-built with VAAPI support (VAAPI check is via
-.BR "ffmpeg \-hwaccels" )
+built with VAAPI support and the
+.B hevc_vaapi
+encoder (\fBffmpeg \-hwaccels\fR and
+.B ffmpeg \-encoders
+are both checked at startup)
+.IP \(bu 2
+A VAAPI render node under
+.I /dev/dri
 .IP \(bu 2
 .B ffprobe
 (for duration / progress)
@@ -356,18 +342,6 @@ Two input directories into one output root (first directory is encoded first):
 .IP
 .EX
 ffmpeg-encode \-i ~/Videos/raw \-i /mnt/archive \-o ~/Videos/encoded
-.EE
-.P
-Encode to AV1 instead of HEVC:
-.IP
-.EX
-ffmpeg-encode \-\-codec av1 \-q 110
-.EE
-.P
-The same thing through the wrapper, which defaults to AV1:
-.IP
-.EX
-ffmpeg-encode-av1 \-i ~/Videos/raw
 .EE
 .P
 Single file with an explicit output path:
@@ -469,8 +443,6 @@ less than 1, a single input file that does not exist, or VAAPI not available.
 .TP
 .B 2
 Command-line parsing error (unknown option, bad choice for
-.B \-\-codec
-or
 .BR \-p ,
 non-integer
 .BR \-q ).
@@ -492,6 +464,6 @@ Fallback VAAPI device when no node is auto-detected.
 .SH SEE ALSO
 .BR ffmpeg (1),
 .BR ffprobe (1),
-.BR ffmpeg-encode-av1 (1)
+.BR encode-bench (1)
 .SH AUTHOR
 Written for local use with VAAPI on AMD RDNA4 (RX 9070 class).
