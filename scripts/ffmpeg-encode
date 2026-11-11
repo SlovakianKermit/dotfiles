@@ -436,6 +436,20 @@ def _hw_decode_failed(stderr_text: str) -> bool:
                "Failed to upload frame")
     return any(m in stderr_text for m in markers)
 
+def _encoder_context_lost(stderr_text: str) -> bool:
+    # A capture that changes resolution mid-stream kills the VCN encode ring:
+    # the VAAPI encoder is opened at the first frame's size, and the first
+    # frame at the new size makes the chip fault at a fixed address (page
+    # fault from client VCNRD, ring vcn_unified_0 timeout, "The CS has been
+    # cancelled because the context is lost").  It fails at the same frame on
+    # every attempt and takes the whole encoder with it, so retry pinned to a
+    # constant size.
+    markers = ("The CS has cancelled",
+               "The CS has been cancelled",
+               "The CS has been rejected",
+               "context is lost")
+    return any(m in stderr_text for m in markers)
+
 def _is_deep_pix_fmt(pix_fmt: str) -> bool:
     """True for >8-bit formats, so a software-decode fallback uploads p010
     instead of silently crushing the depth to nv12.
@@ -482,11 +496,15 @@ def _audio_args(copy_audio: bool, fix_pts: bool = False) -> List[str]:
 def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
                       device: str, copy_audio: bool = True,
                       sw_decode: bool = False, fix_pts: bool = False,
-                      fps: float = 30.0) -> List[str]:
+                      fps: float = 30.0,
+                      pin_size: Optional[Tuple[int, int]] = None) -> List[str]:
     # sw_decode: software decode + hwupload for streams the VAAPI decoder
     # can't initialise on (e.g. malformed 4K SPS); the GPU still encodes.
     # fix_pts: rebuild the timeline from frame index / sample count for
     # captures whose container clock stalled.
+    # pin_size: force every frame to one size.  The VAAPI encoder cannot be
+    # reconfigured mid-run, and a source that changes resolution makes it
+    # fault the chip; a constant scale keeps the graph (and encoder) static.
     cmd = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
@@ -500,6 +518,10 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
     color_args: List[str] = []
     if fix_pts:
         vf.append(f"setpts=N/{fps:g}/TB")
+    if pin_size:
+        w, h = pin_size
+        vf.append(f"scale={w}:{h}" if sw_decode
+                  else f"scale_vaapi=w={w}:h={h}")
     if sw_decode:
         pix_fmt = get_pix_fmt(job.input_path)
         if is_rgb_pix_fmt(pix_fmt):
@@ -651,6 +673,7 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
                   fix_pts_mode: str = "auto"):
     device = find_vaapi_device()
     sw_decode = False
+    pin_size: Optional[Tuple[int, int]] = None
     copy_audio = True
     # Probed here rather than at queue time so adding hundreds of files does
     # not stall startup behind one ffprobe per file.
@@ -677,7 +700,7 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     def attempt() -> Tuple[int, str]:
         return _run_ffmpeg(
             _build_ffmpeg_cmd(job, codec, preset, quality, device,
-                              copy_audio, sw_decode, fix_pts, fps),
+                              copy_audio, sw_decode, fix_pts, fps, pin_size),
             job, state)
 
     try:
@@ -689,6 +712,16 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
         if not cancelled() and returncode != 0 and _hw_decode_failed(stderr_text):
             sw_decode = True
             returncode, stderr_text = attempt()
+
+        # A VCN ring fault mid-encode is how a mid-stream resolution change
+        # shows up: the encoder was opened at the first frame's size, and the
+        # new size faults the chip at the same frame on every attempt.  Pin
+        # the frames to that size and retry once the ring has reset (~2s).
+        if not cancelled() and returncode != 0 and _encoder_context_lost(stderr_text):
+            pin_size = get_dimensions(job.input_path)
+            if pin_size:
+                time.sleep(3)
+                returncode, stderr_text = attempt()
 
         # Muxing a stream-copied ADTS AAC into Matroska can fail on corrupt
         # captures: retry once with the audio re-encoded as AAC.

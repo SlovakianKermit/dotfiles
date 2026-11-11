@@ -215,6 +215,14 @@ by
 .BR p010 ,
 so their bit depth survives the fallback); the GPU still encodes
 .IP \(bu 2
+If the source changes resolution mid-stream (typical of captures that stitch
+clips of different sizes together), the VAAPI encoder, which is opened at the
+first frame's size, faults the GPU on the first frame of the new size. The
+file then fails identically on every attempt. It is retried once, after the
+encoder ring has reset, with every frame scaled to the first frame's
+dimensions (\fBscale_vaapi\fR, or \fBscale\fR on the software-decode path) so
+the filter graph and encoder never reconfigure
+.IP \(bu 2
 Audio streams are
 .B copied
 (not re-encoded) unless a stalled timeline forces a rebuild (see
