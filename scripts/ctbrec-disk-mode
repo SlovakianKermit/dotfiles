@@ -4,9 +4,18 @@
 Runs inside the ctbrec LXC (proxmox VMID 109).  While free space on the
 recordings filesystem is above the enter threshold every model records
 normally.  At or below the enter threshold every model that is not on the
-allowlist is suspended through the ctbrec REST API, which immediately stops
-its recording and keeps it paused.  Allowlisted models keep recording, and an
-allowlisted model that is paused is left paused.
+allowlist stops recording: models that are currently recording are suspended
+through the ctbrec REST API in small, paced batches, which keeps them paused.
+Allowlisted models keep recording, and an allowlisted model that is paused is
+left paused.
+
+Models that are not recording are never suspended - they are not using disk
+and every suspend call takes ctbrec's recorder lock, so calling suspend for
+hundreds of idle models is what previously wedged the recorder.
+
+When a suspend or resume call fails or times out the run aborts immediately
+and the tool backs off for a cooldown period, so a wedged recorder can never
+accumulate a pile of blocked API calls.
 
 When free space reaches the exit threshold, only the models suspended by this
 tool are resumed.  Models the user had already paused before entering the mode
@@ -30,11 +39,20 @@ from typing import Any
 import requests
 import urllib3
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 GIB = 1024**3
 DEFAULT_CONFIG = Path("/etc/ctbrec-disk-mode.json")
 FALLBACK_STATE_DIR = Path("/var/lib/ctbrec-disk-mode")
 LOG = logging.getLogger("ctbrec-disk-mode")
+
+DEFAULT_HARD_FLOOR_GIB = 20
+DEFAULT_TIMEOUT = 60
+DEFAULT_ACTION_TIMEOUT_S = 15
+DEFAULT_MAX_SUSPENDS_PER_RUN = 60
+DEFAULT_MAX_RESUMES_PER_RUN = 60
+DEFAULT_ACTION_DELAY_S = 0.2
+DEFAULT_SLOW_ACTION_S = 5
+DEFAULT_FAILURE_COOLDOWN_S = 600
 
 
 class ApiError(RuntimeError):
@@ -45,6 +63,10 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def epoch_to_utc(epoch: int | float) -> str:
+    return datetime.fromtimestamp(float(epoch), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def iso_to_local(value: str) -> str:
     """Best-effort display of a stored UTC timestamp."""
     try:
@@ -52,6 +74,17 @@ def iso_to_local(value: str) -> str:
         return dt.astimezone().strftime("%Y-%m-%d %H:%M")
     except (ValueError, TypeError):
         return value or "unknown"
+
+
+def fmt_duration(seconds: int | float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{rest:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
 
 
 def state_dir() -> Path:
@@ -86,8 +119,36 @@ def load_config(path: Path) -> dict[str, Any]:
         raise SystemExit(f"{path}: allowlist must be a non-empty list")
 
     cfg["allowlist"] = [str(x).strip() for x in cfg["allowlist"] if str(x).strip()]
-    cfg.setdefault("hard_floor_gib", 1)
-    cfg.setdefault("timeout", 60)
+    cfg.setdefault("hard_floor_gib", DEFAULT_HARD_FLOOR_GIB)
+    cfg.setdefault("timeout", DEFAULT_TIMEOUT)
+    cfg.setdefault("action_timeout_s", DEFAULT_ACTION_TIMEOUT_S)
+    cfg.setdefault("action_delay_s", DEFAULT_ACTION_DELAY_S)
+    cfg.setdefault("slow_action_s", DEFAULT_SLOW_ACTION_S)
+    cfg.setdefault("failure_cooldown_s", DEFAULT_FAILURE_COOLDOWN_S)
+
+    # Older configs only had max_actions_per_run; honour it for both directions.
+    shared_limit = cfg.get("max_actions_per_run")
+    cfg.setdefault(
+        "max_suspends_per_run",
+        shared_limit if shared_limit is not None else DEFAULT_MAX_SUSPENDS_PER_RUN,
+    )
+    cfg.setdefault(
+        "max_resumes_per_run",
+        shared_limit if shared_limit is not None else DEFAULT_MAX_RESUMES_PER_RUN,
+    )
+
+    if int(cfg["max_suspends_per_run"]) < 1:
+        raise SystemExit(f"{path}: max_suspends_per_run must be at least 1")
+    if int(cfg["max_resumes_per_run"]) < 1:
+        raise SystemExit(f"{path}: max_resumes_per_run must be at least 1")
+    if float(cfg["action_timeout_s"]) <= 0:
+        raise SystemExit(f"{path}: action_timeout_s must be positive")
+    if float(cfg["action_delay_s"]) < 0:
+        raise SystemExit(f"{path}: action_delay_s must not be negative")
+    if float(cfg["slow_action_s"]) <= 0:
+        raise SystemExit(f"{path}: slow_action_s must be positive")
+    if int(cfg["failure_cooldown_s"]) < 0:
+        raise SystemExit(f"{path}: failure_cooldown_s must not be negative")
     return cfg
 
 
@@ -145,21 +206,35 @@ class Client:
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.base = str(cfg["api_url"]).rstrip("/")
         self.timeout = int(cfg["timeout"])
+        self.action_timeout = float(cfg["action_timeout_s"])
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         self.session = requests.Session()
         self.session.verify = False
         self.session.headers.update({"X-Requested-With": "XMLHttpRequest"})
 
-    def _request(self, method: str, path: str, payload: Any = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Any = None,
+        *,
+        timeout: float | None = None,
+        attempts: int = 3,
+    ) -> Any:
         url = self.base + path
         last: Exception | None = None
-        for attempt in range(1, 4):
+        attempts = max(1, attempts)
+        for attempt in range(1, attempts + 1):
             try:
                 if method == "GET":
-                    response = self.session.get(url, timeout=self.timeout)
+                    response = self.session.get(
+                        url, timeout=self.timeout if timeout is None else timeout
+                    )
                 else:
                     response = self.session.post(
-                        url, data=json.dumps(payload), timeout=self.timeout
+                        url,
+                        data=json.dumps(payload),
+                        timeout=self.timeout if timeout is None else timeout,
                     )
                 if response.status_code != 200:
                     raise ApiError(
@@ -173,28 +248,47 @@ class Client:
                 return data
             except (requests.RequestException, ValueError, ApiError) as exc:
                 last = exc
-                if attempt < 3:
-                    LOG.warning("%s (attempt %d/3); retrying", exc, attempt)
+                if attempt < attempts:
+                    LOG.warning("%s (attempt %d/%d); retrying", exc, attempt, attempts)
                     time.sleep(2 * attempt)
         raise ApiError(str(last))
 
     def space(self) -> dict[str, Any]:
-        return self._request("POST", "/rec", {"action": "space"})
+        return self._request("POST", "/rec", {"action": "space"}, attempts=2)
 
     def models(self) -> list[dict[str, Any]]:
-        return self._request("POST", "/rec", {"action": "list"})["models"]
+        return self._request("POST", "/rec", {"action": "list"}, attempts=2)["models"]
+
+    def recording_models(self) -> list[dict[str, Any]]:
+        return self._request(
+            "POST", "/rec", {"action": "listCurrentlyRecording"}, attempts=2
+        )["models"]
 
     def suspend(self, model: dict[str, Any]) -> None:
-        self._request("POST", "/rec", {"action": "suspend", "model": model})
+        # One attempt only: a timed-out suspend leaves a blocked request thread
+        # behind, so retrying multiplies the damage if the recorder is wedged.
+        self._request(
+            "POST",
+            "/rec",
+            {"action": "suspend", "model": model},
+            timeout=self.action_timeout,
+            attempts=1,
+        )
 
     def resume(self, model: dict[str, Any]) -> None:
-        self._request("POST", "/rec", {"action": "resume", "model": model})
+        self._request(
+            "POST",
+            "/rec",
+            {"action": "resume", "model": model},
+            timeout=self.action_timeout,
+            attempts=1,
+        )
 
     def settings(self) -> list[dict[str, Any]]:
         return self._request("GET", "/config")
 
     def update_settings(self, settings: list[dict[str, Any]]) -> None:
-        self._request("POST", "/config", settings)
+        self._request("POST", "/config", settings, attempts=2)
 
 
 def allowlist_set(cfg: dict[str, Any]) -> set[str]:
@@ -208,12 +302,212 @@ def is_allowed(model: dict[str, Any], allowed: set[str]) -> bool:
     )
 
 
+def model_label(model: dict[str, Any]) -> str:
+    return str(model.get("displayName") or model.get("name") or model.get("url") or "?")
+
+
 def free_bytes(client: Client) -> int:
     return int(client.space()["spaceFree"])
 
 
 def fmt_gib(value: int | float) -> str:
     return f"{value / GIB:.1f} GiB"
+
+
+def suspended_urls(state: dict[str, Any]) -> set[str]:
+    return set(str(url) for url in state.get("suspended_urls") or [])
+
+
+def add_suspended(state: dict[str, Any], url: str) -> None:
+    urls = suspended_urls(state)
+    urls.add(url)
+    state["suspended_urls"] = sorted(urls)
+
+
+def drop_suspended(state: dict[str, Any], url: str) -> None:
+    urls = suspended_urls(state)
+    urls.discard(url)
+    state["suspended_urls"] = sorted(urls)
+
+
+def cooldown_remaining(state: dict[str, Any]) -> int:
+    failure = state.get("failure") or {}
+    retry_after = failure.get("retry_after_epoch")
+    if not retry_after:
+        return 0
+    return max(0, int(retry_after) - int(time.time()))
+
+
+def record_failure(
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    model: dict[str, Any],
+    exc: Exception,
+) -> None:
+    """Remember a failed recorder action and back off for a while.
+
+    A suspended/blocked recorder action is the signature of the ctbrec
+    stop-recording deadlock, so the next run must not immediately add another
+    blocked request to the pile.
+    """
+    cooldown = int(cfg["failure_cooldown_s"])
+    retry_after = int(time.time()) + cooldown
+    state["failure"] = {
+        "at": utcnow(),
+        "model": model_label(model),
+        "url": str(model.get("url", "")),
+        "error": str(exc)[:500],
+        "retry_after_epoch": retry_after,
+        "retry_after": epoch_to_utc(retry_after),
+    }
+    save_state(state)
+    LOG.error(
+        "recorder action failed for %s: %s", model_label(model), exc
+    )
+    if cooldown:
+        LOG.error(
+            "aborting this run and pausing recorder actions for %s (until %s); "
+            "if free space keeps dropping the ctbrec recorder is probably wedged "
+            "and ctbrec.service needs a restart",
+            fmt_duration(cooldown),
+            iso_to_local(epoch_to_utc(retry_after)),
+        )
+
+
+def clear_failure(state: dict[str, Any]) -> None:
+    if state.pop("failure", None) is not None:
+        save_state(state)
+
+
+def suspend_recording_models(
+    client: Client,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    dry_run: bool,
+) -> tuple[int, int]:
+    """Suspend non-allowlisted models that are recording right now.
+
+    Returns (suspended this run, still left to suspend).
+    """
+    allowed = allowlist_set(cfg)
+    targets = [
+        model for model in client.recording_models() if not is_allowed(model, allowed)
+    ]
+    if not targets:
+        LOG.info("no non-allowlisted model is recording; nothing to suspend")
+        return 0, 0
+
+    limit = int(cfg["max_suspends_per_run"])
+    batch = targets if dry_run else targets[:limit]
+    LOG.info(
+        "low-space mode: %d non-allowlisted model(s) recording, suspending %d now (max %d per run)",
+        len(targets),
+        len(batch),
+        limit,
+    )
+
+    suspended = 0
+    for index, model in enumerate(batch, start=1):
+        if dry_run:
+            LOG.info("dry-run: would suspend %s (%s)", model_label(model), model.get("url"))
+            continue
+        try:
+            started = time.monotonic()
+            client.suspend(model)
+            elapsed = time.monotonic() - started
+        except ApiError as exc:
+            record_failure(cfg, state, model, exc)
+            return suspended, len(targets) - suspended
+        add_suspended(state, str(model["url"]))
+        clear_failure(state)
+        save_state(state)
+        suspended += 1
+        LOG.info(
+            "suspended %s (%d/%d now, %d left for later runs)",
+            model_label(model),
+            suspended,
+            len(batch),
+            len(targets) - suspended,
+        )
+        if elapsed > float(cfg["slow_action_s"]):
+            LOG.warning(
+                "suspend of %s took %.1fs; stopping this batch so a struggling recorder is not hammered",
+                model_label(model),
+                elapsed,
+            )
+            return suspended, len(targets) - suspended
+        if index < len(batch) and float(cfg["action_delay_s"]) > 0:
+            time.sleep(float(cfg["action_delay_s"]))
+    return suspended, len(targets) - suspended
+
+
+def resume_batch(
+    client: Client,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    only_allowed: bool,
+    dry_run: bool,
+) -> tuple[int, int, bool]:
+    """Resume models this tool suspended, in paced batches.
+
+    only_allowed=True takes allowlisted models back out of suspension (used
+    while the mode stays active and the allowlist changed), False resumes
+    everything this tool suspended (used when leaving the mode).
+
+    Returns (resumed this run, still suspended, failed).
+    """
+    allowed = allowlist_set(cfg)
+    urls = sorted(suspended_urls(state))
+    if not urls:
+        return 0, 0, False
+
+    by_url = {str(model["url"]): model for model in client.models()}
+    limit = int(cfg["max_resumes_per_run"])
+    attempted = 0
+    resumed = 0
+
+    for url in urls:
+        if attempted >= limit:
+            break
+        model = by_url.get(url)
+        if model is None or not model.get("suspended", False):
+            # Gone from the model list or already active: forget it. While the
+            # mode stays active other models' entries must be left alone.
+            if not only_allowed and not dry_run:
+                drop_suspended(state, url)
+                save_state(state)
+            continue
+        if only_allowed and not is_allowed(model, allowed):
+            continue
+        if dry_run:
+            LOG.info("dry-run: would resume %s (%s)", model_label(model), url)
+            attempted += 1
+            continue
+        attempted += 1
+        try:
+            started = time.monotonic()
+            client.resume(model)
+            elapsed = time.monotonic() - started
+        except ApiError as exc:
+            record_failure(cfg, state, model, exc)
+            return resumed, len(suspended_urls(state)), True
+        drop_suspended(state, url)
+        clear_failure(state)
+        save_state(state)
+        resumed += 1
+        LOG.info("resumed %s", model_label(model))
+        if elapsed > float(cfg["slow_action_s"]):
+            LOG.warning(
+                "resume of %s took %.1fs; stopping this batch so a struggling recorder is not hammered",
+                model_label(model),
+                elapsed,
+            )
+            return resumed, len(suspended_urls(state)), False
+        if attempted < limit and float(cfg["action_delay_s"]) > 0:
+            time.sleep(float(cfg["action_delay_s"]))
+
+    return resumed, len(suspended_urls(state)), False
 
 
 def enter_mode(
@@ -223,135 +517,92 @@ def enter_mode(
     dry_run: bool,
 ) -> None:
     allowed = allowlist_set(cfg)
-    models = client.models()
-    targets = [
-        m for m in models if not m.get("suspended", False) and not is_allowed(m, allowed)
-    ]
+    recording = client.recording_models()
+    targets = [model for model in recording if not is_allowed(model, allowed)]
     LOG.info(
-        "entering low-space mode: %d active model(s) to suspend, %d allowlisted model(s) stay untouched",
+        "entering low-space mode: %d non-allowlisted model(s) recording, "
+        "%d allowlisted model(s) stay untouched",
         len(targets),
-        sum(1 for m in models if is_allowed(m, allowed)),
+        sum(1 for model in recording if is_allowed(model, allowed)),
     )
     if dry_run:
-        for model in targets:
-            LOG.info("dry-run: would suspend %s (%s)", model["displayName"], model["url"])
+        suspend_recording_models(client, cfg, state, dry_run=True)
         return
 
     state.clear()
-    state.update(
-        {
-            "active": True,
-            "entered_at": utcnow(),
-            "suspended_urls": [m["url"] for m in targets],
-        }
-    )
+    state.update({"active": True, "entered_at": utcnow(), "suspended_urls": []})
     save_state(state)
 
-    failed: list[str] = []
-    for index, model in enumerate(targets, start=1):
-        try:
-            client.suspend(model)
-            LOG.info("suspended %s (%d/%d)", model["displayName"], index, len(targets))
-        except ApiError as exc:
-            failed.append(model["displayName"])
-            LOG.error("could not suspend %s: %s", model["displayName"], exc)
-    if failed:
-        LOG.error("%d model(s) could not be suspended: %s", len(failed), ", ".join(failed))
-        raise SystemExit(1)
+    suspended, remaining = suspend_recording_models(client, cfg, state, dry_run=False)
+    if remaining:
+        LOG.info(
+            "%d recording model(s) still to suspend on later runs", remaining
+        )
 
 
-def enforce_mode(client: Client, cfg: dict[str, Any], state: dict[str, Any], dry_run: bool) -> None:
-    """Keep every non-allowlisted model suspended while the mode is active.
+def enforce_mode(
+    client: Client,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    dry_run: bool,
+) -> None:
+    """Keep every non-allowlisted recording model suspended while active.
 
     An allowlisted model that this tool suspended earlier (for example a model
     added to the allowlist while the mode was already active) is resumed again,
     but only if this tool is the one that paused it.
     """
-    allowed = allowlist_set(cfg)
-    models = client.models()
-    known = set(state.get("suspended_urls", []))
-
-    for model in models:
-        if (
-            is_allowed(model, allowed)
-            and model.get("suspended", False)
-            and model["url"] in known
-        ):
-            if dry_run:
-                LOG.info("dry-run: would resume allowlisted %s (%s)", model["displayName"], model["url"])
-                continue
-            try:
-                client.resume(model)
-                known.discard(model["url"])
-                LOG.info("resumed allowlisted %s", model["displayName"])
-            except ApiError as exc:
-                LOG.error("could not resume allowlisted %s: %s", model["displayName"], exc)
-
-    targets = [
-        m for m in models if not m.get("suspended", False) and not is_allowed(m, allowed)
-    ]
-    if not targets:
-        if not dry_run and known != set(state.get("suspended_urls", [])):
-            state["suspended_urls"] = sorted(known)
-            save_state(state)
+    resumed, _, failed = resume_batch(
+        client, cfg, state, only_allowed=True, dry_run=dry_run
+    )
+    if failed:
         return
-    LOG.info("low-space mode: re-suspending %d non-allowlisted model(s)", len(targets))
-    if dry_run:
-        for model in targets:
-            LOG.info("dry-run: would suspend %s (%s)", model["displayName"], model["url"])
-        return
-    for model in targets:
-        try:
-            client.suspend(model)
-            known.add(model["url"])
-            LOG.info("suspended %s", model["displayName"])
-        except ApiError as exc:
-            LOG.error("could not suspend %s: %s", model["displayName"], exc)
-    state["suspended_urls"] = sorted(known)
-    save_state(state)
+    if resumed:
+        LOG.info("resumed %d allowlisted model(s)", resumed)
+    suspend_recording_models(client, cfg, state, dry_run=dry_run)
 
 
 def exit_mode(
     client: Client,
+    cfg: dict[str, Any],
     state: dict[str, Any],
     reason: str,
     dry_run: bool,
 ) -> None:
-    urls = list(state.get("suspended_urls", []))
+    urls = suspended_urls(state)
     LOG.info("leaving low-space mode (%s): %d model(s) to resume", reason, len(urls))
     if not urls:
         if not dry_run:
             state.clear()
             state.update({"active": False, "suspended_urls": []})
             save_state(state)
+            LOG.info("low-space mode off")
         return
 
-    by_url = {m["url"]: m for m in client.models()}
-    resumed = 0
-    for url in urls:
-        model = by_url.get(url)
-        if model is None:
-            LOG.warning("model no longer tracked: %s", url)
-            continue
-        if not model.get("suspended", False):
-            LOG.info("not resuming %s: already active", model["displayName"])
-            continue
-        if dry_run:
-            LOG.info("dry-run: would resume %s (%s)", model["displayName"], url)
-            continue
-        try:
-            client.resume(model)
-            resumed += 1
-            LOG.info("resumed %s", model["displayName"])
-        except ApiError as exc:
-            LOG.error("could not resume %s: %s", model["displayName"], exc)
+    # Latch the exit: once draining has started it must finish even if free
+    # space falls back between the thresholds while the models resume. Without
+    # the latch a batched exit would flap around the exit threshold forever.
+    if not dry_run and not state.get("exiting"):
+        state["exiting"] = True
+        save_state(state)
 
+    resumed, remaining, failed = resume_batch(
+        client, cfg, state, only_allowed=False, dry_run=dry_run
+    )
     if dry_run:
+        return
+    if failed or remaining:
+        if remaining:
+            LOG.info(
+                "resumed %d model(s) this run; %d still suspended, continuing on later runs",
+                resumed,
+                remaining,
+            )
         return
     state.clear()
     state.update({"active": False, "suspended_urls": []})
     save_state(state)
-    LOG.info("low-space mode off; resumed %d model(s)", resumed)
+    LOG.info("low-space mode off; all models it suspended are recording again")
 
 
 def ensure_floor(client: Client, cfg: dict[str, Any]) -> None:
@@ -380,8 +631,13 @@ def cmd_status(client: Client, cfg: dict[str, Any], state: dict[str, Any]) -> No
     space = client.space()
     free = int(space["spaceFree"])
     models = client.models()
+    recording = client.recording_models()
     allowed = allowlist_set(cfg)
-    matched = [m for m in models if is_allowed(m, allowed)]
+    matched = [model for model in models if is_allowed(model, allowed)]
+    known = suspended_urls(state)
+    actually_suspended = [
+        model for model in models if model.get("suspended") and model["url"] in known
+    ]
 
     print(f"free space      {fmt_gib(free)} ({free} bytes)")
     print(f"enter threshold {fmt_gib(cfg['enter_gib'] * GIB)}")
@@ -389,8 +645,12 @@ def cmd_status(client: Client, cfg: dict[str, Any], state: dict[str, Any]) -> No
     print(f"hard floor      {fmt_gib(int(space.get('minimumSpaceLeftInBytes') or 0))} (ctbrec minimumSpaceLeftInBytes)")
     print()
     if state.get("active"):
-        print(f"mode            ACTIVE since {iso_to_local(state.get('entered_at', ''))}")
-        print(f"suspended       {len(state.get('suspended_urls', []))} model(s) by this tool")
+        suffix = " (finishing exit)" if state.get("exiting") else ""
+        print(f"mode            ACTIVE since {iso_to_local(state.get('entered_at', ''))}{suffix}")
+        print(
+            f"suspended       {len(actually_suspended)} model(s) by this tool "
+            f"({len(known)} tracked in state)"
+        )
     else:
         print("mode            inactive")
         if free <= cfg["enter_gib"] * GIB:
@@ -399,6 +659,16 @@ def cmd_status(client: Client, cfg: dict[str, Any], state: dict[str, Any]) -> No
             print("next run        stays inactive")
         else:
             print("next run        stays inactive (between thresholds)")
+
+    remaining = cooldown_remaining(state)
+    failure = state.get("failure") or {}
+    if remaining:
+        print(
+            f"backing off     {fmt_duration(remaining)} after a failed action on "
+            f"{failure.get('model', '?')} at {iso_to_local(failure.get('at', ''))}"
+        )
+        print(f"  error: {failure.get('error', '')}")
+    print(f"recording now   {len(recording)} model(s)")
     print()
 
     names = {str(m.get("displayName", "")).casefold() for m in matched} | {
@@ -452,7 +722,7 @@ def main(argv: list[str] | None = None) -> int:
         if not state.get("active"):
             print("low-space mode is not active; nothing to do")
             return 0
-        exit_mode(client, state, "manual reset", args.dry_run)
+        exit_mode(client, cfg, state, "manual reset", args.dry_run)
         return 0
 
     free = free_bytes(client)
@@ -466,9 +736,30 @@ def main(argv: list[str] | None = None) -> int:
         "active" if state.get("active") else "inactive",
     )
 
+    remaining = cooldown_remaining(state)
+    if remaining and not args.dry_run:
+        failure = state.get("failure") or {}
+        LOG.warning(
+            "backing off %s after a failed action on %s at %s (%s); no recorder actions this run",
+            fmt_duration(remaining),
+            failure.get("model", "?"),
+            iso_to_local(failure.get("at", "")),
+            failure.get("error", ""),
+        )
+        return 0
+    if remaining == 0 and state.get("failure"):
+        LOG.info("cooldown expired; retrying recorder actions")
+        state.pop("failure", None)
+        save_state(state)
+
     if state.get("active"):
-        if free >= exit_at:
-            exit_mode(client, state, f"free {fmt_gib(free)} >= exit {fmt_gib(exit_at)}", args.dry_run)
+        if state.get("exiting") or free >= exit_at:
+            reason = (
+                "finishing exit"
+                if state.get("exiting")
+                else f"free {fmt_gib(free)} >= exit {fmt_gib(exit_at)}"
+            )
+            exit_mode(client, cfg, state, reason, args.dry_run)
         else:
             enforce_mode(client, cfg, state, args.dry_run)
     elif free <= enter_at:

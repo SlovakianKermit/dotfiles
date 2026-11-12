@@ -1,4 +1,4 @@
-.TH CTBREC-DISK-MODE 1 "2026-11-10" "ctbrec-disk-mode" "User Commands"
+.TH CTBREC-DISK-MODE 1 "2026-11-12" "ctbrec-disk-mode" "User Commands"
 .SH NAME
 ctbrec-disk-mode \- strict low-disk allowlist mode for ctbrec
 .SH SYNOPSIS
@@ -10,15 +10,36 @@ runs inside the ctbrec LXC and talks to the ctbrec REST API on
 .IR https://127.0.0.1:8443 .
 While free space on the recordings filesystem is above the enter threshold all
 models record normally. At or below the enter threshold every model that is not
-on the allowlist is suspended through the ctbrec API, which immediately stops
-its recording and keeps it paused. Allowlisted models keep recording; an
-allowlisted model that was already paused is left paused.
+on the allowlist stops recording: models that are recording at that moment are
+suspended through the ctbrec API, which stops their download and keeps them
+paused. Allowlisted models keep recording; an allowlisted model that was
+already paused is left paused.
+.P
+Only models that are actually recording are suspended. An idle model uses no
+disk, and every
+.B suspend
+call makes ctbrec take its recorder lock, so suspending hundreds of idle models
+in one burst is pure risk: a single wedged stop deadlocks the recorder and every
+further call piles up behind it.
+.P
+Suspend and resume calls are issued one at a time, in batches of at most
+.B max_suspends_per_run
+or
+.BR max_resumes_per_run ,
+with a delay between calls. The first call that fails or times out aborts the
+run and starts a
+.B failure_cooldown_s
+backoff, so a wedged recorder is contacted once per cooldown instead of once per
+minute.
 .P
 When free space reaches the exit threshold, only the models that this tool
-suspended are resumed. Models the user had already paused before the mode was
-entered are never touched. While the mode is active, every run re\-suspends any
-non\-allowlisted model that has become active, for example a new model or one
-resumed by hand in the WebUI, and re\-admits an allowlisted model that this
+suspended are resumed, in the same paced batches. The exit is latched: once
+draining has started it continues on later runs even if free space falls back
+between the thresholds, otherwise resuming a large set would flap around the
+exit threshold. Models the user had already paused before the mode was entered
+are never touched. While the mode is active, every run re\-suspends any
+non\-allowlisted model that has started recording, for example a new model or
+one resumed by hand in the WebUI, and re\-admits an allowlisted model that this
 tool had suspended earlier, so adding a model to the allowlist takes effect
 without leaving the mode.
 .P
@@ -44,7 +65,8 @@ and every allowlisted model with its active/paused state. Changes nothing.
 .TP
 .B \-\-reset
 Force the mode off and resume the models this tool suspended, regardless of
-free space.
+free space. Resumes are batched like suspends, so a large set may need more than
+one run; the mode stays active until the batch is drained.
 .TP
 .B \-\-dry-run
 With
@@ -75,12 +97,55 @@ hysteresis: without it the mode would flap while recordings consume space.
 .SS State
 The set of models suspended by this tool is stored in
 .IR state.json .
+A URL is added only after the API confirmed that suspend, so the file always
+describes what the tool really changed, even when a run aborts halfway.
 On exit, a stored model is resumed only when it is still suspended. A model
 that the user resumed by hand, or that was already paused before the mode was
 entered, is skipped. Resuming through the ctbrec API also clears the model's
 ``marked for later'' flag, because that is what the API's
 .B resume
 action does.
+.SS Batched recorder actions
+ctbrec's recorder deadlocks when a stop\-recording call joins a virtual thread
+while holding the download monitor. A burst of hundreds of suspend calls turns
+that single wedged call into a frozen recorder, an exhausted request pool, and
+a stalled online monitor. This tool therefore:
+.IP \(bu 2
+suspends only models that are recording right now, taken from the API's
+.B listCurrentlyRecording
+action;
+.IP \(bu 2
+sends at most
+.B max_suspends_per_run
+suspend calls and
+.B max_resumes_per_run
+resume calls per run, with
+.B action_delay_s
+seconds between them;
+.IP \(bu 2
+never retries a suspend or resume that failed;
+.IP \(bu 2
+stops the batch when a single call takes longer than
+.BR slow_action_s ,
+so a struggling recorder is not hammered;
+.IP \(bu 2
+uses
+.B action_timeout_s
+for those calls, which is much shorter than the read timeout.
+.SS Failure backoff
+When a suspend or resume fails or times out, the run stops immediately, the
+failure (time, model, error, retry time) is written to
+.IR state.json ,
+and no further recorder action is taken for
+.B failure_cooldown_s
+seconds. During the backoff the timer keeps running but only logs. When the
+cooldown expires the tool tries again.
+.P
+If free space keeps falling while the tool is backing off, the ctbrec recorder
+is most likely wedged and
+.I ctbrec.service
+has to be restarted; the log says so explicitly. A wedged recorder cannot be
+recovered through the API.
 .SS Concurrency
 The tool does not change
 .BR concurrentRecordings .
@@ -94,21 +159,55 @@ same name on two sites, every matching model is treated as allowlisted.
 .SH FILES
 .TP
 .I /etc/ctbrec-disk-mode.json
-Configuration. Keys:
+Configuration. Required keys:
 .BR api_url ,
 .BR enter_gib ,
 .BR exit_gib ,
-.BR allowlist ,
-optional
+.BR allowlist .
+Optional keys and their defaults:
+.RS 4
+.TP
 .B hard_floor_gib
-(default 1) and
+.BR 20 .
+ctbrec's own
+.B minimumSpaceLeftInBytes
+reserve.
+.TP
 .B timeout
-(default 60 seconds). The allowlist is a list of model display names and is
-matched case\-insensitively.
+.BR 60 .
+Read timeout in seconds.
+.TP
+.B action_timeout_s
+.BR 15 .
+Suspend and resume timeout in seconds.
+.TP
+.B max_suspends_per_run
+.BR 60 .
+Suspend calls per run.
+.TP
+.B max_resumes_per_run
+.BR 60 .
+Resume calls per run.
+.TP
+.B action_delay_s
+.BR 0.2 .
+Pause between those calls.
+.TP
+.B slow_action_s
+.BR 5 .
+Stop the batch early when a single call takes longer than this.
+.TP
+.B failure_cooldown_s
+.BR 600 .
+Backoff after a failed call.
+.RE
+.P
+The allowlist is a list of model display names and is matched
+case\-insensitively.
 .TP
 .I /var/lib/ctbrec-disk-mode/state.json
-Active mode, entry timestamp, and URLs suspended by the tool. When systemd
-sets
+Active mode, entry timestamp, the URLs confirmed suspended by the tool, and the
+last failure with its retry time. When systemd sets
 .BR STATE_DIRECTORY ,
 that directory is used instead.
 .SH EXAMPLES
@@ -138,11 +237,11 @@ ctbrec-disk-mode \-\-reset
 .SH EXIT STATUS
 .TP
 .B 0
-Success, including ``nothing to do''.
+Success, including ``nothing to do'' and ``backing off''.
 .TP
 .B 1
-The ctbrec API was unreachable or returned an error, or one or more models
-could not be suspended while entering the mode.
+The ctbrec API was unreachable or returned an error outside a suspend or resume
+batch, such as while reading the free space or the model list.
 .SH SEE ALSO
 .BR ctbrec-disk-mode-remote (1),
 .BR systemctl (1),
