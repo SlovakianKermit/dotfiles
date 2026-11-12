@@ -1,4 +1,4 @@
-.TH FFMPEG-ENCODE 1 "2026-11-11" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-11-12" "ffmpeg-encode" "User Commands"
 .SH NAME
 ffmpeg-encode \- VAAPI HEVC batch video encoder with curses TUI
 .SH SYNOPSIS
@@ -223,13 +223,24 @@ encoder ring has reset, with every frame scaled to the first frame's
 dimensions (\fBscale_vaapi\fR, or \fBscale\fR on the software-decode path) so
 the filter graph and encoder never reconfigure
 .IP \(bu 2
-Audio streams are
+Audio streams from
+.B .ts
+and
+.B .mts
+sources are always re-encoded as AAC at 160 kbit/s. ADTS AAC in MPEG-TS
+captures is routinely damaged by packet loss during recording, and copying
+it into Matroska runs the implicit
+.B aac_adtstoasc
+bitstream filter, which aborts the muxer on the first corrupt ADTS header
+(\fBError parsing ADTS frame header\fR, then
+\fBError muxing a packet\fR) and fails the job after an hour of encoding.
+Audio from every other container is
 .B copied
 (not re-encoded) unless a stalled timeline forces a rebuild (see
 .BR "\-\-fix\-pts" )
 .IP \(bu 2
 If copying the audio makes the Matroska muxer fail (for example a corrupt
-ADTS AAC lead-in in an MPEG-TS capture that ffmpeg cannot parse), the file
+ADTS AAC lead-in in a non-TS capture that ffmpeg cannot parse), the file
 is retried once with the audio re-encoded as AAC at 160 kbit/s
 .IP \(bu 2
 Only video and audio are mapped (\fB\-map 0:v? \-map 0:a?\fR); subtitles

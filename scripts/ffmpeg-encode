@@ -19,7 +19,12 @@ their PTS advance by microseconds, so ffprobe reports a duration far
 shorter than the real content, -progress pins at 100% well before the end
 of the file, and hours of picture would be crammed into the last seconds of
 the output.  Default "auto" spot-checks .ts/.mts sources for this and only
-then rebuilds; "always"/"never" override the decision."""
+then rebuilds; "always"/"never" override the decision.
+
+.ts/.mts sources always have their audio re-encoded as AAC: ADTS AAC in these
+captures is routinely damaged, and stream-copying it into Matroska aborts the
+muxer on the first corrupt ADTS header, failing a job long after it started.
+"""
 
 import argparse
 import curses
@@ -674,7 +679,14 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     device = find_vaapi_device()
     sw_decode = False
     pin_size: Optional[Tuple[int, int]] = None
-    copy_audio = True
+    # ADTS AAC in MPEG-TS captures is routinely damaged: packet loss during
+    # recording leaves truncated frames and corrupt ADTS headers.  Copying it
+    # into Matroska runs the implicit aac_adtstoasc bitstream filter, which
+    # aborts the muxer on the first bad header ("Error parsing ADTS frame
+    # header" -> "Error muxing a packet") and fails the whole job an hour in.
+    # One AAC encode at 160 kbit/s costs little next to the HEVC VAAPI pass,
+    # so TS sources always re-encode the audio.
+    copy_audio = pathlib.Path(job.input_path).suffix.lower() not in (".ts", ".mts")
     # Probed here rather than at queue time so adding hundreds of files does
     # not stall startup behind one ffprobe per file.
     job.duration = job.duration or get_duration(job.input_path)
