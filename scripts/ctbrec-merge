@@ -188,12 +188,20 @@ def meminfo_unflushed():
     return vals.get("Dirty", 0) + vals.get("Writeback", 0)
 
 
-def diskstats_io_ticks(targets):
-    """Milliseconds the device(s) spent doing io, straight from the kernel."""
+def diskstats_io(targets):
+    """(busy_ms, weighted_ms) for the device(s), straight from the kernel.
+
+    ``busy_ms`` is time with at least one request in flight -- on a slow,
+    seek-penalised drive this pins at 100% as soon as anything is queued, so it
+    says "the drive is working", not "the drive is overloaded".  ``weighted_ms``
+    is the same clock weighted by queue depth, so its delta over the sample
+    period is the average queue length: the one number that distinguishes
+    "busy" from "backed up".
+    """
     want = {f"{maj}:{mino}" for maj, mino in targets}
     if not want:
-        return None
-    ticks = None
+        return None, None
+    busy = weighted = None
     try:
         with open("/proc/diskstats") as f:
             for line in f:
@@ -201,13 +209,14 @@ def diskstats_io_ticks(targets):
                 if len(parts) < 14 or f"{parts[0]}:{parts[1]}" not in want:
                     continue
                 try:
-                    t = int(parts[12])
+                    b, w = int(parts[12]), int(parts[13])
                 except ValueError:
                     continue
-                ticks = t if ticks is None else max(ticks, t)
+                busy = b if busy is None else max(busy, b)
+                weighted = w if weighted is None else max(weighted, w)
     except OSError:
-        return None
-    return ticks
+        return None, None
+    return busy, weighted
 
 
 def device_targets(path):
@@ -237,17 +246,24 @@ def device_targets(path):
 
 
 class DiskSampler:
-    """Measures how busy the backing disk actually is.
+    """Measures how loaded the backing disk actually is.
 
-    Three independent signals, because each one lies on its own:
+    Signals, picked because each lies on its own:
 
-    * device busy time from ``/proc/diskstats`` -- the drive is doing work;
-    * PSI ``full`` stall time -- tasks are actually blocked;
+    * device busy time from ``/proc/diskstats`` -- the drive had work queued;
+    * weighted io time -- the average queue length, which is what actually
+      distinguishes "the drive is working" from "the drive is backed up";
     * ``Dirty``/``Writeback`` -- the kernel still owes the drive bytes that no
-      process is waiting on yet (page cache absorbs the write, the stall comes
-      later in a kworker).
+      process is waiting on yet (the page cache absorbs the write and the stall
+      only appears later, in a kworker).
 
-    A burst is only considered finished when all three are quiet.
+    PSI is deliberately not part of the default gate.  ``/proc/pressure/io`` is
+    the *root* cgroup, and on this host it is dominated by kernel writeback
+    threads blocked in ``rq_qos_wait`` because blk-wbt throttles them by
+    design.  That pins root ``full`` at 50-100% whenever writeback is in flight
+    while the ctbrec cgroup and user.slice read near zero, so it cannot be
+    compared with any threshold.  It stays available via
+    ``--io-wait-threshold`` for hosts where it is meaningful.
     """
 
     def __init__(self, targets):
@@ -256,7 +272,7 @@ class DiskSampler:
 
     def _read(self):
         return (time.monotonic(), psi_full_total(),
-                diskstats_io_ticks(self.targets), meminfo_unflushed())
+                diskstats_io(self.targets), meminfo_unflushed())
 
     def prime(self):
         self.prev = self._read()
@@ -266,23 +282,28 @@ class DiskSampler:
             self.prime()
         time.sleep(window)
         cur = self._read()
-        t0, psi0, ticks0, _ = self.prev
-        t1, psi1, ticks1, dirty = cur
+        t0, psi0, io0, _ = self.prev
+        t1, psi1, io1, dirty = cur
         self.prev = cur
         dt = max(1e-6, t1 - t0)
-        util = stall = None
-        if ticks0 is not None and ticks1 is not None:
-            util = min(100.0, max(0.0, 100.0 * (ticks1 - ticks0) / 1000.0 / dt))
+        util = aqu = stall = None
+        busy0, weight0 = io0
+        busy1, weight1 = io1
+        if None not in (busy0, busy1):
+            util = min(100.0, max(0.0, 100.0 * (busy1 - busy0) / 1000.0 / dt))
+        if None not in (weight0, weight1):
+            # weighted_ms / elapsed_ms is the mean queue depth over the window
+            aqu = max(0.0, (weight1 - weight0) / 1000.0 / dt)
         if psi0 is not None and psi1 is not None:
             stall = min(100.0, max(0.0, 100.0 * (psi1 - psi0) / 1e6 / dt))
-        return {"util": util, "stall": stall,
+        return {"util": util, "stall": stall, "aqu": aqu,
                 "dirty_mb": None if dirty is None else dirty / 1e6}
 
 
 def window_means(hist):
     """Mean of each signal over the samples collected so far."""
     out = {}
-    for key in ("util", "stall", "dirty_mb"):
+    for key in ("util", "stall", "aqu", "dirty_mb"):
         vals = [h[key] for h in hist]
         out[key] = None if any(v is None for v in vals) else sum(vals) / len(vals)
     return out
@@ -291,10 +312,13 @@ def window_means(hist):
 def drain_reasons(args, mean):
     """Which signals say the disk is still working, using window means."""
     why = []
+    queue_max = getattr(args, "drain_queue_max", 0) or 0
+    if queue_max > 0 and mean["aqu"] is not None and mean["aqu"] > queue_max:
+        why.append(f"queue {mean['aqu']:.1f} deep")
     if mean["util"] is not None and mean["util"] > args.disk_busy_threshold:
         why.append(f"disk {mean['util']:.0f}% busy")
     if mean["stall"] is not None and mean["stall"] > args.io_wait_threshold:
-        why.append(f"{mean['stall']:.0f}% io stall")
+        why.append(f"{mean['stall']:.0f}% root io stall")
     if args.drain_dirty_mb > 0 and mean["dirty_mb"] is not None \
             and mean["dirty_mb"] > args.drain_dirty_mb:
         why.append(f"{mean['dirty_mb']:.0f} MB unflushed")
@@ -302,20 +326,18 @@ def drain_reasons(args, mean):
 
 
 def wait_for_drain(args, sampler, cooldown=True):
-    """Gate a merge burst until the disk has been quiet for a while.
+    """Gate a merge burst until the disk has caught up and stayed caught up.
 
-    Every signal is averaged over --drain-window seconds (15 by default).  A
-    one-second sample is far too short to judge saturation: with recordings
-    running on the same spindle, the page cache flushes in sub-second bursts
-    and single-second stall samples routinely reach 80-95% while the disk is
-    only a few percent busy and the throughput is trivial.  Judging those
-    samples made the gate fire on noise, and because a quiet second was easy
-    to find a moment later it also let a genuinely saturated disk through.
+    The signals are means over ``--drain-window`` seconds rather than single
+    samples, because a one-second sample of this drive routinely reads 80-95%
+    busy from a single page-cache flush while the drive is only a few percent
+    utilised over the same minute.
 
-    The window mean also gives the property the gate actually needs: after a
-    burst, the burst stays inside the window until the kernel has flushed the
-    dirty pages it created, so the gate cannot restart work while the backlog
-    it produced is still being written.
+    "Caught up" is judged from the device and the page cache, not from PSI.
+    PSI ``full`` is reported for the cgroup it is read from, and
+    ``/proc/pressure/io`` is the root cgroup, where it is dominated by kernel
+    writeback threads that blk-wbt throttles on purpose: it reads 50-100% for
+    as long as any writeback is in flight, so gating on it waits forever.
 
     Returns False when the disk is still busy after --io-wait-max and the mode
     says to stop rather than pile another burst onto the backlog.
@@ -327,9 +349,10 @@ def wait_for_drain(args, sampler, cooldown=True):
     tick = max(0.2, args.drain_sample)
     depth = max(2, int(round(max(tick, args.drain_window) / tick)))
     hist = deque(maxlen=depth)
-    deadline = time.monotonic() + args.io_wait_max
+    started = time.monotonic()
+    deadline = started + args.io_wait_max
     quiet_since = None
-    notified = False
+    notified = 0.0
     sampler.prime()
     while time.monotonic() < deadline:
         hist.append(sampler.read(tick))
@@ -345,11 +368,14 @@ def wait_for_drain(args, sampler, cooldown=True):
                 return True
             continue
         quiet_since = None
-        if not notified:
-            print(f"  waiting for disk ({', '.join(why)}; {args.drain_window:.0f}s mean), "
-                  f"up to {args.io_wait_max:.0f}s")
-            notified = True
-    mean = window_means(hist) if hist else {"util": None, "stall": None, "dirty_mb": None}
+        now = time.monotonic()
+        if not notified or now - notified >= 15.0:
+            lead = "waiting for disk" if not notified else "still waiting"
+            print(f"  {lead} ({', '.join(why)}; {args.drain_window:.0f}s mean, "
+                  f"{now - started:.0f}s so far, limit {args.io_wait_max:.0f}s)")
+            notified = now
+    mean = window_means(hist) if hist else \
+        {"util": None, "stall": None, "aqu": None, "dirty_mb": None}
     why = drain_reasons(args, mean)
     if not why:
         # Ran out of time while the window was still filling, but everything in
@@ -1117,25 +1143,28 @@ def run_repair(args, active_paths, now):
 
 MODES = {
     # mode      io cap  weight  nice  class  jobs cooldown wait  stall% busy%  dirty   timeout
-    # stall%/busy% are compared against means over a --drain-window long window
-    # (15s).  Measured on this host with recordings writing at ~1.4 MB/s and no
-    # merge running: 15s-mean stall peaks at 12.5% and 15s-mean busy at 15%.
-    # One-second samples of the same quiet state peak at 86% stall / 97% busy,
-    # so a single-sample threshold cannot tell idle from saturated.
+    # stalled/busy are compared against means over a --drain-window long window.
+    # PSI (io_wait_threshold) is off by default: root-cgroup io pressure is
+    # dominated by kernel writeback threads throttled by blk-wbt and reads
+    # 50-100% whenever any writeback is in flight, so it cannot be thresholded.
+    # The gate uses average queue depth (drain_queue_max) and the unflushed
+    # backlog instead.  Measured on this host: idle between groups reads
+    # queue 0.0 / busy 0% / dirty <70 MB; while merging, queue 3-13 / busy
+    # 60-100% / dirty 400-500 MB.
     "max": dict(io_rate="0", io_weight=1000, nice=0, io_class="best-effort", jobs=8,
                 cooldown=0.0, io_wait_max=0.0, io_wait_threshold=100.0,
-                disk_busy_threshold=100.0, drain_dirty_mb=0.0,
-                drain_window=15.0, drain_quiet=5.0,
+                disk_busy_threshold=100.0, drain_dirty_mb=0.0, drain_queue_max=0.0,
+                drain_window=5.0, drain_quiet=3.0,
                 drain_timeout_action="proceed"),
     "balanced": dict(io_rate="90M", io_weight=100, nice=10, io_class="best-effort", jobs=1,
-                     cooldown=5.0, io_wait_max=120.0, io_wait_threshold=25.0,
-                     disk_busy_threshold=40.0, drain_dirty_mb=256.0,
-                     drain_window=15.0, drain_quiet=5.0,
+                     cooldown=5.0, io_wait_max=120.0, io_wait_threshold=100.0,
+                     disk_busy_threshold=60.0, drain_dirty_mb=256.0, drain_queue_max=1.5,
+                     drain_window=5.0, drain_quiet=3.0,
                      drain_timeout_action="proceed"),
     "reserved": dict(io_rate="40M", io_weight=10, nice=19, io_class="idle", jobs=1,
-                     cooldown=30.0, io_wait_max=600.0, io_wait_threshold=15.0,
-                     disk_busy_threshold=20.0, drain_dirty_mb=64.0,
-                     drain_window=15.0, drain_quiet=5.0,
+                     cooldown=30.0, io_wait_max=600.0, io_wait_threshold=100.0,
+                     disk_busy_threshold=30.0, drain_dirty_mb=64.0, drain_queue_max=0.7,
+                     drain_window=8.0, drain_quiet=5.0,
                      drain_timeout_action="stop"),
 }
 
@@ -1200,17 +1229,20 @@ def main():
     adv.add_argument("--io-wait-max", type=float, default=None,
                      help="max seconds to wait for the disk to drain before each group; 0 disables")
     adv.add_argument("--io-wait-threshold", type=float, default=None,
-                     help="io stall percent considered drained; compared against a --drain-window mean")
+                     help="root-cgroup io stall percent considered drained; 100 disables "
+                          "(default: disabled, see --drain-queue-max)")
     adv.add_argument("--disk-busy-threshold", type=float, default=None,
                      help="device busy percent considered drained; compared against a --drain-window mean")
+    adv.add_argument("--drain-queue-max", type=float, default=None,
+                     help="average device queue depth considered drained (the main gate); 0 disables")
     adv.add_argument("--drain-dirty-mb", type=float, default=None,
                      help="dirty+writeback megabytes still owed to the disk that counts as busy; 0 ignores")
     adv.add_argument("--drain-sample", type=float, default=1.0,
                      help="seconds per sample when checking for drain (default 1)")
     adv.add_argument("--drain-window", type=float, default=None,
-                     help="seconds of samples averaged before judging the disk (default 15)")
+                     help="seconds of samples averaged before judging the disk (default 5)")
     adv.add_argument("--drain-quiet", type=float, default=None,
-                     help="seconds the averaged signals must stay under the thresholds (default 5)")
+                     help="seconds the averaged signals must stay under the thresholds (default 3)")
     adv.add_argument("--drain-timeout-action", choices=["proceed", "stop"], default=None,
                      help="what to do when the disk is still busy after --io-wait-max")
     adv.add_argument("--io-device", default=None,
@@ -1248,17 +1280,23 @@ def main():
         def mb(v):
             return "n/a" if v is None else f"{v:.0f} MB"
 
+        def num(v, fmt="{:.1f}"):
+            return "n/a" if v is None else fmt.format(v)
+
         print(f"mode: {args.mode}  (io cap {args.io_rate or 'off'}, weight {args.io_weight}, jobs {args.jobs})")
         print(f"device: {dev}  [{', '.join(f'{a}:{b}' for a, b in devs) or 'no block device'}]")
         ensure_io_scope(args)
         print(f"scope: {'active' if args.io_scope else 'unavailable (nice/ionice only)'}")
-        print(f"now ({tick:.0f}s): busy {pct(st['util'])}   stall {pct(st['stall'])}   "
-              f"unflushed {mb(st['dirty_mb'])}")
-        print(f"mean ({args.drain_window:.0f}s): busy {pct(mean['util'])}   stall {pct(mean['stall'])}   "
-              f"unflushed {mb(mean['dirty_mb'])}")
-        print(f"gate: quiet when {args.drain_window:.0f}s-mean busy < {args.disk_busy_threshold:.0f}%, "
-              f"stall < {args.io_wait_threshold:.0f}%, unflushed < {args.drain_dirty_mb:.0f} MB "
-              f"for {args.drain_quiet:.0f}s (wait {args.io_wait_max:.0f}s)")
+        print(f"now ({tick:.0f}s): busy {pct(st['util'])}   queue {num(st['aqu'])}   "
+              f"stall {pct(st['stall'])}   unflushed {mb(st['dirty_mb'])}")
+        print(f"mean ({args.drain_window:.0f}s): busy {pct(mean['util'])}   queue {num(mean['aqu'])}   "
+              f"stall {pct(mean['stall'])}   unflushed {mb(mean['dirty_mb'])}")
+        print(f"gate: quiet when {args.drain_window:.0f}s-mean queue < {args.drain_queue_max:g}, "
+              f"busy < {args.disk_busy_threshold:.0f}%, "
+              f"unflushed < {args.drain_dirty_mb:.0f} MB for {args.drain_quiet:.0f}s "
+              f"(wait {args.io_wait_max:.0f}s)")
+        print("stall is the root cgroup's io pressure: kernel writeback threads "
+              "dominate it, so it is reported but not gated on")
         return 0
 
     du = shutil.disk_usage(args.dir)
@@ -1269,8 +1307,9 @@ def main():
 
     print(f"mode: {args.mode}  (io cap {args.io_rate or 'off'} x2, weight {args.io_weight}, "
           f"jobs {args.jobs}, cooldown {args.cooldown:.0f}s, "
-          f"drain {args.io_wait_max:.0f}s @ <{args.disk_busy_threshold:.0f}% busy/"
-          f"<{args.io_wait_threshold:.0f}% stall, {args.drain_window:.0f}s mean)")
+          f"drain {args.io_wait_max:.0f}s @ queue <{args.drain_queue_max:g}, "
+          f"busy <{args.disk_busy_threshold:.0f}%, "
+          f"unflushed <{args.drain_dirty_mb:.0f} MB, {args.drain_window:.0f}s mean)")
 
     now = datetime.now().timestamp()
     active_paths = None

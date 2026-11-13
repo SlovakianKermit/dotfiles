@@ -124,14 +124,15 @@ Each preset fills in every pacing knob below; any knob given explicitly on the
 command line still wins.
 .TP
 .B \-\-status
-Print the measured disk busy percentage, io stall percentage, unflushed
-(\fIDirty\fR + \fIWriteback\fR) megabytes, the detected device, whether the
-bandwidth cap can be applied, and the thresholds of the active mode, then exit
-without merging. Both a one\-second sample and the
+Print the measured disk busy percentage, average queue depth, io stall
+percentage, unflushed (\fIDirty\fR + \fIWriteback\fR) megabytes, the detected
+device, whether the bandwidth cap can be applied, and the thresholds of the
+active mode, then exit without merging. Both a one\-second sample and the
 .B \-\-drain\-window
-mean are shown; the mean is what the gate acts on and what a monitoring
-dashboard normally plots. Useful for answering "is the disk busy right now and
-why".
+mean are shown; the mean is what the gate acts on. The stall figure is reported
+but not gated on (see
+.BR \-\-io\-wait\-threshold ).
+Useful for answering "is the disk busy right now and why".
 .TP
 .B \-\-dir \fIDIR\fR
 Base directory to scan. Defaults to
@@ -239,33 +240,53 @@ counter in
 .B /proc/pressure/io
 over the sample window rather than from
 .BR avg10 .
-The cumulative form is deliberate:
-.B avg10
-is a decaying average and reads 0 the moment a burst pauses, even while
-hundreds of megabytes of dirty pages are still owed to the disk.
 .P
-The value is compared against a mean over
-.BR \-\-drain\-window
-seconds, not against a single sample. On a host that is also recording, the
-page cache flushes in sub\-second bursts, so single one\-second samples
-routinely read 80\-95% stall while the drive is only a few percent busy; only
-the window mean separates a spike from saturation. Where recordings alone
-produce a 15\-second mean of about 6% (peaking near 12%), and a merge that
-saturates the drive holds 60% or more, the threshold sits well clear of the
-noise on both sides. Defaults to 25
-under
+Disabled by default (100), because of which cgroup the number describes. PSI is
+per cgroup, and
+.B /proc/pressure/io
+is the
+.I root
+cgroup. On a host whose disks are throttled by blk-wbt, root
+.B full
+is dominated by kernel writeback threads parked in
+.B rq_qos_wait
+and by
+.BR jbd2 ;
+it reads 50\-100% for as long as any writeback is in flight. Measured on this
+host during a merge: root 55%, system.slice 50%, user.slice 8%, and the ctbrec
+container that a monitoring dashboard usually graphs 0%. Gating on it waits
+forever for a disk that is already idle, so the default gate uses
+.B \-\-drain\-queue\-max
+and
+.B \-\-drain\-dirty\-mb
+instead. Set it explicitly on hosts where root io pressure tracks something
+useful.
+.TP
+.B \-\-drain\-queue\-max \fIDEPTH\fR
+Average device queue depth considered drained, from the write\-weighted io time
+in
+.BR /proc/diskstats ,
+compared against a
+.B \-\-drain\-window
+mean. This is the primary gate. Busy percentage alone cannot separate "the
+drive is working" from "the drive is backed up" \-\- on a seek\-penalised SMR
+drive busy pins at 100% as soon as one request is queued \-\- but queue depth
+does: idle between groups measures 0.0, a single sequential reader about 3.6,
+and a merging run 3\-13. Defaults to 1.5 under
 .BR balanced ,
-15 under
-.BR reserved .
+0.7 under
+.BR reserved ,
+0 (ignored) under
+.BR max .
 .TP
 .B \-\-disk\-busy\-threshold \fIPERCENT\fR
 Device busy percentage (from
 .BR /proc/diskstats )
 considered drained, also compared against a
 .B \-\-drain\-window
-mean. Defaults to 40 under
+mean. Defaults to 60 under
 .BR balanced ,
-20 under
+30 under
 .BR reserved ,
 100 (ignored) under
 .BR max .
@@ -291,16 +312,20 @@ Interval between samples while checking for drain. Defaults to
 .TP
 .B \-\-drain\-window \fISECONDS\fR
 Length of the window whose mean the drain gate judges. Every sample comes from
-a counter delta divided by the elapsed time, so a long window is exact rather
-than smoothed, and it has a useful side effect: the burst just finished stays
-inside the window until the kernel has flushed the pages it created, so the gate
-cannot start the next burst on top of its own backlog. Defaults to
-.BR 15 .
+a counter delta divided by the elapsed time, so the mean is exact rather than
+smoothed, and it has a useful side effect: the burst just finished stays inside
+the window until the kernel has flushed the pages it created, so the gate cannot
+start the next burst on top of its own backlog. Defaults to
+.BR 5 ,
+8 under
+.BR reserved .
 .TP
 .B \-\-drain\-quiet \fISECONDS\fR
 How long the averaged signals must stay under the thresholds before a burst
 starts. Defaults to
-.BR 5 .
+.BR 3 ,
+5 under
+.BR reserved .
 .TP
 .B \-\-drain\-timeout\-action \fI\,proceed|stop\/\fR
 What to do when the disk is still busy after
@@ -478,16 +503,18 @@ seconds or
 .B \-\-io\-wait\-max
 expires. "Quiet" means the mean over
 .B \-\-drain\-window
-seconds of device busy is below
+seconds of the device queue depth is below
+.BR \-\-drain\-queue\-max ,
+device busy is below
 .BR \-\-disk\-busy\-threshold ,
-io stall is below
-.BR \-\-io\-wait\-threshold ,
 and unflushed data is below
 .BR \-\-drain\-dirty\-mb ;
-all three must agree. The mean, rather than the latest sample, is what makes
-the gate trustworthy: with recordings running, one\-second samples of an almost
-idle drive still spike past 80% every time the page cache flushes, so a
-single\-sample gate both blocked on nothing and resumed during real saturation.
+all three must agree. Queue depth rather than busy percentage is the primary
+test because busy pins at 100% on this drive as soon as a single request is
+queued, while queue depth separates "working" (0.0 idle, 3.6 for one sequential
+reader) from "backed up" (3\-13 while merging). The window mean rather than the
+latest sample is what makes it trustworthy, since one\-second samples of an
+almost idle drive still spike past 80% on every page\-cache flush.
 When it never gets quiet the mode decides between starting anyway and stopping
 the run, except that
 .B proceed
