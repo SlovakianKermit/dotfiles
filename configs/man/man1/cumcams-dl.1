@@ -1,25 +1,24 @@
 .TH CUMCAMS-DL 1 "2026-11-13" "cumcams-dl" "User Commands"
 .SH NAME
-cumcams-dl \- download a cumcams.cc video over HLS, split across CDN edge nodes
+cumcams-dl \- download cumcams.cc videos over HLS, queueing several at once
 .SH SYNOPSIS
 .B cumcams-dl
 [\fIOPTIONS\fR]
 \fIURL\fR
+[\fIURL\fR...]
 .P
 .B cumcams-dl
-\fB\-o\fR \fIDIR\fR
-\fB\-n\fR \fINAME\fR
-\fIhttps://cumcams.cc/video/\fR\fIID\fR\fB/play\fR
+\fB\-f\fR \fIFILE\fR
+[\fB\-P\fR \fIN\fR]
+[\fIOPTIONS\fR]
 .SH DESCRIPTION
 .B cumcams-dl
-downloads an archived show from
+downloads archived shows from
 .BR cumcams.cc ,
 which exposes only an HLS
 .I index.m3u8
 playlist rather than a progressive file.
-A two hour recording is roughly 3900 two-second segments, so a serial
-downloader spends most of its time on connection setup and ends up far below
-the available bandwidth.
+A two hour recording is roughly 3900 two-second segments.
 .P
 The tool walks the same anonymous chain the web player uses: the video page
 supplies a
@@ -32,66 +31,69 @@ returns the player HTML, and that HTML contains a signed
 URL.
 No account, cookie file, or clearance token is required.
 .P
-The segment list is then split into chunks, fetched with
-.BR yt-dlp (1)
-and
-.BR \-N ,
+Segments are fetched in chunks with
+.BR yt\-dlp (1),
 and the finished chunks are concatenated and remuxed to Matroska by
 .BR ffmpeg (1)
 without re-encoding.
-Sustained throughput is capped at about 2 MB/s per client IP, so a two hour
-recording takes somewhere near an hour no matter which client is used.
-.P
-Chunks are kept in a work directory keyed by video id, so an interrupted run
-resumes at the first missing chunk rather than starting over.
-The signed stream URL expires after roughly eighty minutes; because the
-script resolves a fresh one on every invocation, a re-run simply works.
+Throughput is capped at about 2 MB/s per video, so a two hour recording takes
+somewhere near twenty minutes per video and videos downloaded together run in
+parallel rather than competing.
 .SH OPTIONS
 .TP
+.BI \-f " FILE"
+Read URLs from
+.IR FILE ,
+one per line. Blank lines and lines starting with
+.B #
+are ignored. Duplicates against the positional URLs are dropped.
+.TP
+.BI \-P " N"
+Download
+.I N
+videos at once. Default:
+.BR 2 .
+This is the main throughput lever: the 2 MB/s ceiling applies per video, so
+two videos roughly double the aggregate rate (measured 3.47 MB/s across two,
+against 2.05 MB/s for one). Values above three are untested.
+.TP
 .BI \-o " DIR"
-Output directory for the finished file. Default:
+Output directory for finished files. Default:
 .IR ~/Videos/cumcams .
 .TP
 .BI \-n " NAME"
-Output basename, without extension. Default: derived from the stream path,
-e.g.\&
+Output basename, without extension. Only valid with a single URL; with several
+names are derived from each stream path, e.g.\&
 .IR nana_stolass_2026-09-29_13-16 .
 .TP
 .BI \-j " N"
-Concurrent fragments, passed to
+Concurrent fragments per video, passed to
 .BR yt\-dlp " \-N" .
 Default:
 .BR 2 .
-Sustained throughput is capped per client IP at about 2 MB/s regardless of
-this value: runs with
+This does little: runs at
 .BR \-N " 1, 2 and 4"
-all measured 2.05 MB/s.
-Raising it therefore buys nothing and only increases the chance of tripping
-the connection shield described under
+all measured about 2.05 MB/s per video. Raising it only increases the chance
+of tripping the connection shield described under
 .BR BEHAVIOUR .
 .TP
 .BI \-\-nodes " N"
-Number of edge nodes to spread across. Default:
+Edge nodes to spread each video across. Default:
 .BR 1 ,
-which is correct for this CDN.
-Raising it only helps during the short burst allowance that follows an idle
-period, and costs nothing to try when a download is already running cold.
+which is correct for this CDN. Raising it only helps during the short burst
+allowance that follows an idle period.
 .TP
 .BI \-\-chunk\-size " N"
 Segments per chunk. Default:
 .BR 100 ,
 about three and a half minutes of video. Keep this small: the connection
-shield described under
-.B BEHAVIOUR
-can cut a transfer at any moment, and this is the amount of work a single cut
-can throw away. Smaller chunks cost more
-.BR yt\-dlp
-invocations but lose less.
+shield can cut a transfer at any moment, and this is the amount of work a
+single cut throws away.
 .TP
 .BI \-\-max\-segments " N"
 Download only the first
 .I N
-segments. Default
+segments of each video. Default
 .B 0
 means the whole stream. Useful for a smoke test.
 .TP
@@ -117,7 +119,7 @@ files in the work directory and skip the
 concat and remux.
 .TP
 .B \-v, \-\-verbose
-Print the resolved stream URL and the page title.
+Print each resolved stream URL and page title.
 .TP
 .B \-V, \-\-version
 Print the version and exit.
@@ -126,11 +128,16 @@ Print the version and exit.
 Show a short help message and exit.
 .SH BEHAVIOUR
 .SS The 2 MB/s ceiling, and why a browser is unaffected
-Sustained download throughput from these edge nodes is capped at roughly
-2.0 MB/s per client IP, and the cap is flat: one, two and four concurrent
-fragments all measured 2.05 MB/s.
-Short bursts are much faster than that, which is why a single segment can
-appear to arrive at 5 MB/s while a long run settles at 2.
+Sustained download throughput is capped at roughly 2 MB/s
+.B per video
+and is flat within a video: one, two and four concurrent fragments all
+measured about 2.05 MB/s.
+Two separate videos measured 3.47 MB/s combined, and two processes pulling the
+same video split the same 2 MB/s between them, so the budget follows the
+stream rather than the socket.
+.P
+Short bursts are faster than the sustained rate, which is why a single
+segment can appear to arrive at 5 MB/s while a long run settles at 2.
 .P
 The same CDN drops
 .I new
@@ -139,24 +146,34 @@ short window; the client sees this as
 .IR "No route to host" .
 Connections that are already established are not affected.
 This is why the web player keeps working while a downloader stalls: playback
-needs about 1 MB/s against a 2 MB/s cap, and the player holds one long-lived
-connection instead of opening a fresh one per segment.
-A request that is already streaming is safe; a request that has to connect
-during the window is not.
-
-.SS The User-Agent requirement
-The CDN answers 404 to any User-Agent that is not a current Linux Chrome
-string, including
-.BR yt\-dlp 's
-own default.
-.B cumcams-dl
-therefore sends that string on every request it makes and passes it to
+needs about 1 MB/s against a 2 MB/s allowance, and the player holds one
+long-lived connection instead of opening a fresh one per segment.
+The shield is global to the client IP, so it applies across all videos at
+once; it is the per-video budget, not the shield, that makes queueing pay.
+.SS Queueing
+Every URL given on the command line, plus every URL in the
+.B \-\-file
+list, is a job.
+Up to
+.B \-\-parallel
+jobs run at the same time, each in its own thread with its own
 .BR yt\-dlp
-with
-.BR \-\-user\-agent .
-This is why a hand-written
-.B yt\-dlp
-command against the same URL fails.
+process, its own work directory, and its own 2 MB/s budget.
+A failed video does not stop the others; the exit status reports the failure
+and re-running the same command resumes only the missing chunks.
+.SS Resume
+Chunks are named
+.IR NAME .0000.ts ,
+.IR NAME .0001.ts ,
+and so on, inside
+.IR ${TMPDIR}/cumcams-dl-\fIID\fR .
+A chunk that is already complete is skipped, so re-running the same command
+continues where the previous run stopped, for every video in the queue.
+Work directories are removed once the remux succeeds unless
+.B \-\-keep\-chunks
+or
+.B \-\-no\-mux
+is given.
 .SS Edge node discovery
 The API returns one edge host such as
 .I vi5b.cdnhlscloud.com
@@ -166,26 +183,12 @@ When
 .B \-\-nodes
 is greater than one,
 .B cumcams-dl
-probes the sibling letters under the same prefix and keeps the ones that
-answer 200, so
+probes sibling letters under the same prefix and keeps the ones that answer
+200, so
 .I vi5a
 on
 .IR 92.246.93.19
 is added when reachable.
-.SS Resume
-Chunks are named
-.IR NAME .0000.ts ,
-.IR NAME .0001.ts ,
-and so on.
-A chunk whose file already exists and is larger than 1 KiB is skipped, so
-re-running the same command continues where the previous run stopped.
-Work directories live under
-.I ${TMPDIR}/cumcams-dl-\fIID\fR
-and are removed once the remux succeeds unless
-.B \-\-keep\-chunks
-or
-.B \-\-no\-mux
-is given.
 .SS Requirements
 .IP \(bu 2
 .BR yt\-dlp
@@ -206,43 +209,51 @@ Download a show with the defaults:
 cumcams-dl https://cumcams.cc/video/200367738/play
 .EE
 .P
-Send it somewhere else under a chosen name:
+Queue two shows, two at a time:
+.IP
+.EX
+cumcams-dl https://cumcams.cc/video/200367738/play \e
+    https://cumcams.cc/video/200031521/play
+.EE
+.P
+Queue everything in a list file, three at a time:
+.IP
+.EX
+cumcams-dl \-f ~/cams-todo.txt \-P 3
+.EE
+.P
+Send a single show somewhere else under a chosen name:
 .IP
 .EX
 cumcams-dl \-o ~/Videos/cams \-n nana-2026-09-29 \e
     https://cumcams.cc/video/200367738/play
 .EE
 .P
-Pull the first twenty minutes only, to check that the chain works:
+Pull the first minute of each video, to check that the chain works:
 .IP
 .EX
-cumcams-dl \-\-max\-segments 600 \-\-chunk\-size 300 \e
-    https://cumcams.cc/video/200367738/play
+cumcams-dl \-\-max\-segments 30 \-\-chunk\-size 30 \e
+    https://cumcams.cc/video/200367738/play \e
+    https://cumcams.cc/video/200031521/play
 .EE
 .P
 Recover from a CDN rate-limit: wait a few minutes, then re-run the identical
 command. Completed chunks are skipped.
 .IP
 .EX
-cumcams-dl https://cumcams.cc/video/200367738/play
-.EE
-.P
-Keep the raw chunks instead of remuxing, to inspect or re-cut them:
-.IP
-.EX
-cumcams-dl \-\-no\-mux \-\-keep\-chunks \e
-    https://cumcams.cc/video/200367738/play
+cumcams-dl \-f ~/cams-todo.txt
 .EE
 .SH EXIT STATUS
 .TP
 .B 0
-Success: the remux was written, or
+Success: every queue entry produced a file, or
 .B \-\-no\-mux
-left the chunks in place.
+left its chunks in place.
 .TP
 .B 1
 Failure: bad arguments, a dependency is missing, the page or API layout
-changed, the playlist is encrypted, or a chunk exhausted its attempts.
+changed, the playlist is encrypted, or at least one video exhausted its
+attempts.
 .TP
 .B 130
 Interrupted with SIGINT. Re-running the same command resumes.
@@ -252,17 +263,18 @@ Interrupted with SIGINT. Re-running the same command resumes.
 Default output directory.
 .TP
 .I ${TMPDIR}/cumcams-dl-\fIID\fR
-Work directory holding chunk playlists and intermediate
+Per-video work directory holding chunk playlists and intermediate
 .I .ts
 files.
 .SH SEE ALSO
 .BR yt\-dlp (1),
 .BR ffmpeg (1)
 .SH BUGS
-The per-IP 2 MB/s ceiling cannot be raised by any client setting; more
-concurrency does not help and can trip the connection shield.
-A fully uninterrupted run is therefore not achievable at present: expect
-interruptions, and let re-runs resume the remaining chunks.
+The per-video 2 MB/s ceiling cannot be raised by any client setting; only
+downloading more videos at once increases the aggregate.
+The connection shield is global to the client IP, so more parallel videos also
+mean more new connections, and enough of them will stall the whole queue for
+tens of seconds.
 Chunk-level resume is coarse: a chunk interrupted halfway is re-fetched from
 its first segment.
 Widevine or SAMPLE-AES protected playlists are refused rather than handled.

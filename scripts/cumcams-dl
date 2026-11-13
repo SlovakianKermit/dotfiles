@@ -320,105 +320,184 @@ def concat_chunks(chunks: list[Path], tmpdir: Path, dest: Path) -> None:
         raise Failure("ffmpeg concat failed: " + (proc.stderr.strip().splitlines() or ["?"])[-1])
 
 
+def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
+    """Download one video. Returns the finished file, or None with --no-mux."""
+    tag = f"[{page_url.rstrip('/').split('/')[-2]}]" if "/" in page_url else "[?]"
+
+    def say(msg: str) -> None:
+        log(f"{tag} {msg}")
+
+    say("resolving page")
+    title, m3u8, vid = resolve_chain(page_url)
+    if args.verbose:
+        say(f"title: {title}")
+        say(f"stream: {m3u8.split('?')[0]}")
+
+    name = args.name or build_name(m3u8, title)
+    tag = f"[{name}]"
+
+    segs, target = fetch_playlist(m3u8)
+    duration = len(segs) * target
+    say(f"{len(segs)} segments, {duration // 3600}h{duration % 3600 // 60:02d}m")
+    if args.max_segments and args.max_segments < len(segs):
+        segs = segs[: args.max_segments]
+        say(f"limiting to the first {len(segs)} segments")
+
+    primary = urlsplit(m3u8).netloc
+    if args.no_split or args.nodes <= 1:
+        hosts = [primary]
+    else:
+        hosts = sibling_hosts(primary, segs[0][1], args.nodes)
+    if len(hosts) > 1:
+        say("edge nodes: " + ", ".join(hosts))
+
+    work = Path(tempfile.gettempdir()) / f"cumcams-dl-{vid}"
+    work.mkdir(parents=True, exist_ok=True)
+    outdir = args.outdir.expanduser()
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    size = max(1, args.chunk_size)
+    chunks = [segs[i:i + size] for i in range(0, len(segs), size)]
+    say(f"{len(chunks)} chunk{'s' if len(chunks) != 1 else ''} of up to {size} segments")
+
+    results: dict[int, Path] = {}
+    errors: list[str] = []
+    lock = threading.Lock()
+
+    def worker(host: str, indices: list[int]) -> None:
+        for idx in indices:
+            pl = work / f"{name}.{idx:04d}.m3u8"
+            dest = work / f"{name}.{idx:04d}.ts"
+            write_playlist(pl, chunks[idx], target, host)
+            try:
+                run_chunk(pl, dest, args.jobs, page_url, args.attempts,
+                          f"chunk {idx + 1}/{len(chunks)}")
+                with lock:
+                    results[idx] = dest
+            except Failure as exc:
+                with lock:
+                    errors.append(str(exc))
+
+    groups = {h: list(range(len(chunks)))[i::len(hosts)] for i, h in enumerate(hosts)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+        futures = [pool.submit(worker, h, idxs) for h, idxs in groups.items() if idxs]
+        for fut in concurrent.futures.as_completed(futures):
+            fut.result()
+
+    if errors:
+        raise Failure(f"{len(errors)} chunk(s) failed; re-run to resume:\n  " + "\n  ".join(errors))
+
+    ordered = [results[i] for i in range(len(chunks))]
+    if args.no_mux:
+        say(f"chunks left in {work}")
+        return None
+
+    dest = outdir / f"{name}.mkv"
+    say(f"concatenating {len(ordered)} chunks -> {dest}")
+    concat_chunks(ordered, work, dest)
+    say(f"done: {dest} ({human(dest.stat().st_size)})")
+
+    if not args.keep_chunks:
+        for c in ordered:
+            c.unlink(missing_ok=True)
+        for pl in work.glob("*.m3u8"):
+            pl.unlink(missing_ok=True)
+        (work / "concat.txt").unlink(missing_ok=True)
+        try:
+            work.rmdir()
+        except OSError:
+            pass
+    return dest
+
+
+def collect_urls(args: argparse.Namespace) -> list[str]:
+    urls = list(args.urls)
+    if args.file:
+        try:
+            lines = Path(args.file).expanduser().read_text().splitlines()
+        except OSError as exc:
+            raise Failure(f"cannot read {args.file}: {exc.strerror}")
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+    seen: set[str] = set()
+    unique = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    if not unique:
+        raise Failure("no URLs to download")
+    return unique
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="cumcams-dl",
-        description="Download a cumcams.cc video over HLS, split across CDN edge nodes.",
+        description="Download cumcams.cc videos over HLS.",
         epilog="Example: cumcams-dl https://cumcams.cc/video/200367738/play",
     )
-    ap.add_argument("url", help="video page URL, e.g. https://cumcams.cc/video/<id>/play")
-    ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_OUT, help=f"output directory (default: {DEFAULT_OUT})")
-    ap.add_argument("-n", "--name", help="output basename (default: derived from the stream path)")
-    ap.add_argument("-j", "--jobs", type=int, default=2, help="concurrent fragments (default: 2)")
-    ap.add_argument("--nodes", type=int, default=1, help="edge nodes to spread across (default: 1)")
-    ap.add_argument("--chunk-size", type=int, default=100, help="segments per chunk (default: 100)")
-    ap.add_argument("--max-segments", type=int, default=0, help="stop after N segments; 0 means all (smoke test)")
-    ap.add_argument("--attempts", type=int, default=6, help="tries per chunk (default: 6)")
-    ap.add_argument("--no-split", action="store_true", help="single edge node, one worker")
-    ap.add_argument("--keep-chunks", action="store_true", help="keep the per-chunk .ts files")
-    ap.add_argument("--no-mux", action="store_true", help="do not concat/remux; leave chunks in place")
-    ap.add_argument("-v", "--verbose", action="store_true", help="print the resolved stream URL")
+    ap.add_argument("urls", nargs="*", metavar="URL",
+                    help="video page URL, e.g. https://cumcams.cc/video/<id>/play")
+    ap.add_argument("-f", "--file", type=Path,
+                    help="read URLs from FILE, one per line; # starts a comment")
+    ap.add_argument("-P", "--parallel", type=int, default=2,
+                    help="videos to download at once (default: 2)")
+    ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_OUT,
+                    help=f"output directory (default: {DEFAULT_OUT})")
+    ap.add_argument("-n", "--name",
+                    help="output basename; only valid with a single URL")
+    ap.add_argument("-j", "--jobs", type=int, default=2,
+                    help="concurrent fragments per video (default: 2)")
+    ap.add_argument("--nodes", type=int, default=1,
+                    help="edge nodes per video (default: 1)")
+    ap.add_argument("--chunk-size", type=int, default=100,
+                    help="segments per chunk (default: 100)")
+    ap.add_argument("--max-segments", type=int, default=0,
+                    help="stop after N segments; 0 means all (smoke test)")
+    ap.add_argument("--attempts", type=int, default=6,
+                    help="tries per chunk (default: 6)")
+    ap.add_argument("--no-split", action="store_true",
+                    help="single edge node, one worker")
+    ap.add_argument("--keep-chunks", action="store_true",
+                    help="keep the per-chunk .ts files")
+    ap.add_argument("--no-mux", action="store_true",
+                    help="do not concat/remux; leave chunks in place")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="print the resolved stream URL")
     ap.add_argument("-V", "--version", action="version", version=f"cumcams-dl {VERSION}")
     args = ap.parse_args(argv)
 
     try:
+        urls = collect_urls(args)
+        if args.name and len(urls) > 1:
+            raise Failure("--name only makes sense with a single URL")
         check_deps(need_ffmpeg=not args.no_mux)
 
-        log("resolving video page")
-        title, m3u8, vid = resolve_chain(args.url)
-        if args.verbose:
-            log(f"title: {title}")
-            log(f"stream: {m3u8.split('?')[0]}")
-        if vid not in m3u8 and args.verbose:
-            log("note: video id does not appear in the stream path")
+        log(f"{len(urls)} video(s), {args.parallel} at a time")
+        failures: list[tuple[str, str]] = []
+        done: list[Path] = []
 
-        name = args.name or build_name(m3u8, title)
-        segs, target = fetch_playlist(m3u8)
-        duration = len(segs) * target
-        log(f"{name}: {len(segs)} segments, {duration // 3600}h{duration % 3600 // 60:02d}m, target {target}s")
-        if args.max_segments and args.max_segments < len(segs):
-            segs = segs[: args.max_segments]
-            log(f"limiting to the first {len(segs)} segments")
-
-        primary = urlsplit(m3u8).netloc
-        hosts = [primary] if args.no_split or args.nodes <= 1 else sibling_hosts(primary, segs[0][1], args.nodes)
-        log("edge nodes: " + ", ".join(hosts))
-
-        work = Path(tempfile.gettempdir()) / f"cumcams-dl-{vid}"
-        work.mkdir(parents=True, exist_ok=True)
-        outdir = args.outdir.expanduser()
-        outdir.mkdir(parents=True, exist_ok=True)
-
-        size = max(1, args.chunk_size)
-        chunks = [segs[i:i + size] for i in range(0, len(segs), size)]
-        log(f"{len(chunks)} chunk{'s' if len(chunks) != 1 else ''} of up to {size} segments")
-
-        results: dict[int, Path] = {}
-        errors: list[str] = []
-        lock = threading.Lock()
-
-        def worker(host: str, indices: list[int]) -> None:
-            for idx in indices:
-                pl = work / f"{name}.{idx:04d}.m3u8"
-                dest = work / f"{name}.{idx:04d}.ts"
-                write_playlist(pl, chunks[idx], target, host)
-                try:
-                    run_chunk(pl, dest, args.jobs, args.url, args.attempts, f"chunk {idx + 1}/{len(chunks)}")
-                    with lock:
-                        results[idx] = dest
-                except Failure as exc:
-                    with lock:
-                        errors.append(str(exc))
-
-        groups = {h: list(range(len(chunks)))[i::len(hosts)] for i, h in enumerate(hosts)}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
-            futures = [pool.submit(worker, h, idxs) for h, idxs in groups.items() if idxs]
+        workers = max(1, min(args.parallel, len(urls)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(process_video, u, args): u for u in urls}
             for fut in concurrent.futures.as_completed(futures):
-                fut.result()
+                url = futures[fut]
+                try:
+                    dest = fut.result()
+                except Failure as exc:
+                    failures.append((url, str(exc)))
+                    print(f"cumcams-dl: {url}: {exc}", file=sys.stderr)
+                else:
+                    if dest:
+                        done.append(dest)
 
-        if errors:
-            raise Failure(f"{len(errors)} chunk(s) failed; re-run to resume:\n  " + "\n  ".join(errors))
-
-        ordered = [results[i] for i in range(len(chunks))]
-        if args.no_mux:
-            log(f"chunks left in {work}")
-            return 0
-
-        dest = outdir / f"{name}.mkv"
-        log(f"concatenating {len(ordered)} chunks -> {dest}")
-        concat_chunks(ordered, work, dest)
-        log(f"done: {dest} ({human(dest.stat().st_size)})")
-
-        if not args.keep_chunks:
-            for c in ordered:
-                c.unlink(missing_ok=True)
-            for pl in work.glob("*.m3u8"):
-                pl.unlink(missing_ok=True)
-            (work / "concat.txt").unlink(missing_ok=True)
-            try:
-                work.rmdir()
-            except OSError:
-                pass
+        if done:
+            log(f"finished {len(done)} file(s) in {args.outdir.expanduser()}")
+        if failures:
+            log(f"{len(failures)} video(s) incomplete; re-run to resume")
+            return 1
         return 0
 
     except Failure as exc:
