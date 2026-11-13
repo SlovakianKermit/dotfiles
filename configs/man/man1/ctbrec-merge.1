@@ -127,7 +127,11 @@ command line still wins.
 Print the measured disk busy percentage, io stall percentage, unflushed
 (\fIDirty\fR + \fIWriteback\fR) megabytes, the detected device, whether the
 bandwidth cap can be applied, and the thresholds of the active mode, then exit
-without merging. Useful for answering "is the disk busy right now and why".
+without merging. Both a one\-second sample and the
+.B \-\-drain\-window
+mean are shown; the mean is what the gate acts on and what a monitoring
+dashboard normally plots. Useful for answering "is the disk busy right now and
+why".
 .TP
 .B \-\-dir \fIDIR\fR
 Base directory to scan. Defaults to
@@ -238,18 +242,30 @@ over the sample window rather than from
 The cumulative form is deliberate:
 .B avg10
 is a decaying average and reads 0 the moment a burst pauses, even while
-hundreds of megabytes of dirty pages are still owed to the disk. Defaults to 10
+hundreds of megabytes of dirty pages are still owed to the disk.
+.P
+The value is compared against a mean over
+.BR \-\-drain\-window
+seconds, not against a single sample. On a host that is also recording, the
+page cache flushes in sub\-second bursts, so single one\-second samples
+routinely read 80\-95% stall while the drive is only a few percent busy; only
+the window mean separates a spike from saturation. Where recordings alone
+produce a 15\-second mean of about 6% (peaking near 12%), and a merge that
+saturates the drive holds 60% or more, the threshold sits well clear of the
+noise on both sides. Defaults to 25
 under
 .BR balanced ,
-3 under
+15 under
 .BR reserved .
 .TP
 .B \-\-disk\-busy\-threshold \fIPERCENT\fR
 Device busy percentage (from
 .BR /proc/diskstats )
-considered drained. Defaults to 40 under
+considered drained, also compared against a
+.B \-\-drain\-window
+mean. Defaults to 40 under
 .BR balanced ,
-15 under
+20 under
 .BR reserved ,
 100 (ignored) under
 .BR max .
@@ -270,16 +286,32 @@ Defaults to 256 under
 .BR max .
 .TP
 .B \-\-drain\-sample \fISECONDS\fR
-Length of each measurement window when checking for drain. Defaults to
+Interval between samples while checking for drain. Defaults to
 .BR 1 .
+.TP
+.B \-\-drain\-window \fISECONDS\fR
+Length of the window whose mean the drain gate judges. Every sample comes from
+a counter delta divided by the elapsed time, so a long window is exact rather
+than smoothed, and it has a useful side effect: the burst just finished stays
+inside the window until the kernel has flushed the pages it created, so the gate
+cannot start the next burst on top of its own backlog. Defaults to
+.BR 15 .
+.TP
+.B \-\-drain\-quiet \fISECONDS\fR
+How long the averaged signals must stay under the thresholds before a burst
+starts. Defaults to
+.BR 5 .
 .TP
 .B \-\-drain\-timeout\-action \fI\,proceed|stop\/\fR
 What to do when the disk is still busy after
 .BR \-\-io\-wait\-max .
 .B proceed
-starts the burst anyway;
+starts the burst anyway, unless the page cache still owes more than
+.B \-\-drain\-dirty\-mb
+megabytes, in which case the run stops: that backlog is this tool's own unflushed
+output, and adding to it is what drove the disk to 100% for minutes;
 .B stop
-ends the run with the remaining groups left for the next one. Defaults to
+always ends the run with the remaining groups left for the next one. Defaults to
 .B proceed
 under
 .B max
@@ -440,17 +472,27 @@ that pins the disk at 100%": the group simply takes longer.
 Before a burst, and after any group that actually wrote output, the run
 sleeps
 .B \-\-cooldown
-seconds and then polls until the disk is quiet for two consecutive samples or
+seconds and then polls until every signal is quiet for
+.B \-\-drain\-quiet
+seconds or
 .B \-\-io\-wait\-max
-expires. "Quiet" means device busy below
+expires. "Quiet" means the mean over
+.B \-\-drain\-window
+seconds of device busy is below
 .BR \-\-disk\-busy\-threshold ,
-io stall below
+io stall is below
 .BR \-\-io\-wait\-threshold ,
-and unflushed data below
+and unflushed data is below
 .BR \-\-drain\-dirty\-mb ;
-all three must agree. When it never gets quiet the mode decides between
-starting anyway and stopping the run. Groups that write nothing are not paced,
-and
+all three must agree. The mean, rather than the latest sample, is what makes
+the gate trustworthy: with recordings running, one\-second samples of an almost
+idle drive still spike past 80% every time the page cache flushes, so a
+single\-sample gate both blocked on nothing and resumed during real saturation.
+When it never gets quiet the mode decides between starting anyway and stopping
+the run, except that
+.B proceed
+still stops if the unflushed backlog is its own. Groups that write nothing are
+not paced, and
 .B \-\-dry\-run
 never waits.
 .IP \(bu 2
