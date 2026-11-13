@@ -32,16 +32,15 @@ returns the player HTML, and that HTML contains a signed
 URL.
 No account, cookie file, or clearance token is required.
 .P
-The segment list is then split into chunks, spread across every reachable CDN
-edge node, and each node's chunks are handed to
+The segment list is then split into chunks, fetched with
 .BR yt-dlp (1)
-with
-.BR \-\-concurrent\-fragments .
-On the reference video the aggregate rate went from 2.0 MB/s with a single
-serial connection to about 4.0 MB/s across two edge nodes.
-The finished chunks are concatenated and remuxed to Matroska by
+and
+.BR \-N ,
+and the finished chunks are concatenated and remuxed to Matroska by
 .BR ffmpeg (1)
 without re-encoding.
+Sustained throughput is capped at about 2 MB/s per client IP, so a two hour
+recording takes somewhere near an hour no matter which client is used.
 .P
 Chunks are kept in a work directory keyed by video id, so an interrupted run
 resumes at the first missing chunk rather than starting over.
@@ -59,29 +58,35 @@ e.g.\&
 .IR nana_stolass_2026-09-29_13-16 .
 .TP
 .BI \-j " N"
-Concurrent fragments per edge node, passed to
-.BR yt\-dl " \-N" .
+Concurrent fragments, passed to
+.BR yt\-dlp " \-N" .
 Default:
-.BR 5 .
-Raising this past roughly five per node makes the CDN answer 429 and then drop
-the TCP connection for several minutes, which is slower overall.
+.BR 2 .
+Sustained throughput is capped per client IP at about 2 MB/s regardless of
+this value: runs with
+.BR \-N " 1, 2 and 4"
+all measured 2.05 MB/s.
+Raising it therefore buys nothing and only increases the chance of tripping
+the connection shield described under
+.BR BEHAVIOUR .
 .TP
 .BI \-\-nodes " N"
-Maximum number of edge nodes to spread across. Default:
-.BR 2 .
-With
-.B 1
-behaviour is the same as
-.BR \-\-no\-split .
+Number of edge nodes to spread across. Default:
+.BR 1 ,
+which is correct for this CDN.
+Raising it only helps during the short burst allowance that follows an idle
+period, and costs nothing to try when a download is already running cold.
 .TP
 .BI \-\-chunk\-size " N"
 Segments per chunk. Default:
 .BR 100 ,
-about three and a half minutes of video. Keep this small: the CDN starts
-blackholing the client IP after roughly 200 MB in a short window, so a chunk
-much larger than that can never finish in one go. Smaller chunks cost more
-.BR yt\-dl
-invocations but lose less work when the connection is cut.
+about three and a half minutes of video. Keep this small: the connection
+shield described under
+.B BEHAVIOUR
+can cut a transfer at any moment, and this is the amount of work a single cut
+can throw away. Smaller chunks cost more
+.BR yt\-dlp
+invocations but lose less.
 .TP
 .BI \-\-max\-segments " N"
 Download only the first
@@ -95,14 +100,6 @@ Attempts per chunk before giving up. Default:
 .BR 6 .
 Rate-limit and connection failures back off progressively, up to ten minutes
 per wait; a deterministic failure such as a malformed URL aborts immediately.
-.TP
-.BI \-\-pace " N"
-Sleep
-.I N
-seconds after each chunk completes. Default:
-.BR 0 .
-Use this to hold the average bitrate below the CDN's burst allowance when a
-full-speed run keeps getting cut off.
 .TP
 .B \-\-no\-split
 Use a single edge node and a single worker.
@@ -128,33 +125,53 @@ Print the version and exit.
 .B \-h, \-\-help
 Show a short help message and exit.
 .SH BEHAVIOUR
+.SS The 2 MB/s ceiling, and why a browser is unaffected
+Sustained download throughput from these edge nodes is capped at roughly
+2.0 MB/s per client IP, and the cap is flat: one, two and four concurrent
+fragments all measured 2.05 MB/s.
+Short bursts are much faster than that, which is why a single segment can
+appear to arrive at 5 MB/s while a long run settles at 2.
+.P
+The same CDN drops
+.I new
+TCP connection attempts for tens of seconds once too many are opened in a
+short window; the client sees this as
+.IR "No route to host" .
+Connections that are already established are not affected.
+This is why the web player keeps working while a downloader stalls: playback
+needs about 1 MB/s against a 2 MB/s cap, and the player holds one long-lived
+connection instead of opening a fresh one per segment.
+A request that is already streaming is safe; a request that has to connect
+during the window is not.
+
 .SS The User-Agent requirement
 The CDN answers 404 to any User-Agent that is not a current Linux Chrome
 string, including
-.BR yt\-dl 's
+.BR yt\-dlp 's
 own default.
 .B cumcams-dl
 therefore sends that string on every request it makes and passes it to
-.BR yt\-dl
+.BR yt\-dlp
 with
 .BR \-\-user\-agent .
 This is why a hand-written
-.B yt\-dl
+.B yt\-dlp
 command against the same URL fails.
 .SS Edge node discovery
 The API returns one edge host such as
 .I vi5b.cdnhlscloud.com
 on
 .IR 92.246.93.20 .
+When
+.B \-\-nodes
+is greater than one,
 .B cumcams-dl
 probes the sibling letters under the same prefix and keeps the ones that
 answer 200, so
 .I vi5a
 on
-.I 92.246.93.19
+.IR 92.246.93.19
 is added when reachable.
-Each edge carries its own throughput budget, which is where the second node
-helps.
 .SS Resume
 Chunks are named
 .IR NAME .0000.ts ,
@@ -171,7 +188,7 @@ or
 is given.
 .SS Requirements
 .IP \(bu 2
-.BR yt\-dl
+.BR yt\-dlp
 for the segment fetching.
 .IP \(bu 2
 .BR ffmpeg
@@ -239,13 +256,13 @@ Work directory holding chunk playlists and intermediate
 .I .ts
 files.
 .SH SEE ALSO
-.BR yt\-dl (1),
+.BR yt\-dlp (1),
 .BR ffmpeg (1)
 .SH BUGS
-The CDN blackholes the client IP for several minutes after roughly more than
-ten concurrent connections per edge node, so
-.B \-\-jobs
-cannot be used to force more throughput.
+The per-IP 2 MB/s ceiling cannot be raised by any client setting; more
+concurrency does not help and can trip the connection shield.
+A fully uninterrupted run is therefore not achievable at present: expect
+interruptions, and let re-runs resume the remaining chunks.
 Chunk-level resume is coarse: a chunk interrupted halfway is re-fetched from
 its first segment.
 Widevine or SAMPLE-AES protected playlists are refused rather than handled.

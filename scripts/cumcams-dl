@@ -329,12 +329,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("url", help="video page URL, e.g. https://cumcams.cc/video/<id>/play")
     ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_OUT, help=f"output directory (default: {DEFAULT_OUT})")
     ap.add_argument("-n", "--name", help="output basename (default: derived from the stream path)")
-    ap.add_argument("-j", "--jobs", type=int, default=5, help="concurrent fragments per edge node (default: 5)")
-    ap.add_argument("--nodes", type=int, default=2, help="max edge nodes to spread across (default: 2)")
+    ap.add_argument("-j", "--jobs", type=int, default=2, help="concurrent fragments (default: 2)")
+    ap.add_argument("--nodes", type=int, default=1, help="edge nodes to spread across (default: 1)")
     ap.add_argument("--chunk-size", type=int, default=100, help="segments per chunk (default: 100)")
     ap.add_argument("--max-segments", type=int, default=0, help="stop after N segments; 0 means all (smoke test)")
     ap.add_argument("--attempts", type=int, default=6, help="tries per chunk (default: 6)")
-    ap.add_argument("--pace", type=int, default=0, help="sleep N seconds after each chunk (default: 0)")
     ap.add_argument("--no-split", action="store_true", help="single edge node, one worker")
     ap.add_argument("--keep-chunks", action="store_true", help="keep the per-chunk .ts files")
     ap.add_argument("--no-mux", action="store_true", help="do not concat/remux; leave chunks in place")
@@ -390,8 +389,6 @@ def main(argv: list[str] | None = None) -> int:
                 except Failure as exc:
                     with lock:
                         errors.append(str(exc))
-                if args.pace:
-                    time.sleep(args.pace)
 
         groups = {h: list(range(len(chunks)))[i::len(hosts)] for i, h in enumerate(hosts)}
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
