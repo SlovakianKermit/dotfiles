@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""cumcams-dl - download a cumcams.cc video over its HLS stream, fast.
+
+The site only exposes an HLS `index.m3u8` for archived shows.  A two hour
+recording is roughly 3900 two-second segments, so a serial downloader spends
+most of its time on TCP and TLS setup and finishes in well over an hour.
+
+This tool walks the anonymous chain the web player uses:
+
+  page HTML  ->  `mid` cookie + `data-video-id` + `data-token`
+  GET /api/video/<id>?token=<token>  ->  player HTML
+  player HTML  ->  signed `index.m3u8` URL
+
+then splits the segment list across every reachable CDN edge node and hands
+each slice to yt-dlp with `--concurrent-fragments`.  On the reference video
+the aggregate went from 2.0 MB/s (single serial connection) to about
+4.0 MB/s (two edge nodes, five fragments each).
+
+Two details matter enough to be worth stating:
+
+* The CDN answers 404 to any User-Agent that is not a current Linux Chrome
+  string, including yt-dlp's default.  The UA below is applied to every
+  request, both ours and yt-dlp's.
+* The CDN returns 429 and then blackholes the TCP connection for a few
+  minutes when pushed past about five concurrent connections per edge node.
+  The default of five is deliberate; raising it makes downloads slower.
+
+Chunks are written to a work directory keyed by video id, so an interrupted
+run resumes at the first missing chunk instead of starting over.
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+import requests
+
+VERSION = "1.0.0"
+
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+)
+BASE = "https://cumcams.cc"
+DEFAULT_OUT = Path.home() / "Videos" / "cumcams"
+
+# The site sits behind a BunnyCDN shield that answers 403 to plain requests.
+# These are the headers a real navigation actually sends.
+PAGE_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+    "image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "sec-ch-ua": '"Chromium";v="141", "Not?A_Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Linux"',
+}
+
+EDGE_RE = re.compile(r"^(?P<prefix>vi\d+)(?P<letter>[a-z])\.cdnhlscloud\.com$")
+
+_print_lock = threading.Lock()
+
+
+class Failure(RuntimeError):
+    """A step of the download chain did not produce what it should have."""
+
+
+def log(msg: str) -> None:
+    with _print_lock:
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(n) < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GiB"
+
+
+def check_deps(need_ffmpeg: bool) -> None:
+    missing = [b for b in ("yt-dlp", *(("ffmpeg",) if need_ffmpeg else ())) if not shutil.which(b)]
+    if missing:
+        raise Failure("missing dependency: " + ", ".join(missing))
+
+
+def new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(PAGE_HEADERS)
+    return s
+
+
+def get(session: requests.Session, url: str, *, referer: str | None = None, xhr: bool = False, retries: int = 4) -> requests.Response:
+    """GET with the header set this CDN expects, retrying around shield 403s."""
+    headers = {}
+    if referer:
+        headers["Referer"] = referer
+    if xhr:
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["Accept"] = "text/html, */*; q=0.01"
+    last: Exception | str = "no attempt made"
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, headers=headers, timeout=30)
+        except requests.RequestException as exc:
+            last = str(exc)
+        else:
+            if r.status_code == 200:
+                return r
+            last = f"HTTP {r.status_code}"
+            if r.status_code not in (403, 429, 500, 502, 503, 504):
+                raise Failure(f"{last} for {url}")
+        if attempt < retries:
+            time.sleep(min(2 ** attempt, 20))
+    raise Failure(f"could not fetch {url}: {last}")
+
+
+def resolve_chain(page_url: str) -> tuple[str, str, str]:
+    """Return (title, m3u8_url, video_id) for a /video/<id>/play page."""
+    session = new_session()
+    page = get(session, page_url).text
+
+    title_m = re.search(r"<title>(.*?)</title>", page, re.S)
+    title = (title_m.group(1).strip() if title_m else "").replace("&amp;", "&")
+
+    vid_m = re.search(r'data-video-id="(\d+)"', page)
+    tok_m = re.search(r'data-token="([^"]+)"', page)
+    if not vid_m or not tok_m:
+        raise Failure("page did not contain data-video-id/data-token (layout changed?)")
+    vid, token = vid_m.group(1), tok_m.group(1)
+
+    api = f"{BASE}/api/video/{vid}?token={token}"
+    player = get(session, api, referer=page_url, xhr=True).text
+    if player.strip() == "wrong_token":
+        raise Failure("API rejected the token (page/API mismatch, retry)")
+
+    m = re.search(r"https?://[^\s\"'<>]*?\.m3u8[^\s\"'<>]*", player)
+    if not m:
+        raise Failure("player HTML did not contain an m3u8 URL")
+    return title, m.group(0).replace("&amp;", "&"), vid
+
+
+def fetch_playlist(url: str) -> tuple[list[tuple[str, str]], int]:
+    """Return ([(extinf, absolute_segment_url)], target_duration)."""
+    session = new_session()
+    body = get(session, url, referer=BASE + "/").text
+    if "#EXTM3U" not in body:
+        raise Failure("response was not an HLS playlist")
+
+    target = 2
+    tm = re.search(r"#EXT-X-TARGETDURATION:(\d+)", body)
+    if tm:
+        target = int(tm.group(1))
+    if "#EXT-X-KEY" in body:
+        raise Failure(
+            "playlist is encrypted (#EXT-X-KEY present); this tool assumes clear TS"
+        )
+
+    base_path = url.rsplit("/", 1)[0]
+    segs: list[tuple[str, str]] = []
+    extinf = f"#{target}.000"
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("#EXTINF"):
+            extinf = line
+        elif line and not line.startswith("#"):
+            segs.append((extinf, line if line.startswith("http") else f"{base_path}/{line}"))
+    if not segs:
+        raise Failure("playlist contained no segments")
+    return segs, target
+
+
+def sibling_hosts(primary: str, sample_url: str, limit: int) -> list[str]:
+    """Probe the other edge letters for the same prefix on the same path."""
+    host = urlsplit(primary).netloc or primary
+    m = EDGE_RE.match(host)
+    if not m:
+        return [host][:limit]
+
+    candidates = [host]
+    for letter in "abcdefg":
+        if letter != m.group("letter"):
+            candidates.append(f"{m.group('prefix')}{letter}.cdnhlscloud.com")
+
+    good: list[str] = []
+    for cand in candidates:
+        swapped = sample_url.replace(f"//{host}/", f"//{cand}/", 1)
+        try:
+            with requests.get(swapped, headers={"User-Agent": UA, "Referer": BASE + "/"}, timeout=10, stream=True) as r:
+                if r.status_code == 200:
+                    next(r.iter_content(1024), None)
+                    good.append(cand)
+        except requests.RequestException:
+            pass
+    if not good:
+        return [host]
+    return good[:limit]
+
+
+def write_playlist(path: Path, segs: list[tuple[str, str]], target: int, host: str) -> None:
+    src_host = urlsplit(segs[0][1]).netloc
+    out = [
+        "#EXTM3U",
+        f"#EXT-X-TARGETDURATION:{target}",
+        "#EXT-X-VERSION:3",
+        "#EXT-X-PLAYLIST-TYPE:VOD",
+    ]
+    for extinf, url in segs:
+        out.append(extinf)
+        out.append(url.replace(f"//{src_host}/", f"//{host}/", 1))
+    out.append("#EXT-X-ENDLIST")
+    path.write_text("\n".join(out) + "\n")
+
+
+def chunk_complete(dest: Path) -> bool:
+    """A chunk counts as done only when yt-dlp left no in-progress markers."""
+    if not dest.exists() or dest.stat().st_size <= 1024:
+        return False
+    if Path(f"{dest}.ytdl").exists():
+        return False
+    return not any(dest.parent.glob(f"{dest.name}-Frag*"))
+
+
+def clear_chunk(dest: Path) -> None:
+    """Drop a partial chunk and its orphaned fragment files before a retry."""
+    dest.unlink(missing_ok=True)
+    Path(f"{dest}.ytdl").unlink(missing_ok=True)
+    for frag in dest.parent.glob(f"{dest.name}-Frag*"):
+        frag.unlink(missing_ok=True)
+
+
+def run_chunk(playlist: Path, dest: Path, jobs: int, referer: str, attempts: int, label: str) -> None:
+    if chunk_complete(dest):
+        log(f"{label} already present, skipping")
+        return
+
+    cmd = [
+        "yt-dlp",
+        "-N", str(jobs),
+        "--no-part",
+        "--no-warnings",
+        "--quiet",
+        "--progress",
+        "--fragment-retries", "10",
+        "--retries", "10",
+        "--enable-file-urls",
+        "--user-agent", UA,
+        "--referer", referer or BASE + "/",
+        "-o", str(dest),
+        playlist.as_uri(),
+    ]
+    for attempt in range(1, attempts + 1):
+        started = time.time()
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        ok = proc.returncode == 0 and dest.exists() and dest.stat().st_size > 1024
+        if ok:
+            for frag in dest.parent.glob(f"{dest.name}-Frag*"):
+                frag.unlink(missing_ok=True)
+            Path(f"{dest}.ytdl").unlink(missing_ok=True)
+            took = time.time() - started
+            rate = dest.stat().st_size / took if took else 0
+            log(f"{label} done  {human(dest.stat().st_size)} in {took:.0f}s  ({rate / 1048576:.2f} MB/s)")
+            return
+        tail = (proc.stderr or proc.stdout).strip().splitlines()
+        reason = tail[-1] if tail else f"exit {proc.returncode}"
+        transient = any(
+            k in reason
+            for k in ("No route to host", "429", "timed out", "Connection reset",
+                      "Temporary failure", "502", "503", "504", "Read timed out",
+                      "No such file or directory")
+        )
+        if not transient:
+            raise Failure(f"{label} failed permanently: {reason}")
+        wait = min(120 * attempt, 600) if ("No route to host" in reason or "429" in reason) else min(15 * attempt, 60)
+        log(f"{label} attempt {attempt}/{attempts} failed: {reason}")
+        clear_chunk(dest)
+        if attempt < attempts:
+            log(f"{label} backing off {wait}s" + (" (edge is rate-limiting)" if "429" in reason else ""))
+            time.sleep(wait)
+    raise Failure(f"{label} failed after {attempts} attempts")
+
+
+def build_name(playlist_url: str, title: str) -> str:
+    parts = urlsplit(playlist_url).path.split("/")
+    if len(parts) >= 5 and parts[-1].endswith(".m3u8"):
+        model, when = parts[-3], parts[-2].replace(",", "_")
+        raw = f"{model}_{when}"
+    else:
+        raw = title
+    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("-.")
+    return clean[:120] or "video"
+
+
+def concat_chunks(chunks: list[Path], tmpdir: Path, dest: Path) -> None:
+    listing = tmpdir / "concat.txt"
+    listing.write_text("".join(f"file '{c.as_posix()}'\n" for c in chunks))
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "concat", "-safe", "0", "-i", str(listing),
+        "-c", "copy", "-map", "0", str(dest),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        dest.unlink(missing_ok=True)
+        raise Failure("ffmpeg concat failed: " + (proc.stderr.strip().splitlines() or ["?"])[-1])
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="cumcams-dl",
+        description="Download a cumcams.cc video over HLS, split across CDN edge nodes.",
+        epilog="Example: cumcams-dl https://cumcams.cc/video/200367738/play",
+    )
+    ap.add_argument("url", help="video page URL, e.g. https://cumcams.cc/video/<id>/play")
+    ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_OUT, help=f"output directory (default: {DEFAULT_OUT})")
+    ap.add_argument("-n", "--name", help="output basename (default: derived from the stream path)")
+    ap.add_argument("-j", "--jobs", type=int, default=5, help="concurrent fragments per edge node (default: 5)")
+    ap.add_argument("--nodes", type=int, default=2, help="max edge nodes to spread across (default: 2)")
+    ap.add_argument("--chunk-size", type=int, default=100, help="segments per chunk (default: 100)")
+    ap.add_argument("--max-segments", type=int, default=0, help="stop after N segments; 0 means all (smoke test)")
+    ap.add_argument("--attempts", type=int, default=6, help="tries per chunk (default: 6)")
+    ap.add_argument("--pace", type=int, default=0, help="sleep N seconds after each chunk (default: 0)")
+    ap.add_argument("--no-split", action="store_true", help="single edge node, one worker")
+    ap.add_argument("--keep-chunks", action="store_true", help="keep the per-chunk .ts files")
+    ap.add_argument("--no-mux", action="store_true", help="do not concat/remux; leave chunks in place")
+    ap.add_argument("-v", "--verbose", action="store_true", help="print the resolved stream URL")
+    ap.add_argument("-V", "--version", action="version", version=f"cumcams-dl {VERSION}")
+    args = ap.parse_args(argv)
+
+    try:
+        check_deps(need_ffmpeg=not args.no_mux)
+
+        log("resolving video page")
+        title, m3u8, vid = resolve_chain(args.url)
+        if args.verbose:
+            log(f"title: {title}")
+            log(f"stream: {m3u8.split('?')[0]}")
+        if vid not in m3u8 and args.verbose:
+            log("note: video id does not appear in the stream path")
+
+        name = args.name or build_name(m3u8, title)
+        segs, target = fetch_playlist(m3u8)
+        duration = len(segs) * target
+        log(f"{name}: {len(segs)} segments, {duration // 3600}h{duration % 3600 // 60:02d}m, target {target}s")
+        if args.max_segments and args.max_segments < len(segs):
+            segs = segs[: args.max_segments]
+            log(f"limiting to the first {len(segs)} segments")
+
+        primary = urlsplit(m3u8).netloc
+        hosts = [primary] if args.no_split or args.nodes <= 1 else sibling_hosts(primary, segs[0][1], args.nodes)
+        log("edge nodes: " + ", ".join(hosts))
+
+        work = Path(tempfile.gettempdir()) / f"cumcams-dl-{vid}"
+        work.mkdir(parents=True, exist_ok=True)
+        outdir = args.outdir.expanduser()
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        size = max(1, args.chunk_size)
+        chunks = [segs[i:i + size] for i in range(0, len(segs), size)]
+        log(f"{len(chunks)} chunk{'s' if len(chunks) != 1 else ''} of up to {size} segments")
+
+        results: dict[int, Path] = {}
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def worker(host: str, indices: list[int]) -> None:
+            for idx in indices:
+                pl = work / f"{name}.{idx:04d}.m3u8"
+                dest = work / f"{name}.{idx:04d}.ts"
+                write_playlist(pl, chunks[idx], target, host)
+                try:
+                    run_chunk(pl, dest, args.jobs, args.url, args.attempts, f"chunk {idx + 1}/{len(chunks)}")
+                    with lock:
+                        results[idx] = dest
+                except Failure as exc:
+                    with lock:
+                        errors.append(str(exc))
+                if args.pace:
+                    time.sleep(args.pace)
+
+        groups = {h: list(range(len(chunks)))[i::len(hosts)] for i, h in enumerate(hosts)}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+            futures = [pool.submit(worker, h, idxs) for h, idxs in groups.items() if idxs]
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+
+        if errors:
+            raise Failure(f"{len(errors)} chunk(s) failed; re-run to resume:\n  " + "\n  ".join(errors))
+
+        ordered = [results[i] for i in range(len(chunks))]
+        if args.no_mux:
+            log(f"chunks left in {work}")
+            return 0
+
+        dest = outdir / f"{name}.mkv"
+        log(f"concatenating {len(ordered)} chunks -> {dest}")
+        concat_chunks(ordered, work, dest)
+        log(f"done: {dest} ({human(dest.stat().st_size)})")
+
+        if not args.keep_chunks:
+            for c in ordered:
+                c.unlink(missing_ok=True)
+            for pl in work.glob("*.m3u8"):
+                pl.unlink(missing_ok=True)
+            (work / "concat.txt").unlink(missing_ok=True)
+            try:
+                work.rmdir()
+            except OSError:
+                pass
+        return 0
+
+    except Failure as exc:
+        print(f"cumcams-dl: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\ncumcams-dl: interrupted; re-run the same command to resume", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
