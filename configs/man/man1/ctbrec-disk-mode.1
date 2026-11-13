@@ -1,4 +1,4 @@
-.TH CTBREC-DISK-MODE 1 "2026-11-12" "ctbrec-disk-mode" "User Commands"
+.TH CTBREC-DISK-MODE 1 "2026-11-13" "ctbrec-disk-mode" "User Commands"
 .SH NAME
 ctbrec-disk-mode \- strict low-disk allowlist mode for ctbrec
 .SH SYNOPSIS
@@ -49,6 +49,21 @@ systemd timer inside the container. Do not run it from the Proxmox host
 directly; use
 .BR ctbrec-disk-mode-remote (1)
 for that.
+.P
+.SS Forced mode
+.B \-\-on
+turns the allowlist into an always\-on rule: the mode is entered and enforced
+regardless of free space, so only allowlisted models record. Forced mode is
+stored as a marker file in the state directory, so it survives reboots, ctbrec
+restarts, timer runs, and
+.BR "install \-\-keep\-config" .
+.B \-\-off
+removes the marker and leaves the mode, resuming the models this tool
+suspended; the disk thresholds apply again on the next run. Turning forced mode
+off does not disable disk protection: if free space is at or below the enter
+threshold, the normal low\-space mode re\-enters on the next run. ctbrec's own
+.B minimumSpaceLeftInBytes
+reserve still stops everything, allowlisted models included, at the hard floor.
 .SH OPTIONS
 .TP
 .B \-\-config \fIPATH\fR
@@ -63,10 +78,27 @@ default action when no action flag is given.
 Print free space, both thresholds, the ctbrec hard floor, the current mode,
 and every allowlisted model with its active/paused state. Changes nothing.
 .TP
+.B \-\-on
+Turn forced mode on and apply it immediately. The allowlist stays enforced
+regardless of free space until
+.B \-\-off
+is given. Batching, pacing, and the failure backoff still apply, so a large
+set of non\-allowlisted models is suspended over several runs at most
+.B max_suspends_per_run
+per run.
+.TP
+.B \-\-off
+Turn forced mode off and leave the mode, resuming the models this tool
+suspended, in the usual paced batches. Models you paused by hand are left
+paused. The disk thresholds decide again on the next run.
+.TP
 .B \-\-reset
 Force the mode off and resume the models this tool suspended, regardless of
 free space. Resumes are batched like suspends, so a large set may need more than
-one run; the mode stays active until the batch is drained.
+one run; the mode stays active until the batch is drained. If forced mode is
+on, the next run re\-enters the mode; use
+.B \-\-off
+to keep it off.
 .TP
 .B \-\-dry-run
 With
@@ -210,6 +242,12 @@ Active mode, entry timestamp, the URLs confirmed suspended by the tool, and the
 last failure with its retry time. When systemd sets
 .BR STATE_DIRECTORY ,
 that directory is used instead.
+.TP
+.I /var/lib/ctbrec-disk-mode/forced
+Marker file whose presence means forced mode is on. Created by
+.B \-\-on
+and removed by
+.BR \-\-off .
 .SH EXAMPLES
 Show the current decision without acting:
 .IP
@@ -233,6 +271,18 @@ Leave the mode immediately:
 .IP
 .EX
 ctbrec-disk-mode \-\-reset
+.EE
+.P
+Keep only the allowlist recording until further notice:
+.IP
+.EX
+ctbrec-disk-mode \-\-on
+.EE
+.P
+Allow every model to record again:
+.IP
+.EX
+ctbrec-disk-mode \-\-off
 .EE
 .SH EXIT STATUS
 .TP

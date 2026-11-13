@@ -1,4 +1,4 @@
-.TH CTBREC-DISK-MODE-REMOTE 1 "2026-11-10" "ctbrec-disk-mode-remote" "User Commands"
+.TH CTBREC-DISK-MODE-REMOTE 1 "2026-11-13" "ctbrec-disk-mode-remote" "User Commands"
 .SH NAME
 ctbrec-disk-mode-remote \- manage ctbrec low-disk allowlist mode in the LXC
 .SH SYNOPSIS
@@ -11,8 +11,8 @@ is a local wrapper around
 .BR ctbrec-disk-mode (1),
 which runs inside the ctbrec LXC (VMID 109) on the Proxmox node. It uploads
 the engine and configuration, installs the systemd service and timer, and
-exposes status, manual run, reset, log, and uninstall operations from the
-workstation.
+exposes status, manual run, forced mode (on/off), reset, log, and uninstall
+operations from the workstation.
 .P
 The local files
 .I ~/.local/bin/ctbrec-disk-mode
@@ -50,9 +50,23 @@ Evaluate the thresholds once, immediately. With
 .B \-\-dry\-run
 only print the intended suspend or resume actions.
 .TP
+.B on
+Turn forced mode on and apply it now: the allowlist stays enforced regardless of
+free space until
+.B off
+is given. The setting survives reboots and timer runs. Then print the status.
+.TP
+.B off
+Turn forced mode off and leave the mode, resuming the models the tool
+suspended, then print the status. Models paused by hand stay paused. If free
+space is genuinely low the normal low\-space mode re\-enters on the next run.
+.TP
 .B reset [\-\-dry\-run]
 Force the mode off and resume the models it suspended, regardless of free
-space. Useful before maintenance or before a manual cleanup.
+space. Useful before maintenance or before a manual cleanup. With forced mode
+on, the next timer run re\-enters the mode; use
+.B off
+instead.
 .TP
 .B logs [\-\-lines \fIN\fR]
 Show recent service log lines from the journal. Default: 80 lines.
@@ -121,6 +135,18 @@ Leave the mode now:
 .IP
 .EX
 ctbrec-disk-mode-remote reset
+.EE
+.P
+Record only the allowlist until further notice:
+.IP
+.EX
+ctbrec-disk-mode-remote on
+.EE
+.P
+Record everything again:
+.IP
+.EX
+ctbrec-disk-mode-remote off
 .EE
 .P
 Add two models to the allowlist and deploy the change:

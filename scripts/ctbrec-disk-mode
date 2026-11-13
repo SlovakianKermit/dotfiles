@@ -20,6 +20,10 @@ accumulate a pile of blocked API calls.
 When free space reaches the exit threshold, only the models suspended by this
 tool are resumed.  Models the user had already paused before entering the mode
 are never touched.
+
+Forced mode (--on) keeps the allowlist enforced regardless of free space until
+--off is given.  The marker file survives reboots, ctbrec restarts and timer
+runs, so turning it off is an explicit act.
 """
 
 from __future__ import annotations
@@ -39,7 +43,7 @@ from typing import Any
 import requests
 import urllib3
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 GIB = 1024**3
 DEFAULT_CONFIG = Path("/etc/ctbrec-disk-mode.json")
 FALLBACK_STATE_DIR = Path("/var/lib/ctbrec-disk-mode")
@@ -97,6 +101,31 @@ def state_dir() -> Path:
 
 def state_path() -> Path:
     return state_dir() / "state.json"
+
+
+def force_marker() -> Path:
+    return state_dir() / "forced"
+
+
+def forced_on() -> bool:
+    """Forced mode is on while the marker file exists."""
+    return force_marker().exists()
+
+
+def set_forced(enabled: bool) -> bool:
+    """Create or remove the forced-mode marker. Returns True when it changed."""
+    marker = force_marker()
+    if enabled:
+        if marker.exists():
+            return False
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        _own_like_state_dir(marker)
+        return True
+    if not marker.exists():
+        return False
+    marker.unlink()
+    return True
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -515,13 +544,15 @@ def enter_mode(
     cfg: dict[str, Any],
     state: dict[str, Any],
     dry_run: bool,
+    reason: str = "low disk space",
 ) -> None:
     allowed = allowlist_set(cfg)
     recording = client.recording_models()
     targets = [model for model in recording if not is_allowed(model, allowed)]
     LOG.info(
-        "entering low-space mode: %d non-allowlisted model(s) recording, "
+        "entering mode (%s): %d non-allowlisted model(s) recording, "
         "%d allowlisted model(s) stay untouched",
+        reason,
         len(targets),
         sum(1 for model in recording if is_allowed(model, allowed)),
     )
@@ -638,14 +669,21 @@ def cmd_status(client: Client, cfg: dict[str, Any], state: dict[str, Any]) -> No
     actually_suspended = [
         model for model in models if model.get("suspended") and model["url"] in known
     ]
+    forced = forced_on()
 
     print(f"free space      {fmt_gib(free)} ({free} bytes)")
     print(f"enter threshold {fmt_gib(cfg['enter_gib'] * GIB)}")
     print(f"exit threshold  {fmt_gib(cfg['exit_gib'] * GIB)}")
     print(f"hard floor      {fmt_gib(int(space.get('minimumSpaceLeftInBytes') or 0))} (ctbrec minimumSpaceLeftInBytes)")
+    if forced:
+        print("forced          ON (allowlist enforced regardless of free space)")
+    else:
+        print("forced          off")
     print()
     if state.get("active"):
-        suffix = " (finishing exit)" if state.get("exiting") else ""
+        suffix = " [finishing exit]" if state.get("exiting") else ""
+        if forced:
+            suffix += " [forced]"
         print(f"mode            ACTIVE since {iso_to_local(state.get('entered_at', ''))}{suffix}")
         print(
             f"suspended       {len(actually_suspended)} model(s) by this tool "
@@ -653,7 +691,9 @@ def cmd_status(client: Client, cfg: dict[str, Any], state: dict[str, Any]) -> No
         )
     else:
         print("mode            inactive")
-        if free <= cfg["enter_gib"] * GIB:
+        if forced:
+            print("next run        WOULD ENTER the mode (forced on)")
+        elif free <= cfg["enter_gib"] * GIB:
             print("next run        WOULD ENTER low-space mode")
         elif free >= cfg["exit_gib"] * GIB:
             print("next run        stays inactive")
@@ -693,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status", action="store_true", help="show current state, no changes")
     parser.add_argument("--dry-run", action="store_true", help="with --once/--reset, only print intended actions")
     parser.add_argument("--reset", action="store_true", help="force low-space mode off (resume only models this tool suspended)")
+    parser.add_argument("--on", action="store_true", help="force the allowlist on regardless of free space, until --off")
+    parser.add_argument("--off", action="store_true", help="leave forced mode and the allowlist mode, resuming the models this tool suspended")
     parser.add_argument("--ensure-floor", action="store_true", help="set ctbrec minimumSpaceLeftInBytes to hard_floor_gib and exit")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     args = parser.parse_args(argv)
@@ -721,19 +763,51 @@ def main(argv: list[str] | None = None) -> int:
     if args.reset:
         if not state.get("active"):
             print("low-space mode is not active; nothing to do")
+            if forced_on():
+                LOG.warning("forced mode is still on; run --off to keep the mode off")
             return 0
         exit_mode(client, cfg, state, "manual reset", args.dry_run)
+        if forced_on():
+            LOG.warning(
+                "forced mode is still on; the next run re-enters the mode (use --off to turn it off)"
+            )
+        return 0
+
+    if args.on:
+        if args.dry_run:
+            LOG.info("dry-run: would turn forced mode on")
+        elif set_forced(True):
+            LOG.info("forced mode on: the allowlist is enforced regardless of free space")
+        else:
+            LOG.info("forced mode already on")
+        if args.dry_run:
+            return 0
+
+    if args.off:
+        if args.dry_run:
+            LOG.info("dry-run: would turn forced mode off and leave the mode")
+            return 0
+        if set_forced(False):
+            LOG.info("forced mode off: the disk thresholds apply again")
+        else:
+            LOG.info("forced mode was not on")
+        if not state.get("active"):
+            print("the mode is not active; nothing to resume")
+            return 0
+        exit_mode(client, cfg, state, "forced mode turned off", args.dry_run)
         return 0
 
     free = free_bytes(client)
+    forced = forced_on()
     enter_at = int(cfg["enter_gib"] * GIB)
     exit_at = int(cfg["exit_gib"] * GIB)
     LOG.info(
-        "free %s (enter <= %s, exit >= %s); mode %s",
+        "free %s (enter <= %s, exit >= %s); mode %s%s",
         fmt_gib(free),
         fmt_gib(enter_at),
         fmt_gib(exit_at),
         "active" if state.get("active") else "inactive",
+        ", forced" if forced else "",
     )
 
     remaining = cooldown_remaining(state)
@@ -751,6 +825,17 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("cooldown expired; retrying recorder actions")
         state.pop("failure", None)
         save_state(state)
+
+    if forced:
+        # Forced mode: the allowlist is the only rule, thresholds are ignored.
+        if state.get("active"):
+            if state.get("exiting"):
+                exit_mode(client, cfg, state, "finishing exit", args.dry_run)
+            else:
+                enforce_mode(client, cfg, state, args.dry_run)
+        else:
+            enter_mode(client, cfg, state, args.dry_run, reason="forced mode")
+        return 0
 
     if state.get("active"):
         if state.get("exiting") or free >= exit_at:

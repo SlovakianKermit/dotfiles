@@ -135,6 +135,18 @@ cmd_reset() {
   pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --reset "${dry[@]}"
 }
 
+cmd_on() {
+  pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --on
+  echo
+  cmd_status
+}
+
+cmd_off() {
+  pct_exec "${REMOTE_BIN}" --config "${REMOTE_CONFIG}" --off
+  echo
+  cmd_status
+}
+
 cmd_logs() {
   local lines=80
   if [[ "${1:-}" == "--lines" ]]; then lines="${2:?--lines needs a number}"; fi
@@ -275,6 +287,8 @@ Commands:
   install [--keep-config]   deploy engine/config/units and start the timer
   status                    show free space, mode and allowlist matches
   run [--dry-run]           evaluate thresholds once, now
+  on                        force the allowlist on until 'off' (ignores free space)
+  off                       leave forced mode and the mode, resuming its models
   reset [--dry-run]         force the mode off and resume suspended models
   logs [--lines N]          show recent service log lines (default 80)
   config                    print the remote config file
@@ -297,6 +311,8 @@ main() {
     install) cmd_install "$@" ;;
     status) cmd_status ;;
     run) cmd_run "$@" ;;
+    on) cmd_on ;;
+    off) cmd_off ;;
     reset) cmd_reset "$@" ;;
     logs) cmd_logs "$@" ;;
     config) cmd_config ;;
