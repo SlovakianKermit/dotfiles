@@ -50,6 +50,33 @@ the script falls back to a full
 .B ffmpeg \-f concat \-c copy
 remux.
 .P
+When a thumbnail (the same basename with
+.BR .jpg ,
+.B .jpeg
+or
+.BR .png )
+sits next to a part, it follows that part: thumbnails of absorbed parts are
+deleted (or moved to
+.B .merged_originals/
+under
+.BR \-\-keep ),
+while the output keeps the first part's thumbnail.
+.P
+By default a recording's length is derived from its modification time. That is
+only valid while nothing has touched the file since it was written; a copied or
+re\-tagged file carries an unrelated mtime, which makes the computed end time
+(and therefore the gap test) meaningless. Use
+.B \-\-duration\-from probe
+to read the container duration with
+.BR ffprobe (1)
+instead.
+.P
+With
+.BR \-\-verify ,
+append mode also scans the output's raw PTS. If the source recording already
+contains timestamp jumps (a stream dropout), the scan fails and the group is
+retried as a full concat remux rather than being left unmerged.
+.P
 .B \-\-fix\-timestamps
 switches the script into repair mode. Instead of merging, it scans the
 recordings under
@@ -70,9 +97,12 @@ Full throughput: no bandwidth cap, no cooldown, no drain waits, and
 defaults to 8 for probing. Use it when nothing is recording.
 .TP
 .B balanced
-(default) Steady 90M/s read and write per device, no burst, a short cooldown
-and a drain check before each burst. A merge therefore never saturates the
-drive, and a large group no longer ends in a wall of 100% io.
+(default) Steady 60M/s read and write per device, no burst, a short cooldown
+and a drain check before every burst \-\- including between the parts of a
+single group, so a nine\-part merge is nine paced bursts rather than one
+five\-minute one. 60M rather than 90M because this drive drains about
+50\-80 MB/s: above that the page cache outruns the drive, the unflushed backlog
+grows into the gigabyte, and io pressure climbs with it.
 .TP
 .B reserved
 Leaves the drive to everything else: 40M/s cap, idle ionice class, a long
@@ -144,6 +174,25 @@ for the parts to be merged. Defaults to
 .BR 3600
 (60 minutes).
 .TP
+.B \-\-duration\-from \fI\,mtime|probe\/\fR
+How to measure each recording's length:
+.B mtime
+(last\-modified minus the start time in the filename) or
+.B probe
+(container duration from
+.BR ffprobe (1)).
+Defaults to
+.BR mtime .
+Use
+.B probe
+for files whose mtimes are unreliable, such as recordings copied later or
+stored on a share that rewrites timestamps; with
+.BR mtime
+the computed end can be hours or days after the real content ends, which makes
+the
+.B \-\-gap
+test match parts that are not actually adjacent.
+.TP
 .B \-\-slack \fISECONDS\fR
 Extra slack, in seconds, allowed when pre\-selecting candidates by modification
 time. Defaults to
@@ -186,7 +235,9 @@ output). The duration is compared against the expected timeline, and the raw
 transport PTS is scanned for discontinuities. In append mode the expected
 timeline is
 .B one part after another
-with the wall\-clock gaps removed.
+with the wall\-clock gaps removed. A PTS discontinuity found in append mode
+rolls the append back and retries the group as a full concat remux, so
+timestamp glitches already present in the source do not block the merge.
 .TP
 .B \-j, \-\-jobs \fIN\fR
 Number of parallel header probes. Defaults to 1, except 8 under
@@ -299,6 +350,12 @@ plus
 still owed to the disk that counts as busy. This is the signal a burst has
 finished at the filesystem level even though no process is blocked yet: the
 write went into the page cache and the stall only appears later, in a kworker.
+.P
+A backlog above the limit is not counted as busy while it is falling by more
+than about 1 MB/s: that is the drive catching up, and refusing to work until a
+gigabyte of dirty pages has drained would stall the run for no benefit. A
+backlog that is flat or growing is counted, because that is the case where
+another burst makes it worse.
 Defaults to 256 under
 .BR balanced ,
 64 under
@@ -401,7 +458,7 @@ via
 and
 .BR IOWriteBandwidthMax .
 Defaults to
-.B 90M
+.B 60M
 under
 .BR balanced ,
 .B 40M
@@ -494,10 +551,10 @@ sleeps to hold the same average rate, which also throttles ffmpeg's input
 through pipe back\-pressure. There is therefore no such thing as "a large merge
 that pins the disk at 100%": the group simply takes longer.
 .IP \(bu 2
-Before a burst, and after any group that actually wrote output, the run
-sleeps
+Before a burst \-\- both before a group and between the parts of a group \-\- the
+run sleeps
 .B \-\-cooldown
-seconds and then polls until every signal is quiet for
+seconds (groups only) and then polls until every signal is quiet for
 .B \-\-drain\-quiet
 seconds or
 .B \-\-io\-wait\-max
@@ -590,6 +647,13 @@ Merge the old flat directory layout:
 .IP
 .EX
 ctbrec-merge \-\-dir /mnt/shared/Ctbrec/Recording \-\-top\-level
+.EE
+.P
+Merge recordings whose mtimes are unreliable (e.g. copied to a share), using
+the real container duration for the one\-hour gap rule:
+.IP
+.EX
+ctbrec-merge \-\-dir /mnt/shared/VR \-\-top\-level \-\-duration\-from probe \-\-verify
 .EE
 .P
 Preview and then repair merged files that have phantom timeline gaps:

@@ -27,6 +27,7 @@ CURRENT_APPEND = None
 CURRENT_APPEND_SIZE = 0
 DELETED_SO_FAR = 0
 KEPT_SO_FAR = 0
+STOP_REQUESTED = False
 
 
 def parse_filename(name):
@@ -48,7 +49,7 @@ def probe_header(path):
     cmd = [
         "ffprobe", "-v", "error",
         "-read_intervals", "0%+1",
-        "-show_entries", "format=start_time",
+        "-show_entries", "format=start_time,duration",
         "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,sample_rate,channels,id",
         "-of", "json", path,
     ]
@@ -56,9 +57,14 @@ def probe_header(path):
     if r.returncode != 0:
         return None
     try:
-        start = float(json.loads(r.stdout)["format"]["start_time"])
+        fmt = json.loads(r.stdout)["format"]
+        start = float(fmt["start_time"])
     except (KeyError, ValueError, TypeError):
         return None
+    try:
+        duration = float(fmt["duration"])
+    except (KeyError, ValueError, TypeError):
+        duration = None
     v = a = None
     pids = []
     for s in json.loads(r.stdout).get("streams", []):
@@ -70,7 +76,31 @@ def probe_header(path):
             pids.append(str(s["id"]))
     vsig = tuple(v.get(k) for k in VKEY) if v else None
     asig = tuple(a.get(k) for k in AKEY) if a else None
-    return start, vsig, asig, tuple(sorted(pids))
+    return start, duration, vsig, asig, tuple(sorted(pids))
+
+
+def entry_duration(entry, probed, args):
+    """Length of a recording, either probed or inferred from mtime.
+
+    mtime is only the recording's end when nothing has touched the file since
+    it was written.  Files that were copied, moved or re-tagged later carry an
+    unrelated mtime, which makes the inferred duration far too long and turns
+    the gap test into nonsense.  --duration-from probe reads the container
+    duration instead.
+    """
+    if args.duration_from == "probe" and probed is not None and probed > 0:
+        return probed
+    return max(0.0, entry["mtime"] - entry["start"])
+
+
+def sidecar_path(entry):
+    """Matching thumbnail next to a recording, or None."""
+    base = os.path.splitext(entry["path"])[0]
+    for ext in (".jpg", ".jpeg", ".png"):
+        cand = base + ext
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 def probe_duration(path):
@@ -309,7 +339,24 @@ def window_means(hist):
     return out
 
 
-def drain_reasons(args, mean):
+def dirty_trend(hist):
+    """MB/s the unflushed backlog is moving at over the window, or None.
+
+    Positive means the kernel is falling further behind.  A backlog that is
+    above the limit but shrinking is the drive catching up, which is not a
+    reason to keep a burst from starting; a backlog that is flat or growing at
+    the same level is.
+    """
+    vals = [h["dirty_mb"] for h in hist if h["dirty_mb"] is not None]
+    if len(vals) < 4:
+        return None
+    half = len(vals) // 2
+    first = sum(vals[:half]) / half
+    last = sum(vals[half:]) / (len(vals) - half)
+    return (last - first) / (len(vals) - half)
+
+
+def drain_reasons(args, mean, hist=None):
     """Which signals say the disk is still working, using window means."""
     why = []
     queue_max = getattr(args, "drain_queue_max", 0) or 0
@@ -321,7 +368,10 @@ def drain_reasons(args, mean):
         why.append(f"{mean['stall']:.0f}% root io stall")
     if args.drain_dirty_mb > 0 and mean["dirty_mb"] is not None \
             and mean["dirty_mb"] > args.drain_dirty_mb:
-        why.append(f"{mean['dirty_mb']:.0f} MB unflushed")
+        trend = dirty_trend(hist) if hist is not None else None
+        if trend is None or trend > -1.0:
+            shape = "rising" if trend is None else f"{trend:+.0f} MB/s"
+            why.append(f"{mean['dirty_mb']:.0f} MB unflushed ({shape})")
     return why
 
 
@@ -359,7 +409,7 @@ def wait_for_drain(args, sampler, cooldown=True):
         if len(hist) < depth:
             continue
         mean = window_means(hist)
-        why = drain_reasons(args, mean)
+        why = drain_reasons(args, mean, hist)
         if not why:
             now = time.monotonic()
             if quiet_since is None:
@@ -376,7 +426,7 @@ def wait_for_drain(args, sampler, cooldown=True):
             notified = now
     mean = window_means(hist) if hist else \
         {"util": None, "stall": None, "aqu": None, "dirty_mb": None}
-    why = drain_reasons(args, mean)
+    why = drain_reasons(args, mean, hist)
     if not why:
         # Ran out of time while the window was still filling, but everything in
         # it is below the thresholds -- that is quiet, not busy.
@@ -395,6 +445,23 @@ def wait_for_drain(args, sampler, cooldown=True):
               f"(limit {args.drain_dirty_mb:.0f} MB); the next run will continue", file=sys.stderr)
         return False
     return True
+
+
+def part_gate(args):
+    """Drain check before each appended part, not just before each group.
+
+    A group is a chain of parts and can be many gigabytes; gating only at the
+    group boundary let one group run for minutes at full rate, which is what
+    drives the page cache backlog and the io pressure that follows it.  Pacing
+    per part keeps a burst to a single part's worth of writes.
+
+    No cooldown here: the quiet requirement in the gate already provides the
+    pause, and a per-part cooldown would multiply across large groups.
+    """
+    sampler = getattr(args, "sampler", None)
+    if sampler is None or getattr(args, "dry_run", False):
+        return True
+    return wait_for_drain(args, sampler, cooldown=False)
 
 
 def find_chain_groups(rows, threshold):
@@ -464,8 +531,8 @@ def process_group(model, entries, args):
         if p is None:
             print(f"  warn: could not probe {e['name']}", file=sys.stderr)
             continue
-        e["start_time"], e["vsig"], e["asig"], e["pids"] = p
-        e["dur"] = max(0.0, e["mtime"] - e["start"])
+        e["start_time"], probed_dur, e["vsig"], e["asig"], e["pids"] = p
+        e["dur"] = entry_duration(e, probed_dur, args)
         by_path[e["path"]] = e
     candidates = [e for e in candidates if e["path"] in by_path]
     candidates.sort(key=lambda e: e["start"])
@@ -566,7 +633,16 @@ def merge_run(group, args):
         return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
 
     if mode == "append":
-        return append_run(group, args, pre, base, gaps)
+        res = append_run(group, args, pre, base, gaps)
+        if not res.get("fallback"):
+            return res
+        # The append itself is sound but the verification found PTS
+        # discontinuities.  Those often exist in the source recording already
+        # (the stream dropped and the timestamp jumped); a stream-copy concat
+        # cannot remove them either, but it is the right fallback so the group
+        # still gets merged instead of being retried forever.
+        print("  append verify failed; retrying with ffmpeg concat", file=sys.stderr)
+        mode = "concat"
 
     part_path = out_path + ".part"
     global CURRENT_PART
@@ -652,20 +728,28 @@ def merge_run(group, args):
 
     n_del = n_keep = 0
     global DELETED_SO_FAR, KEPT_SO_FAR
-    for e in group:
+    for i, e in enumerate(group):
         if args.keep:
             bak = os.path.join(e["dir"], ".merged_originals")
             os.makedirs(bak, exist_ok=True)
             dest = os.path.join(bak, e["name"])
-            i = 1
+            j = 1
             while os.path.exists(dest):
-                dest = os.path.join(bak, f"{e['name']}.{i}")
-                i += 1
+                dest = os.path.join(bak, f"{e['name']}.{j}")
+                j += 1
             os.rename(e["path"], dest)
+            if i:
+                side = sidecar_path(e)
+                if side:
+                    os.rename(side, os.path.join(bak, os.path.basename(side)))
             n_keep += 1
             KEPT_SO_FAR += 1
         else:
             os.remove(e["path"])
+            if i:
+                side = sidecar_path(e)
+                if side:
+                    os.remove(side)
             n_del += 1
             DELETED_SO_FAR += 1
 
@@ -678,7 +762,7 @@ def merge_run(group, args):
 
 
 def append_run(group, args, pre, base, gaps):
-    global CURRENT_APPEND, CURRENT_APPEND_SIZE, DELETED_SO_FAR
+    global CURRENT_APPEND, CURRENT_APPEND_SIZE, DELETED_SO_FAR, STOP_REQUESTED
     out_path = group[0]["path"]
     orig_size = os.path.getsize(out_path)
     start1 = pre["start_time"]
@@ -686,7 +770,7 @@ def append_run(group, args, pre, base, gaps):
     # Content-continuous offsets: place each part immediately after the
     # previous part's content instead of at its wall-clock position, so the
     # merged timeline has no phantom gaps and byte<->time seeking stays linear.
-    cur_end = start1 + max(0.0, group[0]["mtime"] - group[0]["start"])
+    cur_end = start1 + group[0]["dur"]
     appended = 0
     limiter = RateLimiter(parse_rate(args.io_rate))
     started = time.monotonic()
@@ -694,6 +778,16 @@ def append_run(group, args, pre, base, gaps):
     CURRENT_APPEND_SIZE = orig_size
     with open(out_path, "ab") as f:
         for e in group[1:]:
+            if not part_gate(args):
+                # Keep the output consistent: roll the whole group back rather
+                # than leave a half-merged file whose originals were kept.
+                f.flush()
+                os.truncate(out_path, orig_size)
+                CURRENT_APPEND = None
+                print("  stopping: disk still saturated, this group was rolled "
+                      "back and the next run will retry it", file=sys.stderr)
+                STOP_REQUESTED = True
+                return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
             off = cur_end - e.get("start_time", 0.0)
             if off < last_off + APPEND_MARGIN:
                 off = last_off + APPEND_MARGIN
@@ -738,7 +832,7 @@ def append_run(group, args, pre, base, gaps):
                 print(f"  error: ffmpeg append failed, part rolled back, kept originals\n{stderr}", file=sys.stderr)
                 return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
             last_off = off
-            cur_end = off + e.get("start_time", 0.0) + max(0.0, e["mtime"] - e["start"])
+            cur_end = off + e.get("start_time", 0.0) + e["dur"]
             appended += e["size"]
         f.flush()
         os.fsync(f.fileno())
@@ -759,14 +853,25 @@ def append_run(group, args, pre, base, gaps):
             os.truncate(out_path, orig_size)
             CURRENT_APPEND = None
             print(f"  error: verify failed ({nj} PTS discontinuity/ies), part rolled back", file=sys.stderr)
-            return {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+            out = {"merged": False, **base, "size": 0, "n_del": 0, "n_keep": 0}
+            if nj and not bad:
+                out["fallback"] = "concat"
+            return out
 
     n_del = len(group) - 1
-    for e in group[1:]:
-        os.remove(e["path"])
-        DELETED_SO_FAR += 1
+    # The output is complete and verified here. Disarm the interrupt handler
+    # *before* removing originals: it used to run os.remove() while
+    # CURRENT_APPEND still pointed at the output, so an interrupt landing in
+    # that window deleted the source part and then truncated the merged output
+    # back to its original size -- losing everything that had just been merged.
     CURRENT_APPEND = None
     CURRENT_APPEND_SIZE = 0
+    for e in group[1:]:
+        os.remove(e["path"])
+        side = sidecar_path(e)
+        if side:
+            os.remove(side)
+        DELETED_SO_FAR += 1
 
     print(f"  ok: {group[0]['name']} ({new_size/1e6:.0f} MB, "
           f"{rate_txt(started, appended, appended)}), appended {len(group)-1} part(s), "
@@ -1108,6 +1213,7 @@ def run_repair(args, active_paths, now):
             print("io cap: unavailable, using nice/ionice only", file=sys.stderr)
 
     sampler = DiskSampler(device_targets(args.dir))
+    args.sampler = sampler
     fixed = failed = 0
     written = 0
     budget = args.max_run_gb * 1e9
@@ -1150,13 +1256,15 @@ MODES = {
     # The gate uses average queue depth (drain_queue_max) and the unflushed
     # backlog instead.  Measured on this host: idle between groups reads
     # queue 0.0 / busy 0% / dirty <70 MB; while merging, queue 3-13 / busy
-    # 60-100% / dirty 400-500 MB.
+    # 60-100% / dirty 400-500 MB.  The cap is 60M rather than 90M because the
+    # drive drains about 50-80 MB/s: at 90M the page cache outran the drive and
+    # the backlog grew to ~1 GB, which is what pushed io pressure to 90%.
     "max": dict(io_rate="0", io_weight=1000, nice=0, io_class="best-effort", jobs=8,
                 cooldown=0.0, io_wait_max=0.0, io_wait_threshold=100.0,
                 disk_busy_threshold=100.0, drain_dirty_mb=0.0, drain_queue_max=0.0,
                 drain_window=5.0, drain_quiet=3.0,
                 drain_timeout_action="proceed"),
-    "balanced": dict(io_rate="90M", io_weight=100, nice=10, io_class="best-effort", jobs=1,
+    "balanced": dict(io_rate="60M", io_weight=100, nice=10, io_class="best-effort", jobs=1,
                      cooldown=5.0, io_wait_max=120.0, io_wait_threshold=100.0,
                      disk_busy_threshold=60.0, drain_dirty_mb=256.0, drain_queue_max=1.5,
                      drain_window=5.0, drain_quiet=3.0,
@@ -1184,6 +1292,11 @@ def main():
                     help="base directory (one folder per model, or flat .mts files)")
     ap.add_argument("--gap", type=int, default=3600,
                     help="max gap in seconds between recordings to merge (default 3600)")
+    ap.add_argument("--duration-from", choices=["mtime", "probe"], default="mtime",
+                    help="how to measure each recording's length: mtime = last-modified "
+                         "minus the start time in its name (cheap, default); probe = "
+                         "ffprobe container duration (accurate for copied files whose "
+                         "mtime is unrelated to the recording's end)")
     ap.add_argument("--slack", type=int, default=30,
                     help="extra seconds of slack when finding candidates via mtime (default 30)")
     ap.add_argument("--age", type=int, default=300,
@@ -1217,7 +1330,7 @@ def main():
 
     adv = ap.add_argument_group("pacing overrides (normally set by --mode)")
     adv.add_argument("--io-rate", default=None,
-                     help="hard read/write bandwidth cap per device, e.g. 90M; 0 disables")
+                     help="hard read/write bandwidth cap per device, e.g. 60M; 0 disables")
     adv.add_argument("--io-weight", type=int, default=None,
                      help="cgroup io weight for merge/repair ffmpeg (1-10000)")
     adv.add_argument("--nice", type=int, default=None,
@@ -1358,6 +1471,7 @@ def main():
 
     budget = args.max_run_gb * 1e9
     sampler = None if args.dry_run else DiskSampler(device_targets(args.dir))
+    args.sampler = sampler
     if model_groups and not args.dry_run:
         ensure_io_scope(args)
     gate_next = True
@@ -1378,6 +1492,9 @@ def main():
         summary.extend(res_summary)
         ran += 1
         gate_next = bool(bytes_out)
+        if STOP_REQUESTED:
+            print("stopping: disk still saturated, the next run will continue", file=sys.stderr)
+            break
         if budget and total_bytes >= budget:
             print(f"run budget reached ({args.max_run_gb:.0f} GB); stopping", file=sys.stderr)
             break
