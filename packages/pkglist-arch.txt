@@ -184,7 +184,6 @@ prismlauncher
 profile-sync-daemon
 protontricks
 pv
-python
 python-defusedxml
 python-packaging
 python-pip

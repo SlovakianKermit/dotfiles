@@ -5,10 +5,16 @@ local options = {
 	lossless = true,
 	output_dir = ".",
 	multi_cut_mode = "separate",
+	-- "onepass" renders every cut into the destination in a single ffmpeg run,
+	-- "segments" renders one file per cut and concatenates them afterwards
+	merge_mode = "onepass",
 	ffmpeg_path = "ffmpeg",
 	verify = true,
 	verify_duration = true,
 	duration_tolerance = 2.0,
+	-- extra tolerance per cut for the one-pass duration check: lossless cuts
+	-- snap to keyframes, so a single range can be off by up to one GOP
+	duration_slack_per_cut = 5.0,
 	min_size_bytes = 1024,
 	ffprobe_path = "ffprobe",
 	notify = true,
@@ -786,9 +792,9 @@ local function render_cut(input, outpath, start, duration, input_mtime)
 	return success
 end
 
+-- Only used when merge_mode=segments, or as the fallback when a one-pass render
+-- fails: renders nothing itself, just concatenates the already cut segments.
 local function merge_cuts(temp_dir, filepaths, outpath, input_mtime)
-	-- i hate that you have to do a separate command and render each cut separately first, i tried using
-	-- filter_complex for merging with multiple inputs but it wouldn't let me. todo: look into this further
 
 	local merge_file = join_paths(temp_dir, "merging.txt")
 	local content = ""
@@ -834,6 +840,147 @@ local function merge_cuts(temp_dir, filepaths, outpath, input_mtime)
 	end
 
 	return success
+end
+
+-- single-pass merge ---------------------------------------------------------
+-- The concat demuxer can re-open the same source once per range (inpoint /
+-- outpoint), so every kept range can be copied straight into the destination
+-- by one ffmpeg run. The kept bytes are then written once and read once,
+-- instead of being written as segments and read back again for the merge,
+-- which is what costs real time on a slow disk. Per-cut rendering only exists
+-- as the fallback below.
+
+-- ffmpeg picks the muxer from the extension, so the partial file keeps it
+local function partial_path_of(out_path)
+	local dir, name = out_path:match("^(.*)[/\\]([^/\\]+)$")
+	if not dir then
+		dir, name = ".", out_path
+	end
+
+	local base, ext = name:match("^(.*)(%.[^%.]+)$")
+	if not base then
+		base, ext = name, ""
+	end
+
+	return join_paths(dir, base .. ".part" .. ext)
+end
+
+-- concat lists live next to the queue rather than in the destination, so no
+-- scratch files ever appear in the user's output folder
+local function concat_list_dir()
+	local base = os.getenv("XDG_RUNTIME_DIR")
+	if not base or base == "" then
+		base = os.getenv("TMPDIR") or "/tmp"
+	end
+	return join_paths(base, "mpv-lossless-cut")
+end
+
+local function write_concat_list(path, input, cuts, offset, input_duration)
+	local lines = {}
+
+	for _, cut in ipairs(cuts) do
+		if cut.end_time then
+			local start = cut.start_time - offset
+			local stop = cut.end_time - offset
+			if start < 0 then
+				start = 0
+			end
+
+			table.insert(lines, string.format("file '%s'", ffmpeg_escape_filepath(input)))
+			if start > 0 then
+				table.insert(lines, string.format("inpoint %.6f", start))
+			end
+			-- an outpoint past EOF makes the demuxer give up on the entry
+			if not input_duration or stop < input_duration - 0.05 then
+				table.insert(lines, string.format("outpoint %.6f", stop))
+			end
+		end
+	end
+
+	return write_text(path, table.concat(lines, "\n") .. "\n")
+end
+
+-- Renders every cut into out_path in one pass. Returns nil on success, or a
+-- reason string (with nothing left behind) when the caller should fall back.
+local function render_onepass(job, out_path)
+	local scratch = concat_list_dir()
+	if not ensure_directory_exists(scratch) then
+		return "failed to create temporary directory"
+	end
+
+	local list_path = join_paths(scratch, string.format("%d-%d-concat.txt", my_pid, job.id))
+	local partial = partial_path_of(out_path)
+
+	local requested = 0
+	for _, cut in ipairs(job.cuts) do
+		if cut.end_time then
+			requested = requested + (cut.end_time - cut.start_time)
+		end
+	end
+
+	if not write_concat_list(list_path, job.input, job.cuts, job.cache_offset, probe_duration(job.input)) then
+		return "failed to write concat list"
+	end
+
+	log(string.format("Rendering %d cuts in one pass...", job.num_cuts))
+
+	local args = {
+		"-f",
+		"concat",
+		"-safe",
+		"0",
+		"-i",
+		list_path,
+		-- copy all input streams
+		"-map",
+		"0",
+		-- shift timestamps so they start at 0
+		"-avoid_negative_ts",
+		"make_zero",
+	}
+
+	if options.lossless then
+		table.insert(args, "-c")
+		table.insert(args, "copy")
+	end
+
+	table.insert(args, partial)
+
+	local ok = run_ffmpeg(args)
+	os.remove(list_path)
+
+	if not ok then
+		delete_file(partial)
+		return "ffmpeg failed"
+	end
+
+	local verified, reason = verify_output(partial)
+	if not verified then
+		delete_file(partial)
+		return reason
+	end
+
+	if options.verify_duration then
+		local actual = probe_duration(partial)
+		local slack = options.duration_tolerance + options.duration_slack_per_cut * job.num_cuts
+		if actual and math.abs(actual - requested) > slack then
+			delete_file(partial)
+			return string.format("duration mismatch (got %.2fs, cuts ask for %.2fs)", actual, requested)
+		end
+	end
+
+	-- only ever publish a finished file, so a failed or killed render cannot
+	-- leave a half-written video under the real name
+	if not os.rename(partial, out_path) then
+		delete_file(partial)
+		return "failed to move the rendered file into place"
+	end
+
+	if job.mtime then
+		set_file_times(out_path, job.mtime)
+	end
+
+	return nil
 end
 
 local function dump_cache(outpath)
@@ -984,112 +1131,130 @@ local function run_job(job)
 	local mtime = job.mtime
 	local cache_offset = job.cache_offset
 
-	-- merge segments go to a per-job scratch dir so neither a crashed run nor
-	-- a concurrent instance can poison this one
-	local seg_base = join_paths(outdir, ".mpv-cut-tmp")
-	local seg_dir = outdir
-	if do_merge then
-		prune_scratch(seg_base)
-		seg_dir = join_paths(seg_base, string.format("%d-%d", my_pid, job.id))
-		if not ensure_directory_exists(seg_dir) then
-			local err = "failed to create temporary directory"
-			log(err)
-			notify("Cut failed", err, "critical")
-			return
-		end
-	end
-
-	local rendered = {}
-
-	for i, cut in ipairs(job.cuts) do
-		if cut.end_time then
-			local duration = cut.end_time - cut.start_time
-
-			local target
-			if num_cuts == 1 then
-				target = out_path
-			elseif do_merge then
-				target = join_paths(seg_dir, string.format("seg_%d%s", i, ext))
-			else
-				target = join_paths(outdir, string.format("%s_%d%s", filename_noext, i, ext))
-			end
-
-			log(string.format("(%d/%d) Rendering cut to %s", i, num_cuts, target))
-
-			if render_cut(input, target, cut.start_time - cache_offset, duration, mtime) then
-				table.insert(rendered, { path = target, duration = duration })
-				log(string.format("(%d/%d) Rendered cut to %s", i, num_cuts, target))
-			else
-				log("Failed to render cut " .. i)
-			end
-		end
-	end
-
 	local failure
+	local success_path
+	local final_duration
+	local merged_in_one_pass = false
 
-	-- existence / size check on every produced piece
-	for _, seg in ipairs(rendered) do
-		local ok, reason = verify_output(seg.path)
-		if not ok then
-			failure = seg.path .. ": " .. reason
-			break
-		end
-	end
-
-	if not failure and #rendered < num_cuts then
-		failure = string.format("%d of %d segments failed to render", num_cuts - #rendered, num_cuts)
-	end
-
-	local success_path = nil
-	local final_duration = nil
-
-	if not failure and do_merge then
-		local seg_files = {}
-		local seg_duration = 0
-		for _, seg in ipairs(rendered) do
-			table.insert(seg_files, seg.path)
-			seg_duration = seg_duration + (probe_duration(seg.path) or 0)
-		end
-
-		log("Merging cuts...")
-		if not merge_cuts(seg_dir, seg_files, out_path, mtime) then
-			failure = "merge failed"
+	-- preferred route: all cuts rendered into the destination by a single
+	-- ffmpeg run, so the kept bytes are written once instead of twice
+	if do_merge and options.merge_mode ~= "segments" then
+		failure = render_onepass(job, out_path)
+		if failure then
+			log("Single-pass render failed (" .. failure .. "), falling back to per-cut rendering")
+			failure = nil
 		else
-			local ok, reason = verify_output(out_path)
-			local merged_duration = options.verify_duration and probe_duration(out_path) or nil
+			merged_in_one_pass = true
+			success_path = out_path
+			final_duration = options.verify_duration and probe_duration(out_path) or nil
+		end
+	end
 
-			if not ok then
-				failure = out_path .. ": " .. reason
-			elseif
-				options.verify_duration
-				and seg_duration > 0
-				and merged_duration
-				and math.abs(merged_duration - seg_duration) > options.duration_tolerance
-			then
-				-- a healthy concat matches the sum of its parts; comparing to the
-				-- *requested* length would false-fail because lossless cuts snap
-				-- to keyframes
-				failure = string.format(
-					"%s: merge duration mismatch (got %.2fs, parts sum to %.2fs)",
-					out_path,
-					merged_duration,
-					seg_duration
-				)
-			else
-				success_path = out_path
-				final_duration = merged_duration
+	if not merged_in_one_pass then
+		local seg_base = join_paths(outdir, ".mpv-cut-tmp")
+		local seg_dir = outdir
+		local uses_scratch = do_merge
+
+		-- per-cut segments go to a per-job scratch dir so neither a crashed
+		-- run nor a concurrent instance can poison this one
+		if uses_scratch then
+			prune_scratch(seg_base)
+			seg_dir = join_paths(seg_base, string.format("%d-%d", my_pid, job.id))
+			if not ensure_directory_exists(seg_dir) then
+				local err = "failed to create temporary directory"
+				log(err)
+				notify("Cut failed", err, "critical")
+				return
 			end
 		end
-	elseif not failure and num_cuts == 1 then
-		-- separate mode with one segment: already verified above
-		success_path = out_path
-		final_duration = options.verify_duration and probe_duration(out_path) or nil
-	end
 
-	if do_merge then
-		remove_dir(seg_dir)
-		-- leave no empty scratch dir behind in the destination
-		run({ "rmdir", seg_base })
+		local rendered = {}
+
+		for i, cut in ipairs(job.cuts) do
+			if cut.end_time then
+				local duration = cut.end_time - cut.start_time
+
+				local target
+				if num_cuts == 1 then
+					target = out_path
+				elseif do_merge then
+					target = join_paths(seg_dir, string.format("seg_%d%s", i, ext))
+				else
+					target = join_paths(outdir, string.format("%s_%d%s", filename_noext, i, ext))
+				end
+
+				log(string.format("(%d/%d) Rendering cut to %s", i, num_cuts, target))
+
+				if render_cut(input, target, cut.start_time - cache_offset, duration, mtime) then
+					table.insert(rendered, { path = target, duration = duration })
+					log(string.format("(%d/%d) Rendered cut to %s", i, num_cuts, target))
+				else
+					log("Failed to render cut " .. i)
+				end
+			end
+		end
+
+		-- existence / size check on every produced piece
+		for _, seg in ipairs(rendered) do
+			local ok, reason = verify_output(seg.path)
+			if not ok then
+				failure = seg.path .. ": " .. reason
+				break
+			end
+		end
+
+		if not failure and #rendered < num_cuts then
+			failure = string.format("%d of %d segments failed to render", num_cuts - #rendered, num_cuts)
+		end
+
+		if not failure and do_merge then
+			local seg_files = {}
+			local seg_duration = 0
+			for _, seg in ipairs(rendered) do
+				table.insert(seg_files, seg.path)
+				seg_duration = seg_duration + (probe_duration(seg.path) or 0)
+			end
+
+			log("Merging cuts...")
+			if not merge_cuts(seg_dir, seg_files, out_path, mtime) then
+				failure = "merge failed"
+			else
+				local ok, reason = verify_output(out_path)
+				local merged_duration = options.verify_duration and probe_duration(out_path) or nil
+
+				if not ok then
+					failure = out_path .. ": " .. reason
+				elseif
+					options.verify_duration
+					and seg_duration > 0
+					and merged_duration
+					and math.abs(merged_duration - seg_duration) > options.duration_tolerance
+				then
+					-- a healthy concat matches the sum of its parts; comparing to the
+					-- *requested* length would false-fail because lossless cuts snap
+					-- to keyframes
+					failure = string.format(
+						"%s: merge duration mismatch (got %.2fs, parts sum to %.2fs)",
+						out_path,
+						merged_duration,
+						seg_duration
+					)
+				else
+					success_path = out_path
+					final_duration = merged_duration
+				end
+			end
+		elseif not failure and num_cuts == 1 then
+			-- separate mode with one segment: already verified above
+			success_path = out_path
+			final_duration = options.verify_duration and probe_duration(out_path) or nil
+		end
+
+		if uses_scratch then
+			remove_dir(seg_dir)
+			-- leave no empty scratch dir behind in the destination
+			run({ "rmdir", seg_base })
+		end
 	end
 
 	-- the output is final (or the job is over): let the next instance start,
