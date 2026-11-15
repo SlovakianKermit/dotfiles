@@ -5,6 +5,7 @@ cpuid
 deadlock-modmanager-bin
 eden-bin
 fuzzy-pkg-finder
+gallery-dl
 handbrake-full
 handbrake-full-cli
 ludusavi-bin

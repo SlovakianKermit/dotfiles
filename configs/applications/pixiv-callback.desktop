@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Pixiv OAuth callback
+Comment=Capture pixiv:// OAuth callback URLs for gallery-dl
+Exec=sh -c "mkdir -p \"$HOME/.cache\"; printf '%%s\\n' \"%u\" >> \"$HOME/.cache/pixiv-oauth-url\""
+MimeType=x-scheme-handler/pixiv;
+NoDisplay=true
+Terminal=false

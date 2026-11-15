@@ -84,6 +84,7 @@ video/x-sgi-movie=mpv.desktop
 video/x-theora=mpv.desktop
 video/x-theora+ogg=mpv.desktop
 x-scheme-handler/mailto=helium.desktop
+x-scheme-handler/pixiv=pixiv-callback.desktop
 
 [Added Associations]
 x-scheme-handler/http=helium.desktop;userapp-Zen-NLK7P3.desktop;zen.desktop;
@@ -170,3 +171,4 @@ video/x-sgi-movie=mpv.desktop
 video/x-theora=mpv.desktop
 video/x-theora+ogg=mpv.desktop
 x-scheme-handler/mailto=helium.desktop
+x-scheme-handler/pixiv=pixiv-callback.desktop
