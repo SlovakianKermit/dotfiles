@@ -11,6 +11,14 @@ side-by-side HEVC frame) and refuses to shrink the frame: the encoded
 output must keep the source's exact pixel dimensions or the job fails.  VR
 outputs are written under a VR/ subdirectory of the output root.
 
+--vr-square implies --vr and repairs captures whose two eyes are not square
+(a 3840x1440 side-by-side frame is 2 eyes of 1920x1440, 4:3).  Fisheye
+players assume the 180/190 degree circle is inscribed in a square eye, so
+those streams look "slightly off" at every FOV preset.  Padding each eye's
+short axis with black restores the square layout without touching a single
+real pixel; no resampling is involved.  Padding has to run on system memory,
+so --vr-square forces software decode and the GPU still does the encode.
+
 --fix-pts rebuilds the output timeline from element counts (decoded frame
 index for video, decoded sample count for audio) instead of trusting the
 container timestamps.  Long MPEG-TS captures sometimes keep recording long
@@ -502,7 +510,8 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
                       device: str, copy_audio: bool = True,
                       sw_decode: bool = False, fix_pts: bool = False,
                       fps: float = 30.0,
-                      pin_size: Optional[Tuple[int, int]] = None) -> List[str]:
+                      pin_size: Optional[Tuple[int, int]] = None,
+                      pad_to: Optional[Tuple[int, int]] = None) -> List[str]:
     # sw_decode: software decode + hwupload for streams the VAAPI decoder
     # can't initialise on (e.g. malformed 4K SPS); the GPU still encodes.
     # fix_pts: rebuild the timeline from frame index / sample count for
@@ -510,6 +519,7 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
     # pin_size: force every frame to one size.  The VAAPI encoder cannot be
     # reconfigured mid-run, and a source that changes resolution makes it
     # fault the chip; a constant scale keeps the graph (and encoder) static.
+    # pad_to: pad to this size before upload (--vr-square).
     cmd = [
         "ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error",
         "-progress", "pipe:1", "-nostats",
@@ -527,6 +537,12 @@ def _build_ffmpeg_cmd(job: Job, codec: str, preset: str, quality: int,
         w, h = pin_size
         vf.append(f"scale={w}:{h}" if sw_decode
                   else f"scale_vaapi=w={w}:h={h}")
+    if pad_to:
+        # --vr-square: restore a square per-eye frame by padding the short
+        # axis.  VAAPI has no pad filter, so this always runs on system
+        # memory and the graph ends with format=nv12,hwupload below.
+        pw, ph = pad_to
+        vf.append(f"pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black")
     if sw_decode:
         pix_fmt = get_pix_fmt(job.input_path)
         if is_rgb_pix_fmt(pix_fmt):
@@ -675,10 +691,11 @@ def _run_ffmpeg(cmd: List[str], job: Job, state: SharedState) -> Tuple[int, str]
 
 def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
                   quality: int, delete_original: bool, vr: bool = False,
-                  fix_pts_mode: str = "auto"):
+                  fix_pts_mode: str = "auto", vr_square: bool = False):
     device = find_vaapi_device()
     sw_decode = False
     pin_size: Optional[Tuple[int, int]] = None
+    pad_to: Optional[Tuple[int, int]] = None
     # ADTS AAC in MPEG-TS captures is routinely damaged: packet loss during
     # recording leaves truncated frames and corrupt ADTS headers.  Copying it
     # into Matroska runs the implicit aac_adtstoasc bitstream filter, which
@@ -691,6 +708,24 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     # not stall startup behind one ffprobe per file.
     job.duration = job.duration or get_duration(job.input_path)
     fps = get_frame_rate(job.input_path) or 30.0
+
+    # --vr-square: fisheye players map the 180/190 degree circle onto a square
+    # per-eye frame.  A capture whose eye is not square (e.g. 3840x1440 -> 2x
+    # 1920x1440) is a vertical crop of that square and cannot be fixed by any
+    # FOV preset, only by restoring the layout.  Padding adds no picture, so
+    # the source pixels pass through untouched.  Software decode is required
+    # because VAAPI has no pad filter; the encode still runs on the GPU.
+    if vr_square:
+        dims = get_dimensions(job.input_path)
+        if dims:
+            w, h = dims
+            eye_w = w // 2
+            if eye_w > h:                       # eye wider than tall: crop
+                pad_to = (w, eye_w + eye_w % 2)
+            elif eye_w < h:                     # eye taller than wide: crop
+                pad_to = ((2 * h) + h % 2, h)
+            if pad_to:
+                sw_decode = True
 
     # A stalled capture clock makes the container duration a lie: the encode
     # would pin at 100% and cram the remaining picture into the last seconds.
@@ -712,7 +747,8 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
     def attempt() -> Tuple[int, str]:
         return _run_ffmpeg(
             _build_ffmpeg_cmd(job, codec, preset, quality, device,
-                              copy_audio, sw_decode, fix_pts, fps, pin_size),
+                              copy_audio, sw_decode, fix_pts, fps, pin_size,
+                              pad_to),
             job, state)
 
     try:
@@ -751,10 +787,12 @@ def ffmpeg_worker(job: Job, state: SharedState, codec: str, preset: str,
         dims_changed = ""
         if out_size and vr:
             # VR: never accept a downscaled/re-cropped frame.  The two
-            # fisheye eyes must survive at their source resolution.
+            # fisheye eyes must survive at their source resolution.  With
+            # --vr-square the expected size is the padded one.
             din = get_dimensions(job.input_path)
             dout = get_dimensions(job.output_path)
-            if din and dout and din != dout:
+            expected = pad_to or din
+            if din and dout and dout != expected:
                 dims_changed = f"{din[0]}x{din[1]} -> {dout[0]}x{dout[1]}"
 
         was_cancelled = cancelled()
@@ -901,7 +939,7 @@ class TUI:
                     target=ffmpeg_worker,
                     args=(job, self.state, self.args.codec, self.args.preset,
                           self.args.quality, self.args.delete, self.args.vr,
-                          self.args.fix_pts),
+                          self.args.fix_pts, self.args.vr_square),
                     daemon=True,
                 )
                 self.state.workers.append(t)
@@ -1187,6 +1225,8 @@ class TUI:
         left = f" ffmpeg-encode [qp {self.args.quality}"
         if self.args.vr:
             left += " vr"
+        if self.args.vr_square:
+            left += "+square"
         left += "] "
         right = f" Elapsed: {ts}  Queued: {pending_count} "
 
@@ -1504,6 +1544,12 @@ def parse_args() -> argparse.Namespace:
                         "the source; never downscales. Outputs are written "
                         "under a VR/ subdirectory of the output root. An "
                         "explicit -q still overrides the default.")
+    p.add_argument("--vr-square", dest="vr_square", action="store_true",
+                   help="Implies --vr, and pads each eye to a square frame "
+                        "(e.g. 3840x1440 -> 3840x1920) so 180/190 degree "
+                        "fisheye presets map correctly. Never resamples the "
+                        "picture; the square-per-eye check is skipped when "
+                        "the eyes are already square.")
     p.add_argument("--fix-pts", dest="fix_pts", default="auto",
                    choices=["auto", "always", "never"],
                    help="Rebuild the output timeline from decoded frame/sample "
@@ -1524,6 +1570,10 @@ def main():
         args.i = [DEFAULT_INPUT_DIR]
     args.delete = not args.keep  # delete is default; -k keeps both files
     args.codec = DEFAULT_CODEC   # AV1 is no longer offered on the CLI
+    # --vr-square is --vr plus the square-per-eye repair: same quality
+    # default, same VR/ output tree, same "never downscale" guarantee.
+    if args.vr_square:
+        args.vr = True
     if args.jobs < 1:
         print("Error: --jobs must be >= 1", file=sys.stderr)
         sys.exit(1)

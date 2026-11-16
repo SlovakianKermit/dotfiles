@@ -1,4 +1,4 @@
-.TH FFMPEG-ENCODE 1 "2026-11-12" "ffmpeg-encode" "User Commands"
+.TH FFMPEG-ENCODE 1 "2026-11-16" "ffmpeg-encode" "User Commands"
 .SH NAME
 ffmpeg-encode \- VAAPI HEVC batch video encoder with curses TUI
 .SH SYNOPSIS
@@ -74,6 +74,18 @@ differ from the source (the job fails and the file is removed). It never
 rescales, crops or reduces the frame, and an explicit
 .B \-q
 still overrides the default.
+.P
+With
+.B \-\-vr\-square
+that square\-per\-eye assumption is repaired. VR180 and 190 degree fisheye
+presets map the lens circle onto a square eye; a capture whose eye is not
+square (a 3840\(mu1440 frame is two 1920\(mu1440 eyes, 4:3) is a vertical crop
+of that square and looks slightly wrong at every field\-of\-view setting. The
+option pads each eye's short axis with black to restore the square layout
+(3840\(mu1440 becomes 3840\(mu1920) without touching a single picture pixel.
+It implies
+.BR \-\-vr ,
+and the output resolution check accepts exactly that padded size.
 .P
 The TUI shows a running percentage, frames per second, a smoothed encoding
 speed multiplier and an estimated time remaining for the current file, the
@@ -157,6 +169,16 @@ as failed and the output removed. The encoder never downscales or crops in
 this mode. An explicit
 .B \-q
 overrides the VR quality default.
+.TP
+.B \-\-vr\-square
+Implies
+.BR \-\-vr ,
+and pads each eye to a square frame before encoding: a 3840\(mu1440
+side\-by\-side capture becomes 3840\(mu1920, that is two 1920\(mu1920 eyes with
+240 black rows above and below. The picture is never resampled, scaled or
+cropped; only the layout is restored. Captures whose eyes are already square
+are encoded unchanged. Because VAAPI has no pad filter, padding runs on system
+memory, so these files are decoded in software while the GPU still encodes.
 .TP
 .BI \-\-fix\-pts " MODE"
 Rebuild the output timeline from decoded element counts instead of the
@@ -387,6 +409,13 @@ goes to
 .IP
 .EX
 ffmpeg-encode \-\-vr \-\-input vr180.ts
+.EE
+.P
+Repair a 4:3\-per\-eye VR capture (two 1920\(mu1440 eyes padded to two
+1920\(mu1920 eyes, so 190 degree fisheye presets line up):
+.IP
+.EX
+ffmpeg-encode \-\-vr\-square \-\-input Miss_Ida.ts
 .EE
 .P
 VR batch run into a custom split tree (outputs land in
