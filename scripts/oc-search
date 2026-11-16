@@ -123,6 +123,6 @@ rg --files-with-matches --smart-case --no-ignore '' "$cache_dir" 2>/dev/null \
     --disabled \
     --bind "change:reload(rg --files-with-matches --smart-case --no-ignore {q} $cache_dir 2>/dev/null | sed 's|^$cache_dir/||' | sort || true)" \
     --bind "enter:execute(nvim $cache_dir/{})" \
-    --bind 'ctrl-o:become(fish,-c,systemctl --user start supermemory.service 2>/dev/null; opencode -s (basename {} | cut -d: -f3))' \
+    --bind 'ctrl-o:become(systemctl --user start supermemory.service 2>/dev/null; opencode -s {2})' \
     --bind "ctrl-x:execute-silent(oc-search-delete {})+reload(rg --files-with-matches --smart-case --no-ignore {q} $cache_dir 2>/dev/null | sed 's|^$cache_dir/||' | sort || true)+transform-header(oc-search-header {})" \
     --bind "focus:transform-header(oc-search-header {})"
