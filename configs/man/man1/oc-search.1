@@ -1,4 +1,4 @@
-.TH OC-SEARCH 1 "2026-08-25" "oc-search" "User Commands"
+.TH OC-SEARCH 1 "2026-11-16" "oc-search" "User Commands"
 .SH NAME
 oc-search \- search opencode conversation history with ripgrep and fzf
 .SH SYNOPSIS
@@ -15,12 +15,30 @@ then lets you filter and open the cached sessions with
 .P
 The database is read from
 .IR ~/.local/share/opencode/opencode.db .
+The
+.B opencode
+v2 schema is used: sessions come from the
+.B session_v2
+table and messages from
+.B session_message
+(user text lives in the message's
+.B text
+field, assistant text in the
+.B content
+array's text parts). The legacy v1 tables
+.RI ( session ,
+.IR message ,
+.IR part )
+are no longer read.
 Only non-archived sessions are indexed. The fzf list is sorted by last
 update time ascending, so the oldest conversation is at the top and the
-newest at the bottom. If the database does not exist, or either
-.B rg
-or
+newest at the bottom. If the database does not exist, has no
+.B session_v2
+table, or any of
+.BR rg ,
 .B fzf
+or
+.B sqlite3
 is not installed, the script prints an error to stderr and exits with
 status 1.
 .P
@@ -60,7 +78,9 @@ and
 prefixes are hidden), with the oldest conversation at the top.
 .P
 A session is re-dumped when its cached file is older than the session's
-update time. User messages that begin with
+update time. Only user and assistant messages are dumped: system,
+synthetic and compaction events are skipped as harness noise. User
+messages that begin with
 .B [SUPERMEMORY]
 or
 .B <supermemory-recall>
@@ -103,9 +123,16 @@ Delete the selected conversation. Pressing
 .B CTRL-X
 once arms the deletion for the selected conversation (the header shows
 a \*(lqpress again to confirm delete\*(rq hint); pressing it again on the
-same conversation removes the session, its messages and parts from the
-database and deletes its cache file, so the conversation disappears from
-the list. Pressing
+same conversation removes the session and its messages from the database
+(the v2
+.B session_v2
+row is deleted, along with any child sessions, their
+.BR session_message ,
+.B session_part
+and
+.B blob_ref
+rows, plus matching legacy v1 rows) and deletes its cache file, so the
+conversation disappears from the list. Pressing
 .B CTRL-X
 on a different conversation re-arms it to that one.
 .TP

@@ -3,6 +3,8 @@
 # First press with the same conversation selected arms the delete;
 # a second press on the same conversation removes it from the database and cache.
 # Usage: oc-search-delete <cache-file-basename>
+#
+# Deletes from the opencode v2 tables (and the legacy v1 tables if still present).
 
 set -q OC_SEARCH_DB; and set db "$OC_SEARCH_DB"; or set db ~/.local/share/opencode/opencode.db
 set -q OC_SEARCH_CACHE; and set cache_dir "$OC_SEARCH_CACHE"; or set cache_dir ~/.cache/oc-search
@@ -13,11 +15,22 @@ set pending "$cache_dir/.pending"
 
 if test -f "$pending"; and test (cat "$pending") = "$file"
     rm -f "$pending"
+    # Child sessions (subagents/tasks) first so they don't outlive the parent.
+    set -l children (sqlite3 -cmd '.timeout 5000' "$db" "SELECT id FROM session_v2 WHERE parent_id='$id';" 2>/dev/null)
     if sqlite3 -cmd '.timeout 5000' "$db" "
+            PRAGMA foreign_keys = ON;
+            DELETE FROM session_v2 WHERE parent_id='$id';
+            DELETE FROM session_part WHERE session_id='$id';
+            DELETE FROM session_message WHERE session_id='$id';
+            DELETE FROM blob_ref WHERE session_id='$id';
+            DELETE FROM session_v2 WHERE id='$id';
             DELETE FROM part WHERE session_id='$id';
             DELETE FROM message WHERE session_id='$id';
-            DELETE FROM session WHERE id='$id';"
+            DELETE FROM session WHERE id='$id';" 2>/dev/null
         rm -f "$cache_dir/$file"
+        for child in $children
+            find "$cache_dir" -maxdepth 1 -type f -name "*::$child::*" -delete
+        end
     end
 else
     echo "$file" > "$pending"

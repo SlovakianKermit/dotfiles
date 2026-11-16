@@ -2,21 +2,29 @@
 # Search opencode conversations using ripgrep + fzf
 # Caches session text to ~/.cache/oc-search/
 # Usage: oc-search [query]
+#
+# Works with the opencode v2 schema (session_v2 / session_message / session_part).
+# v1 schema (session / message / part) is no longer read.
 
 set -q OC_SEARCH_DB; and set db "$OC_SEARCH_DB"; or set db ~/.local/share/opencode/opencode.db
 set -q OC_SEARCH_CACHE; and set cache_dir "$OC_SEARCH_CACHE"; or set cache_dir ~/.cache/oc-search
-set -l cache_version 4
+set -l cache_version 5
 
 if not test -f "$db"
     echo "Error: No opencode database at $db" >&2
     exit 1
 end
 
-for cmd in rg fzf
+for cmd in rg fzf sqlite3
     if not command -q $cmd
         echo "Error: $cmd not installed" >&2
         exit 1
     end
+end
+
+if test (sqlite3 "$db" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='session_v2';") -eq 0
+    echo "Error: $db has no session_v2 table (not an opencode v2 database)" >&2
+    exit 1
 end
 
 mkdir -p "$cache_dir"
@@ -24,20 +32,21 @@ mkdir -p "$cache_dir"
 # -- force cache rebuild if script was updated --
 set -l version_file "$cache_dir/.version"
 if not test -f "$version_file"; or test (cat "$version_file") -ne $cache_version
-    rm -f "$cache_dir"/* 2>/dev/null
+    find "$cache_dir" -maxdepth 1 -type f -delete
     echo $cache_version >"$version_file"
 end
 
 # --- update cache ---
+# Columns are emitted id|updated|title so titles may contain '|' safely.
 sqlite3 -separator '|' "$db" "
-    SELECT s.id, s.title, s.time_updated
-    FROM session s
+    SELECT s.id, s.time_updated, coalesce(s.title, 'untitled')
+    FROM session_v2 s
     WHERE s.time_archived IS NULL
     ORDER BY s.time_updated DESC
 " | while read -l line
     set -l id (echo "$line" | cut -d'|' -f1)
-    set -l title (echo "$line" | cut -d'|' -f2)
-    set -l updated (echo "$line" | cut -d'|' -f3)
+    set -l updated (echo "$line" | cut -d'|' -f2)
+    set -l title (echo "$line" | cut -d'|' -f3-)
 
     set -l safe_title (echo "$title" | string replace -ar '[\/:*?"<>|]' '_' | string shorten -m 80)
     set -l cache_file "$cache_dir"/"$updated"::"$id"::"$safe_title"
@@ -51,30 +60,47 @@ sqlite3 -separator '|' "$db" "
     end
 
     if test "$needs_update" -eq 1
-        set -l created (sqlite3 "$db" "SELECT datetime(time_created/1000, 'unixepoch', 'localtime') FROM session WHERE id='$id';")
+        set -l created (sqlite3 "$db" "SELECT datetime(time_created/1000, 'unixepoch', 'localtime') FROM session_v2 WHERE id='$id';")
 
         # Write header
         printf '# %s\n# %s\n\n' "$title" "$created" > "$cache_file"
 
-        # Write messages — skip supermemory [SUPERMEMORY] injection messages
+        # Write messages.
+        # v2 keeps user text in data.text and assistant text parts in data.content[].
+        # Synthetic/system/compaction events are harness noise and are skipped,
+        # as are supermemory context injections.
         sqlite3 "$db" "
             SELECT
                 '## ' ||
-                CASE json_extract(m.data, '\$.role')
+                CASE t.type
                     WHEN 'user' THEN 'USER'
                     WHEN 'assistant' THEN 'ASSISTANT'
-                    ELSE json_extract(m.data, '\$.role')
+                    ELSE upper(t.type)
                 END ||
-                ' (' || datetime(m.time_created/1000, 'unixepoch', 'localtime') || ')' || x'0a' || x'0a' ||
-                replace(json_extract(p.data, '\$.text'), '**', '') || x'0a' || x'0a'
-            FROM message m
-            JOIN part p ON p.message_id = m.id
-            WHERE m.session_id = '$id'
-              AND json_extract(p.data, '\$.type') = 'text'
-              AND NOT (json_extract(m.data, '\$.role') = 'user'
-                       AND (json_extract(p.data, '\$.text') LIKE '[SUPERMEMORY]%'
-                            OR json_extract(p.data, '\$.text') LIKE '<supermemory-recall>%'))
-            ORDER BY m.time_created, m.id, p.id
+                ' (' || datetime(t.time_created/1000, 'unixepoch', 'localtime') || ')' ||
+                char(10) || char(10) ||
+                t.body || char(10) || char(10)
+            FROM (
+                SELECT
+                    m.seq,
+                    m.type,
+                    m.time_created,
+                    replace(coalesce(
+                        json_extract(m.data, '\$.text'),
+                        (SELECT group_concat(json_extract(j.value, '\$.text'), char(10) || char(10))
+                           FROM json_each(json_extract(m.data, '\$.content')) j
+                          WHERE json_extract(j.value, '\$.type') = 'text')
+                    ), '**', '') AS body
+                FROM session_message m
+                WHERE m.session_id = '$id'
+                  AND m.type IN ('user', 'assistant')
+            ) t
+            WHERE t.body IS NOT NULL
+              AND trim(t.body) <> ''
+              AND NOT (t.type = 'user'
+                       AND (t.body LIKE '[SUPERMEMORY]%'
+                            OR t.body LIKE '<supermemory-recall>%'))
+            ORDER BY t.seq
         " >> "$cache_file"
     end
 end
