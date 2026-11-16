@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Find and (optionally) forget near-duplicate supermemory memories.
+
+Pruning uses the free exact-ID forget endpoint, never semantic search, so a
+prune costs zero model tokens.  Duplicates are detected locally with token-set
+similarity over block keys; anything whose identifiers (numbers, paths, code
+spans) differ is only reported, never auto-merged.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from collections import defaultdict
+from datetime import datetime, timezone
+
+DEFAULT_BASE = "http://localhost:6767"
+DEFAULT_NAMESPACE = "sm_project_default"
+ENV_FILE = os.path.expanduser("~/.config/supermemory/env")
+
+IDENT_RE = re.compile(r"`[^`]+`|\b\d[\d.:/-]*\b|/[\w./-]+")
+
+
+def load_api_key(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    for var in ("SUPERMEMORY_API_KEY", "SM_API_KEY"):
+        if os.environ.get(var):
+            return os.environ[var]
+    key_file = os.path.expanduser("~/.supermemory/api-key")
+    if os.path.isfile(key_file):
+        with open(key_file, encoding="utf-8") as fh:
+            key = fh.read().strip()
+        if key:
+            return key
+    raise SystemExit("no API key: pass --api-key or set SUPERMEMORY_API_KEY")
+
+
+def api(base: str, key: str, method: str, path: str, body: dict | None = None) -> dict:
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        base.rstrip("/") + path,
+        data=data,
+        method=method,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise SystemExit(f"{method} {path} failed: {exc.code} {detail}") from exc
+
+
+def fetch_memories(base: str, key: str, namespace: str, page_size: int = 200) -> list[dict]:
+    out: list[dict] = []
+    page = 1
+    while True:
+        resp = api(
+            base,
+            key,
+            "POST",
+            "/v4/memories/list",
+            {
+                "containerTags": [namespace],
+                "limit": page_size,
+                "page": page,
+                "order": "desc",
+                "sort": "createdAt",
+            },
+        )
+        batch = resp.get("memoryEntries") or []
+        out.extend(batch)
+        pagination = resp.get("pagination") or {}
+        if page >= (pagination.get("totalPages") or 1) or not batch:
+            break
+        page += 1
+    return [m for m in out if m.get("isLatest", True) and not m.get("isForgotten")]
+
+
+def tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 2}
+
+
+def idents(text: str) -> set[str]:
+    return {i.strip().lower() for i in IDENT_RE.findall(text)}
+
+
+def jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+NUM_HASHES = 64
+NUM_BANDS = 32
+PRIME = (1 << 61) - 1
+
+
+def minhash(toks: set[str]) -> list[int]:
+    """64-element minhash signature via affine permutations of one base hash."""
+    if not toks:
+        return [0] * NUM_HASHES
+    base = [hash(t) & 0xFFFFFFFFFFFF for t in toks]
+    sig = []
+    for i in range(NUM_HASHES):
+        a = 2 * i + 1
+        b = 7 * i + 3
+        sig.append(min(((a * h + b) % PRIME) for h in base))
+    return sig
+
+
+def lsh_candidates(memories: list[dict]) -> set[tuple[int, int]]:
+    buckets: dict[tuple, list[int]] = defaultdict(list)
+    for idx, mem in enumerate(memories):
+        sig = minhash(tokens(mem["memory"]))
+        for band in range(NUM_BANDS):
+            start = band * (NUM_HASHES // NUM_BANDS)
+            buckets[(band, tuple(sig[start : start + NUM_HASHES // NUM_BANDS]))].append(idx)
+    pairs: set[tuple[int, int]] = set()
+    for idxs in buckets.values():
+        if len(idxs) < 2 or len(idxs) > 60:
+            continue
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                pairs.add((min(idxs[i], idxs[j]), max(idxs[i], idxs[j])))
+    return pairs
+
+
+def semantic_pairs(
+    base: str, key: str, namespace: str, memories: list[dict], threshold: float, workers: int
+) -> set[tuple[int, int]]:
+    """Ask the server for each memory's nearest neighbours (local embeddings, no LLM)."""
+    import concurrent.futures
+
+    by_text = {m["memory"]: i for i, m in enumerate(memories)}
+
+    def probe(mem: dict) -> list[tuple[int, int]]:
+        body = {
+            "q": mem["memory"],
+            "containerTags": [namespace],
+            "limit": 3,
+            "threshold": threshold,
+            "searchMode": "memories",
+        }
+        try:
+            results = api(base, key, "POST", "/v4/search", body).get("results") or []
+        except SystemExit:
+            return []
+        out = []
+        me = by_text.get(mem["memory"])
+        for res in results:
+            other = by_text.get((res.get("memory") or "").strip())
+            sim = res.get("similarity") or res.get("score") or 0
+            if other is None or other == me or sim < threshold:
+                continue
+            out.append((min(me, other), max(me, other)))
+        return out
+
+    pairs: set[tuple[int, int]] = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for found in pool.map(probe, memories):
+            pairs.update(found)
+    return pairs
+
+
+def cluster(memories: list[dict], threshold: float, pairs: set[tuple[int, int]] | None = None) -> list[list[int]]:
+    parent = list(range(len(memories)))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for a, b in pairs:
+        if idents(memories[a]["memory"]) != idents(memories[b]["memory"]):
+            continue  # different dates/versions: keep both
+        union(a, b)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+    for idx in range(len(memories)):
+        groups[find(idx)].append(idx)
+    return [sorted(g) for g in groups.values() if len(g) > 1]
+
+
+def winner(memories: list[dict], group: list[int]) -> int:
+    """Newest memory wins; longer text breaks ties."""
+
+    def rank(idx: int):
+        mem = memories[idx]
+        return (mem.get("createdAt") or "", len(mem.get("memory") or ""))
+
+    return max(group, key=rank)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="sm-memory-prune",
+        description="Detect near-duplicate supermemory memories and optionally forget them (free).",
+    )
+    parser.add_argument("--base", default=os.environ.get("SUPERMEMORY_BASE_URL", DEFAULT_BASE))
+    parser.add_argument("--namespace", default=DEFAULT_NAMESPACE)
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--threshold", type=float, default=0.92)
+    parser.add_argument(
+        "--mode",
+        choices=("lexical", "semantic"),
+        default="lexical",
+        help="lexical: minhash/Jaccard on text (fast, offline); semantic: server embeddings via /v4/search (no LLM tokens)",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="parallel search workers in semantic mode")
+    parser.add_argument(
+        "--apply-min-lexical",
+        type=float,
+        default=0.85,
+        help="with --apply, only merge groups whose wording overlaps this much (guards against near-identical but different facts)",
+    )
+    parser.add_argument("--cache", default=os.path.expanduser("~/.cache/sm-memory-prune/pairs.json"))
+    parser.add_argument("--no-cache", action="store_true", help="ignore any cached semantic pairs")
+    parser.add_argument("--apply", action="store_true", help="actually forget duplicates")
+    parser.add_argument("--max-clusters", type=int, default=0, help="limit clusters processed (0 = all)")
+    parser.add_argument("--show", type=int, default=10, help="how many clusters to print")
+    parser.add_argument("--json", action="store_true", help="machine-readable cluster dump")
+    args = parser.parse_args(argv)
+
+    key = load_api_key(args.api_key)
+    mems = fetch_memories(args.base, key, args.namespace)
+    fingerprint = hashlib.sha256(
+        ("|".join(sorted(m["id"] for m in mems)) + f"|{args.threshold}").encode()
+    ).hexdigest()
+
+    cached_pairs = None
+    if not args.no_cache and os.path.isfile(args.cache):
+        try:
+            with open(args.cache, encoding="utf-8") as fh:
+                blob = json.load(fh)
+            if blob.get("fingerprint") == fingerprint:
+                cached_pairs = {tuple(p) for p in blob.get("pairs", [])}
+        except (OSError, json.JSONDecodeError):
+            cached_pairs = None
+
+    if args.mode == "semantic":
+        if cached_pairs is not None:
+            pairs = cached_pairs
+        else:
+            pairs = semantic_pairs(args.base, key, args.namespace, mems, args.threshold, args.workers)
+            try:
+                os.makedirs(os.path.dirname(args.cache), exist_ok=True)
+                with open(args.cache, "w", encoding="utf-8") as fh:
+                    json.dump({"fingerprint": fingerprint, "pairs": sorted(pairs)}, fh)
+            except OSError:
+                pass
+    else:
+        pairs = {
+            (a, b)
+            for a, b in lsh_candidates(mems)
+            if jaccard(tokens(mems[a]["memory"]), tokens(mems[b]["memory"])) >= args.threshold
+        }
+    groups = cluster(mems, args.threshold, pairs)
+    groups.sort(key=len, reverse=True)
+    if args.max_clusters:
+        groups = groups[: args.max_clusters]
+
+    def safe(group: list[int]) -> bool:
+        for a in range(len(group)):
+            for b in range(a + 1, len(group)):
+                if (
+                    jaccard(tokens(mems[group[a]]["memory"]), tokens(mems[group[b]]["memory"]))
+                    < args.apply_min_lexical
+                ):
+                    return False
+        return True
+
+    safe_groups = [g for g in groups if safe(g)]
+    review_groups = [g for g in groups if not safe(g)]
+    removable = sum(len(g) - 1 for g in groups)
+    safe_removable = sum(len(g) - 1 for g in safe_groups)
+    print(
+        f"namespace={args.namespace} active_memories={len(mems)} mode={args.mode} "
+        f"duplicate_clusters={len(groups)} removable={removable} threshold={args.threshold}"
+    )
+    print(
+        f"safe_to_apply={len(safe_groups)} (rows {safe_removable}) "
+        f"review_only={len(review_groups)} (wording differs; would delete distinct facts)"
+    )
+
+    if args.json:
+        dump = [
+            {
+                "winner": mems[winner(mems, g)]["id"],
+                "forget": [mems[i]["id"] for i in g if i != winner(mems, g)],
+                "memories": [mems[i]["memory"] for i in g],
+            }
+            for g in groups
+        ]
+        print(json.dumps(dump, indent=1))
+    else:
+        for g in groups[: args.show]:
+            w = winner(mems, g)
+            print(f"\ncluster of {len(g)} (keep {mems[w]['id']}):")
+            print(f"  KEEP  {mems[w]['memory'][:150]}")
+            for i in g:
+                if i != w:
+                    print(f"  DROP  {mems[i]['memory'][:150]}")
+
+    if not args.apply:
+        print("\ndry run: nothing changed (pass --apply to forget only the safe clusters)")
+        return 0
+
+    ids: list[str] = []
+    for g in safe_groups:
+        w = winner(mems, g)
+        ids.extend(mems[i]["id"] for i in g if i != w)
+
+    if not ids:
+        print("nothing safe to forget")
+        return 0
+    forgotten = 0
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        resp = api(
+            args.base,
+            key,
+            "DELETE",
+            f"/ns/{args.namespace}/memories",
+            {"ids": chunk},
+        )
+        forgotten += resp.get("count", 0)
+    print(f"forgot {forgotten} memories at {datetime.now(timezone.utc).isoformat(timespec='seconds')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

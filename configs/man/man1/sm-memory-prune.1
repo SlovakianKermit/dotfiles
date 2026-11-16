@@ -1,0 +1,159 @@
+.TH SM-MEMORY-PRUNE 1 2026-11-16 "sm-memory-prune 1.0" "User Commands"
+.SH NAME
+sm-memory-prune \- find and forget near-duplicate supermemory memories
+.SH SYNOPSIS
+.B sm-memory-prune
+.RB [ \-\-base
+.IR url ]
+.RB [ \-\-namespace
+.IR tag ]
+.RB [ \-\-threshold
+.IR sim ]
+.RB [ \-\-mode
+.RI { lexical | semantic }]
+.RB [ \-\-workers
+.IR n ]
+.RB [ \-\-apply ]
+.RB [ \-\-apply-min-lexical
+.IR sim ]
+.RB [ \-\-max-clusters
+.IR n ]
+.RB [ \-\-show
+.IR n ]
+.RB [ \-\-json ]
+.RB [ \-\-cache
+.IR file ]
+.RB [ \-\-no-cache ]
+.RB [ \-\-api-key
+.IR key ]
+.SH DESCRIPTION
+.B sm-memory-prune
+reads every active memory in one supermemory namespace, groups near-duplicates,
+and can forget the redundant copies.  Detection never calls an LLM, and
+deletion uses the exact-ID forget endpoint, so a full prune costs zero model
+tokens.
+.P
+Two detection modes exist.
+.B lexical
+(the default) hashes token sets with MinHash and verifies Jaccard similarity
+locally; it only catches near-verbatim repeats but needs no server calls.
+.B semantic
+asks the running server for each memory's nearest neighbours through
+.BR /v4/search ,
+which uses the local embedding model (no LLM).  It is slower (roughly a
+minute per thousand memories) but finds paraphrases.  Results are cached.
+.P
+Groups whose members differ in identifiers (numbers, dates, paths, backticked
+code) are never merged, in either mode.  For
+.BR \-\-apply ,
+a group must additionally pass
+.B \-\-apply-min-lexical
+(its members must share most of their wording).  Groups that only match
+semantically are reported under
+.B review_only
+and left alone, because near-identical phrasing can describe different facts
+(for example the same sentence about an MCP server for RAG, email, image
+generation and memory).
+.P
+Inside a mergable group the newest memory wins; a longer text breaks ties.
+.SH OPTIONS
+.TP
+.BI \-\-base " url"
+Server base URL (default
+.BR http://localhost:6767 ,
+or
+.BR $SUPERMEMORY_BASE_URL ).
+.TP
+.BI \-\-namespace " tag"
+Container tag to inspect (default
+.BR sm_project_default ).
+.TP
+.BI \-\-threshold " sim"
+Minimum similarity, 0\-1 (default
+.BR 0.92 ).
+Raise it to be stricter.
+.TP
+.BI \-\-mode " lexical|semantic"
+Detection strategy (default
+.BR lexical ).
+.TP
+.BI \-\-workers " n"
+Parallel requests in semantic mode (default
+.BR 6 ).
+.TP
+.B \-\-apply
+Forget the redundant memories in every
+.B safe
+group.  Without this flag nothing is written.
+.TP
+.BI \-\-apply-min-lexical " sim"
+Minimum token-set overlap for
+.BR \-\-apply
+(default
+.BR 0.85 ).
+Groups below it are review-only.
+.TP
+.BI \-\-max-clusters " n"
+Stop after
+.I n
+clusters (0, the default, means all).
+.TP
+.BI \-\-show " n"
+Print this many clusters (default
+.BR 10 ).
+.TP
+.B \-\-json
+Print clusters as JSON (winner id, forget ids, texts).
+.TP
+.BI \-\-cache " file"
+Where semantic pairs are cached (default
+.BR ~/.cache/sm-memory-prune/pairs.json ).
+The cache is keyed by the namespace's memory ids and the threshold.
+.TP
+.B \-\-no-cache
+Ignore any cached pairs and re-query the server.
+.TP
+.BI \-\-api-key " key"
+API key; otherwise
+.BR $SUPERMEMORY_API_KEY
+or
+.BR ~/.supermemory/api-key .
+.SH EXAMPLES
+Dry run over the live namespace with the fast local detector:
+.EX
+sm-memory-prune --threshold 0.92 --show 20
+.EE
+.P
+Find paraphrases using the server's embeddings, then review:
+.EX
+sm-memory-prune --mode semantic --threshold 0.92 --show 20
+.EE
+.P
+Apply only the safe, near-verbatim merges:
+.EX
+sm-memory-prune --mode semantic --threshold 0.92 --apply
+.EE
+.P
+Export the shortlist for manual review:
+.EX
+sm-memory-prune --mode semantic --json > /tmp/prune.json
+.EE
+.SH FILES
+.TP
+.B ~/.cache/sm-memory-prune/pairs.json
+Cached semantic neighbour pairs.
+.SH BEHAVIOUR
+Forgetting is a soft delete: the memory is marked forgotten, removed from
+recall and dropped from the vector index, but its audit row remains.  The
+category is therefore recoverable from the local store, but not through the
+API.
+.SH NOTES
+Deleting a document
+.RB ( DELETE " /v3/documents/{id})"
+cascades to the memories it sourced and is also free; it is the cheaper way to
+remove an entire redundant capture, but it drops any facts only that capture
+produced.
+.SH SEE ALSO
+.BR sm-llm-proxy (1),
+.BR curl (1),
+.BR jq (1)
