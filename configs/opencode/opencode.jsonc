@@ -17,7 +17,20 @@
           "name": "DeepSeek V4 Pro"
         },
         "deepseek-flash": {
-          "name": "DeepSeek Flash"
+          "name": "DeepSeek Flash",
+          // Default to high reasoning, and only offer low/high for Ctrl+T.
+          "settings": {
+            "reasoningEffort": "high"
+          },
+          "body": {
+            "thinking": { "type": "enabled" }
+          },
+          "capabilities": {
+            "reasoning": {
+              "supported": true,
+              "effort": ["low", "high"]
+            }
+          }
         }
       }
     }
