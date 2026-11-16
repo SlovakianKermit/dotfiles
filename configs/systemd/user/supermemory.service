@@ -1,10 +1,14 @@
 [Unit]
 Description=Supermemory self-hosted memory server
-After=network-online.target
+After=network-online.target sm-llm-proxy.service
+Requires=sm-llm-proxy.service
 
 [Service]
 Type=simple
-Environment=OPENAI_BASE_URL=https://api.deepseek.com/v1
+# All LLM traffic goes through sm-llm-proxy: it pins reasoning_effort (the
+# memory agent otherwise inherits DeepSeek's "high" default) and logs per-call
+# token usage to ~/.local/share/sm-llm-proxy/requests.jsonl.
+Environment=OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 # The API key lives outside the unit so this file can be synced to the repo.
 EnvironmentFile=%h/.config/supermemory/env
 Environment=OPENAI_MODEL=deepseek-v4-flash

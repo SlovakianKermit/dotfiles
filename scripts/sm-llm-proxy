@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""Local OpenAI-compatible proxy that logs token usage and pins reasoning effort.
+
+Sits between a self-hosted supermemory server and an OpenAI-compatible
+upstream (DeepSeek by default).  Every /chat/completions request is forwarded
+verbatim except that ``reasoning_effort`` is injected (and an optional output
+token cap applied), and the response ``usage`` block is appended to a JSONL
+log so per-request token cost can be measured.
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+DEFAULT_UPSTREAM = "https://api.deepseek.com"
+DEFAULT_PORT = 8787
+DEFAULT_LOG = os.path.expanduser("~/.local/share/sm-llm-proxy/requests.jsonl")
+
+HOP_BY_HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+
+_log_lock = threading.Lock()
+
+
+def log_event(path: str, record: dict) -> None:
+    with _log_lock:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+        except OSError as exc:  # never break proxying because logging failed
+            print(f"[sm-llm-proxy] log failed: {exc}", file=sys.stderr)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def inject_options(payload: dict, args) -> dict:
+    """Add reasoning_effort / stream_options without disturbing other fields."""
+    if args.reasoning_effort and "reasoning_effort" not in payload:
+        payload["reasoning_effort"] = args.reasoning_effort
+    if args.reasoning_effort_none and args.reasoning_effort == "none":
+        payload["reasoning_effort"] = "none"
+    if payload.get("stream") and "stream_options" not in payload:
+        payload["stream_options"] = {"include_usage": True}
+    elif payload.get("stream"):
+        payload.setdefault("stream_options", {}).setdefault("include_usage", True)
+    if args.max_tokens:
+        current = payload.get("max_tokens") or payload.get("max_completion_tokens")
+        if current is None or current > args.max_tokens:
+            payload["max_tokens"] = args.max_tokens
+            payload.pop("max_completion_tokens", None)
+    return payload
+
+
+def extract_usage(body: bytes, stream: bool) -> dict | None:
+    if stream:
+        usage = None
+        text = body.decode("utf-8", "replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            chunk = line[5:].strip()
+            if not chunk or chunk == "[DONE]":
+                continue
+            try:
+                event = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get("usage"):
+                usage = event["usage"]
+        return usage
+    try:
+        doc = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(doc, dict):
+        return doc.get("usage")
+    return None
+
+
+class ProxyHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "sm-llm-proxy/1.0"
+
+    # -- helpers ---------------------------------------------------------
+    def _read_body(self) -> bytes:
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            chunks = []
+            while True:
+                size_line = self.rfile.readline().strip()
+                if not size_line:
+                    break
+                size = int(size_line.split(b";")[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)  # trailing CRLF
+            return b"".join(chunks)
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _forward(self, method: str) -> None:
+        if self.path.split("?")[0].rstrip("/") in ("/healthz", "/health"):
+            self._send_json(200, {"status": "ok", "upstream": self.server.upstream})
+            return
+
+        started = time.monotonic()
+        body = self._read_body()
+        stream = False
+        request_json: dict | None = None
+
+        path = self.path
+        if "chat/completions" in path and body:
+            try:
+                request_json = json.loads(body)
+            except json.JSONDecodeError:
+                request_json = None
+            if isinstance(request_json, dict):
+                stream = bool(request_json.get("stream"))
+                request_json = inject_options(request_json, self.server.args)
+                body = json.dumps(request_json).encode()
+
+        parts = urlsplit(self.server.upstream)
+        conn_cls = (
+            http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        )
+        conn = conn_cls(parts.hostname, parts.port, timeout=self.server.args.timeout)
+
+        headers = {}
+        for key, value in self.headers.items():
+            lower = key.lower()
+            if lower in HOP_BY_HOP or lower in ("host", "content-length", "accept-encoding"):
+                continue
+            headers[key] = value
+        headers["Content-Length"] = str(len(body))
+        headers["Connection"] = "close"
+        # Ask for identity encoding so the usage block is always inspectable.
+        headers["Accept-Encoding"] = "identity"
+
+        upstream_path = path
+        if parts.path and parts.path != "/":
+            upstream_path = parts.path.rstrip("/") + path
+
+        try:
+            conn.request(method, upstream_path, body=body or None, headers=headers)
+            resp = conn.getresponse()
+        except Exception as exc:  # noqa: BLE001 - surface upstream failure plainly
+            self._send_json(502, {"error": f"upstream request failed: {exc}"})
+            log_event(
+                self.server.args.log,
+                {
+                    "ts": utc_now(),
+                    "path": path,
+                    "status": 502,
+                    "error": str(exc),
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                },
+            )
+            return
+
+        self.send_response(resp.status)
+        passthrough = (
+            "Content-Type",
+            "Cache-Control",
+            "X-Request-Id",
+            "OpenAI-Processing-Ms",
+        )
+        for key in passthrough:
+            value = resp.getheader(key)
+            if value is not None:
+                self.send_header(key, value)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        captured = bytearray()
+        try:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                if len(captured) < 8 * 1024 * 1024:
+                    captured.extend(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            conn.close()
+            self.close_connection = True
+
+        usage = extract_usage(bytes(captured), stream)
+        prompt_tokens = (usage or {}).get("prompt_tokens")
+        completion_tokens = (usage or {}).get("completion_tokens")
+        details = (usage or {}).get("completion_tokens_details") or {}
+        prompt_details = (usage or {}).get("prompt_tokens_details") or {}
+        record = {
+            "ts": utc_now(),
+            "path": path,
+            "status": resp.status,
+            "stream": stream,
+            "duration_ms": round((time.monotonic() - started) * 1000),
+        }
+        if isinstance(request_json, dict):
+            record["model"] = request_json.get("model")
+            record["reasoning_effort"] = request_json.get("reasoning_effort")
+            record["max_tokens"] = request_json.get("max_tokens")
+            messages = request_json.get("messages") or []
+            record["messages"] = len(messages) if isinstance(messages, list) else None
+            tools = request_json.get("tools") or []
+            record["tools"] = len(tools) if isinstance(tools, list) else None
+        if usage:
+            record["prompt_tokens"] = prompt_tokens
+            record["completion_tokens"] = completion_tokens
+            record["reasoning_tokens"] = details.get("reasoning_tokens")
+            record["cached_tokens"] = prompt_details.get("cached_tokens")
+            record["total_tokens"] = usage.get("total_tokens")
+        log_event(self.server.args.log, record)
+
+    # -- routes ----------------------------------------------------------
+    def do_GET(self):  # noqa: N802
+        self._forward("GET")
+
+    def do_POST(self):  # noqa: N802
+        self._forward("POST")
+
+    def do_PUT(self):  # noqa: N802
+        self._forward("PUT")
+
+    def do_PATCH(self):  # noqa: N802
+        self._forward("PATCH")
+
+    def do_DELETE(self):  # noqa: N802
+        self._forward("DELETE")
+
+    def log_message(self, fmt, *args):  # quieter default access log
+        if self.server.args.verbose:
+            super().log_message(fmt, *args)
+
+
+class ProxyServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="sm-llm-proxy",
+        description="OpenAI-compatible logging/parameter-pinning proxy for supermemory.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--upstream", default=os.environ.get("SM_PROXY_UPSTREAM", DEFAULT_UPSTREAM))
+    parser.add_argument("--log", default=os.environ.get("SM_PROXY_LOG", DEFAULT_LOG))
+    parser.add_argument(
+        "--reasoning-effort",
+        default=os.environ.get("SM_PROXY_REASONING_EFFORT", "low"),
+        help="reasoning_effort to inject (default: low; use 'none' for off, empty to disable)",
+    )
+    parser.add_argument(
+        "--reasoning-effort-none",
+        action="store_true",
+        help="send reasoning_effort=none (disable thinking) instead of low",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=int(os.environ.get("SM_PROXY_MAX_TOKENS", "0")) or None,
+        help="optional cap on max_tokens per request",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.environ.get("SM_PROXY_TIMEOUT", "900")),
+        help="upstream timeout in seconds (default: 900)",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    server = ProxyServer((args.host, args.port), ProxyHandler)
+    server.upstream = args.upstream.rstrip("/")
+    server.args = args
+    print(
+        f"[sm-llm-proxy] listening on http://{args.host}:{args.port}"
+        f" -> {server.upstream} (reasoning_effort={args.reasoning_effort or 'passthrough'})",
+        flush=True,
+    )
+    print(f"[sm-llm-proxy] usage log: {args.log}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

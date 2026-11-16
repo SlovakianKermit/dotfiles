@@ -1,0 +1,17 @@
+[Unit]
+Description=Logging/parameter-pinning proxy for supermemory LLM calls
+Documentation=man:sm-llm-proxy(1)
+After=network-online.target
+Wants=network-online.target
+# Only needed while the supermemory unit points OPENAI_BASE_URL at us.
+PartOf=supermemory.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sm-llm-proxy --port 8787
+Environment=SM_PROXY_REASONING_EFFORT=low
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

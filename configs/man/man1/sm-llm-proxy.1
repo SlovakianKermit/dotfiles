@@ -1,0 +1,169 @@
+.TH SM-LLM-PROXY 1 2026-11-16 "sm-llm-proxy 1.0" "User Commands"
+.SH NAME
+sm-llm-proxy \- logging OpenAI-compatible proxy that pins reasoning effort
+.SH SYNOPSIS
+.B sm-llm-proxy
+.RB [ \-h ]
+.RB [ \-\-host
+.IR addr ]
+.RB [ \-\-port
+.IR port ]
+.RB [ \-\-upstream
+.IR url ]
+.RB [ \-\-log
+.IR file ]
+.RB [ \-\-reasoning-effort
+.IR level ]
+.RB [ \-\-reasoning-effort-none ]
+.RB [ \-\-max-tokens
+.IR n ]
+.RB [ \-\-timeout
+.IR seconds ]
+.RB [ \-\-verbose ]
+.SH DESCRIPTION
+.B sm-llm-proxy
+is a small local reverse proxy for OpenAI-compatible chat APIs, written for the
+self-hosted supermemory server.  It forwards every request to
+.I upstream
+verbatim, with three exceptions:
+.IP \(bu 2
+For
+.B /chat/completions
+requests it injects
+.B reasoning_effort
+unless the caller already set one.  DeepSeek models default to high effort,
+which makes tool-looping agents expensive; supermemory never sets the field, so
+this pins it.
+.IP \(bu 2
+It adds
+.B stream_options.include_usage
+to streaming requests so the final SSE frame carries token counts.
+.IP \(bu 2
+It can optionally cap
+.B max_tokens
+to a maximum value.
+.P
+Every response
+.B usage
+block is appended as one JSON object per line to
+.I log
+(JSONL), including prompt, completion, reasoning and cached token counts, the
+model, message count, tool count and request duration.  The log is the cost
+ledger for anything sitting behind the proxy.
+.P
+The request body is otherwise forwarded byte-for-byte, including the
+.B Authorization
+header.  Streaming responses are relayed as they arrive.
+.P
+A
+.B GET /healthz
+on the proxy answers locally with
+.BR {"status":"ok"} .
+.P
+Defaults: host
+.BR 127.0.0.1 ,
+port
+.BR 8787 ,
+upstream
+.BR https://api.deepseek.com ,
+log
+.BR ~/.local/share/sm-llm-proxy/requests.jsonl ,
+reasoning effort
+.BR low .
+Environment variables
+.BR SM_PROXY_UPSTREAM ,
+.BR SM_PROXY_LOG ,
+.BR SM_PROXY_REASONING_EFFORT ,
+.B SM_PROXY_MAX_TOKENS
+and
+.B SM_PROXY_TIMEOUT
+provide the same defaults.
+.SH OPTIONS
+.TP
+.B \-h, \-\-help
+Show usage and exit.
+.TP
+.BI \-\-host " addr"
+Address to bind (default
+.BR 127.0.0.1 ).
+.TP
+.BI \-\-port " port"
+Port to bind (default
+.BR 8787 ).
+.TP
+.BI \-\-upstream " url"
+Base URL of the real API, for example
+.BR https://api.deepseek.com .
+A path component is preserved and prefixed to incoming paths.
+.TP
+.BI \-\-log " file"
+JSONL file receiving one record per completion (default
+.BR ~/.local/share/sm-llm-proxy/requests.jsonl ).
+Parent directories are created on demand.
+.TP
+.BI \-\-reasoning-effort " level"
+Value injected as
+.B reasoning_effort
+(default
+.BR low ).
+Use an empty string to disable injection.  DeepSeek accepts
+.BR low ,
+.B high
+and
+.BR max .
+.TP
+.B \-\-reasoning-effort-none
+Shortcut for sending
+.B reasoning_effort=none
+to turn thinking off entirely.
+.TP
+.BI \-\-max-tokens " n"
+If a request has no
+.B max_tokens
+or asks for more than
+.IR n ,
+rewrite it to
+.IR n .
+Default is no cap.
+.TP
+.BI \-\-timeout " seconds"
+Upstream socket timeout (default
+.BR 900 ).
+.TP
+.B \-\-verbose
+Log each proxied request to stderr.
+.SH EXAMPLES
+Point the supermemory unit at the proxy:
+.EX
+Environment=OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+
+systemctl --user restart sm-llm-proxy supermemory
+.EE
+.P
+Watch token spend per agent step:
+.EX
+tail -f ~/.local/share/sm-llm-proxy/requests.jsonl |
+  jq -c '{ts,model,prompt_tokens,completion_tokens,reasoning_tokens}'
+
+jq -s 'map(.completion_tokens // 0) | add' \\
+  ~/.local/share/sm-llm-proxy/requests.jsonl
+.EE
+.P
+Temporarily disable thinking for a test run:
+.EX
+sm-llm-proxy --reasoning-effort-none --port 8788
+.EE
+.SH FILES
+.TP
+.B ~/.local/share/sm-llm-proxy/requests.jsonl
+Default usage ledger (one JSON object per request).
+.SH NOTES
+The proxy does not terminate TLS and binds to loopback by default; expose it
+only on a trusted interface.  Responses are relayed with
+.BR "Connection: close"
+framing, so keep-alive is not reused.  Upstream failures return HTTP 502 with a
+JSON error body.
+.SH SEE ALSO
+.BR curl (1),
+.BR jq (1),
+.BR systemctl (1)
