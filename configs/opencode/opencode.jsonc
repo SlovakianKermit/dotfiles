@@ -18,7 +18,7 @@
         },
         "deepseek-flash": {
           "name": "DeepSeek Flash",
-          // Default to high reasoning, and only offer low/high for Ctrl+T.
+          // Default (no variant) = high reasoning. Ctrl+T only toggles low.
           "settings": {
             "reasoningEffort": "high"
           },
@@ -28,7 +28,7 @@
           "capabilities": {
             "reasoning": {
               "supported": true,
-              "effort": ["low", "high"]
+              "effort": ["low"]
             }
           }
         }
