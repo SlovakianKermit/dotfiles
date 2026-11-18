@@ -1,0 +1,13 @@
+[Desktop Entry]
+# Overrides /usr/share/applications/anker-launcher.desktop so that menu and
+# URI launches go through ~/.local/bin/anker-launcher, which enables WebKit's
+# GPU rendering. See anker-launcher(1).
+Categories=Game;Utility;
+Comment=Desktop client for AnkerGames
+Exec=/home/killian/.local/bin/anker-launcher %u
+StartupWMClass=anker-launcher
+Icon=anker-launcher
+Name=Anker Launcher
+Terminal=false
+Type=Application
+MimeType=x-scheme-handler/ankergames;

@@ -1,0 +1,117 @@
+.TH ANKER\-LAUNCHER 1 "2026-11-18" "anker-launcher" "User Commands"
+.SH NAME
+anker\-launcher \- run the AnkerGames launcher with WebKit GPU rendering enabled
+.SH SYNOPSIS
+.B anker\-launcher
+[\fIURL\fR]
+.SH DESCRIPTION
+.B anker\-launcher
+is a wrapper around the upstream AnkerGames desktop client installed at
+.IR /opt/anker\-launcher\-bin/AppRun .
+It exists for one reason: the client is a Tauri application using
+.B WebKitGTK
+4.1, and on startup it sets two WebKit environment variables to values that
+force software rendering on every Linux system:
+.IP \(bu 2
+.B WEBKIT_DISABLE_DMABUF_RENDERER=1
+.IP \(bu 2
+.B WEBKIT_SKIA_GPU_PAINTING_THREADS=0
+.P
+With those values, WebKit rasterises page content on the CPU and the GTK UI
+process presents each frame through a freshly allocated
+.B wl_shm
+pool. The cost of a frame is then proportional to window area: at 1280x800 the
+client keeps two processes busy repainting ~60 times a second even when idle,
+and at 2560x1440 scrolling becomes unusable.
+.P
+The client only writes those variables when they are not already present, so a
+wrapper is enough: this script exports GPU values and then
+.BR exec s
+the AppImage. Measured on an RX 9070 with Mesa 26, scrolling CPU in the UI
+process falls from roughly 14% to 3% at 1280x800. No file inside
+.B /opt
+is modified.
+.P
+Any arguments are passed through to the AppImage unchanged, so URI activation
+from the desktop entry
+.RB ( x\-scheme\-handler=ankergames )
+keeps working.
+.SH ENVIRONMENT
+.TP
+.B ANKER_SOFTWARE_RENDER
+Set to
+.B 1
+to skip the overrides and launch the client exactly as upstream ships it, i.e.
+with software rendering. Use this if a driver update makes the GPU path render
+a blank or corrupt window.
+.TP
+.B WEBKIT_DISABLE_DMABUF_RENDERER
+Pre-set by the wrapper to
+.B 0
+(dmabuf buffers shared with the compositor). A value supplied in the calling
+environment is preserved.
+.TP
+.B WEBKIT_SKIA_GPU_PAINTING_THREADS
+Pre-set by the wrapper to
+.B 4
+(GPU painting threads). A value supplied in the calling environment is
+preserved. Setting it to
+.B 0
+reproduces the slow software path even when the dmabuf override is active.
+.SH EXAMPLES
+Start the launcher normally:
+.IP
+.EX
+anker\-launcher
+.EE
+.P
+Open the launcher on a store page:
+.IP
+.EX
+anker\-launcher "ankergames://store"
+.EE
+.P
+Reproduce upstream behaviour to compare, or to work around a broken GPU path:
+.IP
+.EX
+ANKER_SOFTWARE_RENDER=1 anker\-launcher
+.EE
+.P
+Use a different number of GPU painting threads:
+.IP
+.EX
+WEBKIT_SKIA_GPU_PAINTING_THREADS=2 anker\-launcher
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+The launcher exited normally.
+.TP
+.B other
+Whatever the AppImage returned; the wrapper does not alter exit codes.
+.SH FILES
+.TP
+.I /opt/anker\-launcher\-bin/AppRun
+The upstream launcher that this script execs.
+.TP
+.I /usr/bin/anker\-launcher
+Distribution launcher entry point, shadowed for interactive use by this script
+when
+.I ~/.local/bin
+comes first in
+.BR PATH .
+.TP
+.I ~/.local/share/applications/anker\-launcher.desktop
+Desktop entry that points at this wrapper so menu launches get the GPU path.
+.TP
+.I ~/.config/net.ankergames.launcher/
+Launcher preferences, library and session data.
+.SH SEE ALSO
+.BR dotfiles\-sync (1),
+.BR webkit2gtk\-4.1 (3)
+.SH BUGS
+The override relies on the upstream client continuing to fill in the two
+variables only when they are unset. A future version that assigns them
+unconditionally will silently invalidate this wrapper.
+.SH AUTHOR
+Written for local use.

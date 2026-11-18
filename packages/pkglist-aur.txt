@@ -1,4 +1,5 @@
 amf-amdgpu-pro
+anker-launcher-bin
 bottles
 cemu
 cpuid

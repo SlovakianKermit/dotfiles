@@ -64,3 +64,4 @@ speedtest++
 ventoy-bin
 vulkan-radeon
 xpadneo-dkms
+zen-browser-bin
