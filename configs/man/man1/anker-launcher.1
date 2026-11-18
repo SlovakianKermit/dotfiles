@@ -1,6 +1,6 @@
 .TH ANKER\-LAUNCHER 1 "2026-11-18" "anker-launcher" "User Commands"
 .SH NAME
-anker\-launcher \- run the AnkerGames launcher with WebKit GPU rendering enabled
+anker\-launcher \- run the AnkerGames launcher with GPU rendering and instant scrolling
 .SH SYNOPSIS
 .B anker\-launcher
 [\fIURL\fR]
@@ -8,29 +8,49 @@ anker\-launcher \- run the AnkerGames launcher with WebKit GPU rendering enabled
 .B anker\-launcher
 is a wrapper around the upstream AnkerGames desktop client installed at
 .IR /opt/anker\-launcher\-bin/AppRun .
-It exists for one reason: the client is a Tauri application using
+It works around two separate upstream problems; no file under
+.B /opt
+is modified.
+.SS Software rendering by default
+The client is a Tauri application using
 .B WebKitGTK
-4.1, and on startup it sets two WebKit environment variables to values that
-force software rendering on every Linux system:
+4.1. On startup it sets two WebKit environment variables, but only when they
+are not already present:
 .IP \(bu 2
 .B WEBKIT_DISABLE_DMABUF_RENDERER=1
 .IP \(bu 2
 .B WEBKIT_SKIA_GPU_PAINTING_THREADS=0
 .P
-With those values, WebKit rasterises page content on the CPU and the GTK UI
-process presents each frame through a freshly allocated
+With those values WebKit rasterises page content on the CPU and the GTK UI
+process presents every frame through a freshly allocated
 .B wl_shm
-pool. The cost of a frame is then proportional to window area: at 1280x800 the
-client keeps two processes busy repainting ~60 times a second even when idle,
-and at 2560x1440 scrolling becomes unusable.
+pool, so the cost of a frame is proportional to window area. At 1280x800 the
+client kept two processes busy repainting about 60 times a second even while
+idle, and at 2560x1440 scrolling became unusable.
 .P
-The client only writes those variables when they are not already present, so a
-wrapper is enough: this script exports GPU values and then
-.BR exec s
-the AppImage. Measured on an RX 9070 with Mesa 26, scrolling CPU in the UI
-process falls from roughly 14% to 3% at 1280x800. No file inside
-.B /opt
-is modified.
+This wrapper presets GPU values instead. Measured on an RX 9070 with Mesa 26,
+scrolling CPU in the UI process fell from roughly 14% to 3%.
+.SS Scroll animation pacing
+WebKitGTK eases wheel scrolling inside the web process on a fixed 60 Hz clock.
+On a high refresh display that makes scrolling feel like a 60 Hz panel and lag
+behind the pointer, even after the rendering fix above. WebKitGTK exposes no
+environment variable for the setting, so this wrapper compiles a small
+.B LD_PRELOAD
+shim (source embedded in the script, cached under
+.IR ~/.cache/anker\-launcher )
+that hooks
+.BR webkit_web_view_get_settings ()
+and calls
+.BR webkit_settings_set_enable_smooth_scrolling ( settings ", 0)."
+Scrolling then applies each wheel event immediately instead of animating it.
+.P
+The shim removes its own
+.B LD_PRELOAD
+entry once loaded in the launcher, so WebKit helper processes and the Wine or
+Proton processes that later start a game do not inherit it. A compiler is
+needed only the first time; without
+.BR gcc (1)
+the wrapper starts the client untweaked instead of failing.
 .P
 Any arguments are passed through to the AppImage unchanged, so URI activation
 from the desktop entry
@@ -41,23 +61,32 @@ keeps working.
 .B ANKER_SOFTWARE_RENDER
 Set to
 .B 1
-to skip the overrides and launch the client exactly as upstream ships it, i.e.
-with software rendering. Use this if a driver update makes the GPU path render
-a blank or corrupt window.
+to skip the rendering fix and launch the client exactly as upstream ships it,
+i.e. with software rendering. Use this if a driver update makes the GPU path
+render a blank or corrupt window.
+.TP
+.B ANKER_NO_SCROLL_TWEAK
+Set to
+.B 1
+to skip the scroll shim and keep WebKit's animated (60 Hz) scrolling.
 .TP
 .B WEBKIT_DISABLE_DMABUF_RENDERER
-Pre-set by the wrapper to
+Preset by the wrapper to
 .B 0
 (dmabuf buffers shared with the compositor). A value supplied in the calling
 environment is preserved.
 .TP
 .B WEBKIT_SKIA_GPU_PAINTING_THREADS
-Pre-set by the wrapper to
+Preset by the wrapper to
 .B 4
 (GPU painting threads). A value supplied in the calling environment is
 preserved. Setting it to
 .B 0
 reproduces the slow software path even when the dmabuf override is active.
+.TP
+.B LD_PRELOAD
+Prepended with the compiled scroll shim. Existing entries are kept and are
+still visible to the launcher's own children.
 .SH EXAMPLES
 Start the launcher normally:
 .IP
@@ -71,10 +100,16 @@ Open the launcher on a store page:
 anker\-launcher "ankergames://store"
 .EE
 .P
-Reproduce upstream behaviour to compare, or to work around a broken GPU path:
+Compare against upstream behaviour, or work around a broken GPU path:
 .IP
 .EX
 ANKER_SOFTWARE_RENDER=1 anker\-launcher
+.EE
+.P
+Keep the rendering fix but restore WebKit's animated scrolling:
+.IP
+.EX
+ANKER_NO_SCROLL_TWEAK=1 anker\-launcher
 .EE
 .P
 Use a different number of GPU painting threads:
@@ -102,16 +137,31 @@ comes first in
 .BR PATH .
 .TP
 .I ~/.local/share/applications/anker\-launcher.desktop
-Desktop entry that points at this wrapper so menu launches get the GPU path.
+Desktop entry that points at this wrapper, so menu and
+.B ankergames://
+launches get the fixes.
+.TP
+.I ~/.cache/anker\-launcher/scrollhook\-HASH.so
+Compiled scroll shim, keyed by a hash of the embedded source. Stale builds from
+older revisions are deleted automatically.
 .TP
 .I ~/.config/net.ankergames.launcher/
-Launcher preferences, library and session data.
+Launcher preferences, library and session data. Setting
+.B presentation.reduce_motion
+to
+.B true
+there stops the store UI's constant animation loop, which otherwise repaints at
+the frame-rate ceiling even when idle.
 .SH SEE ALSO
 .BR dotfiles\-sync (1),
-.BR webkit2gtk\-4.1 (3)
+.BR gcc (1),
+.BR webkit2gtk\-4\.1 (3)
 .SH BUGS
-The override relies on the upstream client continuing to fill in the two
-variables only when they are unset. A future version that assigns them
-unconditionally will silently invalidate this wrapper.
+Both fixes depend on upstream behaviour that a future release could change:
+the client must keep filling in the two WebKit variables only when they are
+unset, and it must keep fetching its settings object through
+.BR webkit_web_view_get_settings ().
+If a new version assigns those variables unconditionally or caches settings
+internally elsewhere, the corresponding workaround silently stops applying.
 .SH AUTHOR
 Written for local use.

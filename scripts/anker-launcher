@@ -1,26 +1,154 @@
 #!/usr/bin/env bash
-# anker-launcher — run the AnkerGames launcher with WebKit's GPU paths enabled.
+# anker-launcher — run the AnkerGames launcher with WebKit's GPU path enabled
+# and its 60 Hz scroll animation turned off.
 #
-# The upstream AppImage forces software rendering for every Linux user: at
-# startup it sets WEBKIT_DISABLE_DMABUF_RENDERER=1 and
-# WEBKIT_SKIA_GPU_PAINTING_THREADS=0, but only when those variables are unset.
-# With them set, WebKit rasterises and presents every frame on the CPU in the
-# GTK UI process, so scrolling costs time proportional to the window area: at
-# 2560x1440 the launcher is unusable, and it re-allocates a wl_shm pool for
-# every frame it paints. Setting the two variables to GPU values before exec
-# is enough — the launcher honours what it finds — and drops UI-process CPU on
-# a 1280x800 window from ~14% to ~3% while scrolling.
+# Two separate upstream problems live here.
 #
-# Set ANKER_SOFTWARE_RENDER=1 to reproduce upstream behaviour (e.g. if a
-# future driver makes the GPU path show a blank window).
+# 1. Software rendering by default. At startup the AppImage sets
+#    WEBKIT_DISABLE_DMABUF_RENDERER=1 and WEBKIT_SKIA_GPU_PAINTING_THREADS=0
+#    (only when unset). With those, WebKit rasterises every frame on the CPU in
+#    the GTK UI process and re-allocates a wl_shm pool per frame, so cost grows
+#    with window area: at 1280x800 the UI process sat at ~14% while scrolling,
+#    at 2560x1440 the launcher was unusable. Presetting GPU values drops that to
+#    ~3% and cost stops scaling with area.
+#
+# 2. Scroll animation pacing. WebKitGTK eases wheel scrolling in the web
+#    process on a fixed 60 Hz clock, so on a 240 Hz display scrolling still
+#    reads as "60 Hz" and lags behind the pointer. This build exposes no
+#    environment variable for it, so a tiny shim (compiled below, cached) hooks
+#    webkit_web_view_get_settings() and calls
+#    webkit_settings_set_enable_smooth_scrolling(settings, 0).
+#
+# Escape hatches: ANKER_SOFTWARE_RENDER=1 restores upstream rendering,
+# ANKER_NO_SCROLL_TWEAK=1 skips the shim, and a WEBKIT_* value you export
+# yourself is left alone.
 set -euo pipefail
 
 APPIMAGE_ROOT="/opt/anker-launcher-bin"
 
 if [[ "${ANKER_SOFTWARE_RENDER:-0}" != "1" ]]; then
-	# Only fill these in if the caller did not pick a value already.
 	export WEBKIT_DISABLE_DMABUF_RENDERER="${WEBKIT_DISABLE_DMABUF_RENDERER:-0}"
 	export WEBKIT_SKIA_GPU_PAINTING_THREADS="${WEBKIT_SKIA_GPU_PAINTING_THREADS:-4}"
+fi
+
+# Intercepts webkit_web_view_get_settings() to disable smooth (animated)
+# scrolling. The source is embedded so this stays a single mirrored file; the
+# build is cached and keyed by a hash of that source.
+build_scroll_shim() {
+	local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/anker-launcher"
+	local src hash shim tmp
+
+	src='#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct _WebKitWebView WebKitWebView;
+typedef struct _WebKitSettings WebKitSettings;
+
+/* Child processes (WebKit helpers, Wine/Proton games) do not need this shim and
+ * a wrong-architecture preload only produces loader warnings, so drop our own
+ * entry from LD_PRELOAD once we are loaded. Anything the caller had stays.
+ * Only do this in the launcher itself: the AppRun wrapper is a shell script, so
+ * stripping it there would remove the preload before the real binary starts. */
+static void drop_self_from_preload(void) __attribute__((constructor));
+static void drop_self_from_preload(void)
+{
+    Dl_info info;
+    const char *preload;
+    char comm[64] = {0};
+    char *copy, *token, *kept;
+    FILE *f;
+
+    f = fopen("/proc/self/comm", "r");
+    if (f) {
+        if (!fgets(comm, sizeof comm, f))
+            comm[0] = '\0';
+        fclose(f);
+    }
+    if (strncmp(comm, "anker-launcher", 14) != 0)
+        return;
+
+    if (!dladdr((void *)drop_self_from_preload, &info) || !info.dli_fname)
+        return;
+    preload = getenv("LD_PRELOAD");
+    if (!preload)
+        return;
+    copy = strdup(preload);
+    kept = calloc(strlen(preload) + 1, 1);
+    if (!copy || !kept) {
+        free(copy);
+        free(kept);
+        return;
+    }
+    for (token = strtok(copy, ": "); token; token = strtok(NULL, ": ")) {
+        if (strcmp(token, info.dli_fname) == 0)
+            continue;
+        if (*kept)
+            strcat(kept, ":");
+        strcat(kept, token);
+    }
+    if (*kept)
+        setenv("LD_PRELOAD", kept, 1);
+    else
+        unsetenv("LD_PRELOAD");
+    free(copy);
+    free(kept);
+}
+
+/* WebKitGTK animates wheel scrolling inside the web process on a fixed 60 Hz
+ * clock, which is why scrolling still feels like a 60 Hz panel on a 240 Hz
+ * display. Disabling the setting makes each wheel event apply immediately.
+ * The launcher never sets this property itself and fetches its settings object
+ * through webkit_web_view_get_settings(), so hooking the getter is enough. */
+WebKitSettings *webkit_web_view_get_settings(WebKitWebView *view)
+{
+    static WebKitSettings *(*real)(WebKitWebView *);
+    static void (*set_smooth)(WebKitSettings *, int);
+
+    if (!real)
+        real = dlsym(RTLD_NEXT, "webkit_web_view_get_settings");
+    if (!set_smooth)
+        set_smooth = dlsym(RTLD_NEXT, "webkit_settings_set_enable_smooth_scrolling");
+
+    WebKitSettings *settings = real(view);
+    if (settings && set_smooth)
+        set_smooth(settings, 0);
+    return settings;
+}'
+
+	hash="$(printf '%s' "$src" | sha256sum | cut -c1-16)"
+	shim="${cache_dir}/scrollhook-${hash}.so"
+
+	if [[ -f "$shim" ]]; then
+		printf '%s\n' "$shim"
+		return 0
+	fi
+
+	# No compiler means no shim: launch untweaked rather than fail.
+	command -v gcc >/dev/null 2>&1 || return 1
+
+	mkdir -p "$cache_dir"
+	tmp="$(mktemp -d)"
+	trap 'rm -rf "$tmp"' RETURN
+
+	printf '%s\n' "$src" >"${tmp}/scrollhook.c"
+	if ! gcc -shared -fPIC -O2 -o "${tmp}/scrollhook.so" "${tmp}/scrollhook.c" -ldl 2>/dev/null; then
+		return 1
+	fi
+
+	mv -f "${tmp}/scrollhook.so" "$shim"
+	# Drop shims built from older revisions of the source above.
+	find "$cache_dir" -maxdepth 1 -name 'scrollhook-*.so' ! -name "$(basename "$shim")" -delete 2>/dev/null || true
+
+	printf '%s\n' "$shim"
+}
+
+if [[ "${ANKER_NO_SCROLL_TWEAK:-0}" != "1" ]]; then
+	if shim="$(build_scroll_shim)"; then
+		export LD_PRELOAD="${shim}${LD_PRELOAD:+:${LD_PRELOAD}}"
+	fi
 fi
 
 exec "$APPIMAGE_ROOT/AppRun" "$@"
