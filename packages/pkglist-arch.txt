@@ -25,7 +25,6 @@ btrfs-assistant
 btrfs-progs
 calf
 cantarell-fonts
-coolercontrol
 copyparty
 cpupower
 cryptsetup
@@ -60,6 +59,7 @@ flatpak
 flatseal
 fsarchiver
 fwupd
+gallery-dl
 gerbera
 ggml
 ggml-vulkan

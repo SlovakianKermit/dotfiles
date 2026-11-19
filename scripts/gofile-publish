@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Publish recordings to gofile.io, one folder per model.
+
+Free gofile accounts cannot list their own remote contents through the API, so
+this script keeps a state file that is the only record of what exists where:
+model name -> folder UUID and share code, plus one entry per uploaded file.
+Re-running skips anything already recorded, so an interrupted run resumes where
+it stopped instead of re-uploading.
+
+Uploads are delegated to curl so a multi-gigabyte file is streamed from disk and
+never buffered in memory.  gofile uploads are not resumable: an interrupted file
+restarts from zero.
+
+The model name is taken from the filename prefix before the recording
+timestamp, e.g. ``abbytheran_2026-11-17_20-33-50_423.ts`` becomes
+``abbytheran``.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+API = "https://api.gofile.io"
+UPLOAD_URL = "https://upload.gofile.io/uploadfile"
+DEFAULT_DIR = "/mnt/pve/Data_Storage/vr"
+STATE_DEFAULT = os.path.expanduser("~/.local/state/gofile-publish/state.json")
+TOKEN_DEFAULT = os.path.expanduser("~/.config/gofile/token")
+MANIFEST_DEFAULT = os.path.expanduser("~/.local/state/gofile-publish/links.tsv")
+
+MODEL_RE = re.compile(r"^(?P<model>.+?)_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}")
+TS_EXTS = (".ts", ".mts")
+
+UPLOAD_ATTEMPTS = 3
+RETRY_SLEEP = 15
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def human(n):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def model_of(path):
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = MODEL_RE.match(stem)
+    if m:
+        return m.group("model").strip("_ -")
+    return stem.strip("_ -")
+
+
+def read_token(path):
+    env = os.environ.get("GOFILE_TOKEN")
+    if env:
+        return env.strip()
+    try:
+        with open(path) as fh:
+            token = fh.read().strip()
+    except FileNotFoundError:
+        sys.exit(f"token file not found: {path}")
+    if not token:
+        sys.exit(f"token file is empty: {path}")
+    return token
+
+
+def load_state(path):
+    try:
+        with open(path) as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        state = {}
+    state.setdefault("rootFolder", None)
+    state.setdefault("models", {})
+    state.setdefault("files", {})
+    return state
+
+
+def save_state(path, state):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def api_post(path, token, body):
+    cmd = [
+        "curl", "-sS", "--max-time", "120",
+        "-X", "POST", f"{API}{path}",
+        "-H", f"Authorization: Bearer {token}",
+        "-H", "Content-Type: application/json",
+        "-d", json.dumps(body),
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    if not out.stdout.strip():
+        return {"status": "error-transport", "msg": out.stderr.strip()}
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return {"status": "error-json", "msg": out.stdout[:200]}
+
+
+def ensure_model_folder(model, token, state, root, dry_run):
+    entry = state["models"].get(model)
+    if entry and entry.get("id"):
+        return entry
+    if dry_run:
+        return {"id": "dry-run", "code": "dry-run"}
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        res = api_post("/contents/createFolder", token,
+                       {"parentFolderId": root, "folderName": model, "public": True})
+        if res.get("status") == "ok":
+            data = res["data"]
+            entry = {"id": data["id"], "code": data["code"],
+                     "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+            state["models"][model] = entry
+            save_state(STATE_PATH, state)
+            return entry
+        status = res.get("status", "?")
+        if status == "error-rateLimit" and attempt < UPLOAD_ATTEMPTS:
+            log(f"  rate limited creating folder {model}, waiting {RETRY_SLEEP}s")
+            time.sleep(RETRY_SLEEP)
+            continue
+        sys.exit(f"cannot create folder for {model}: {status} {res.get('msg', '')}")
+    sys.exit(f"cannot create folder for {model}")
+
+
+def upload(path, folder_id, token):
+    """Upload one file with curl. Returns the parsed JSON response."""
+    name = os.path.basename(path)
+    cmd = [
+        "curl", "-sS", "--max-time", "21600",
+        "-X", "POST", UPLOAD_URL,
+        "-H", f"Authorization: Bearer {token}",
+        "-F", f"file=@{path}",
+        "-F", f"folderId={folder_id}",
+    ]
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    if not out.stdout.strip():
+        return {"status": "error-transport", "msg": out.stderr.strip()[:300]}
+    try:
+        return json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return {"status": "error-json", "msg": out.stdout[:300]}
+
+
+def main():
+    global STATE_PATH
+    ap = argparse.ArgumentParser(
+        description="Upload .ts recordings to gofile.io, one folder per model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="The state file is the only record of what was uploaded: a free "
+               "gofile account cannot list its contents through the API.")
+    ap.add_argument("--dir", default=DEFAULT_DIR, help=f"source directory (default {DEFAULT_DIR})")
+    ap.add_argument("--root", help="account root folder UUID (needed on first run)")
+    ap.add_argument("--model", action="append", metavar="NAME",
+                    help="only this model, repeatable")
+    ap.add_argument("--limit", type=int, help="stop after N uploads")
+    ap.add_argument("--min-size", type=float, metavar="GB",
+                    help="skip files smaller than this many GB")
+    ap.add_argument("--state", default=STATE_DEFAULT, help=f"state file (default {STATE_DEFAULT})")
+    ap.add_argument("--token-file", default=TOKEN_DEFAULT,
+                    help=f"token file (default {TOKEN_DEFAULT})")
+    ap.add_argument("--manifest", default=MANIFEST_DEFAULT,
+                    help=f"TSV of share links (default {MANIFEST_DEFAULT})")
+    ap.add_argument("-n", "--dry-run", action="store_true",
+                    help="show what would be uploaded, change nothing")
+    ap.add_argument("-q", "--quiet", action="store_true", help="only print share links")
+    args = ap.parse_args()
+
+    STATE_PATH = args.state
+    token = read_token(args.token_file)
+    state = load_state(args.state)
+
+    root = args.root or state.get("rootFolder")
+
+    files = []
+    if not os.path.isdir(args.dir):
+        sys.exit(f"not a directory: {args.dir}")
+    for name in sorted(os.listdir(args.dir)):
+        if not name.lower().endswith(TS_EXTS):
+            continue
+        path = os.path.join(args.dir, name)
+        if not os.path.isfile(path):
+            continue
+        model = model_of(path)
+        if args.model and model not in args.model:
+            continue
+        size = os.path.getsize(path)
+        if args.min_size and size < args.min_size * 1_000_000_000:
+            continue
+        files.append((model, path, size))
+
+    if not files:
+        sys.exit("no matching .ts files")
+
+    pending = [(m, p, s) for m, p, s in files
+               if state["files"].get(p, {}).get("size") != s]
+
+    if not args.quiet:
+        log(f"{len(files)} files, {human(sum(s for _, _, s in files))} total")
+        log(f"{len(pending)} to upload, {human(sum(s for _, _, s in pending))} pending")
+        log(f"{len(state['models'])} model folders already recorded")
+
+    if args.dry_run:
+        by_model = {}
+        for model, path, size in pending:
+            by_model.setdefault(model, []).append((path, size))
+        for model in sorted(by_model):
+            known = state["models"].get(model, {})
+            link = f"https://gofile.io/d/{known['code']}" if known.get("code") else "(new folder)"
+            log(f"{model:30s} {len(by_model[model]):3d} files "
+                f"{human(sum(s for _, s in by_model[model])):>10s}  {link}")
+        return
+
+    if not root:
+        sys.exit("no root folder known: pass --root <UUID> once (account profile page)")
+    if not state.get("rootFolder"):
+        state["rootFolder"] = root
+        save_state(args.state, state)
+
+    uploaded = 0
+    failed = []
+    for model, path, size in pending:
+        if args.limit and uploaded >= args.limit:
+            break
+        folder = ensure_model_folder(model, token, state, root, False)
+        name = os.path.basename(path)
+        if not args.quiet:
+            log(f"[{model}] {name} ({human(size)})")
+        start = time.monotonic()
+        res = None
+        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            res = upload(path, folder["id"], token)
+            status = res.get("status")
+            if status == "ok":
+                break
+            if status in ("error-rateLimit", "error-transport") and attempt < UPLOAD_ATTEMPTS:
+                log(f"  {status}, retrying in {RETRY_SLEEP}s")
+                time.sleep(RETRY_SLEEP)
+                continue
+            break
+        elapsed = max(time.monotonic() - start, 0.001)
+        if res and res.get("status") == "ok":
+            data = res["data"]
+            rate = size / elapsed
+            state["files"][path] = {
+                "id": data.get("id"),
+                "md5": data.get("md5"),
+                "size": data.get("size", size),
+                "model": model,
+                "uploaded": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            save_state(args.state, state)
+            uploaded += 1
+            if not args.quiet:
+                log(f"  ok {human(size / elapsed)}/s, {elapsed:.0f}s")
+        else:
+            status = (res or {}).get("status", "?")
+            failed.append((name, status))
+            log(f"  FAILED {status} {(res or {}).get('msg', '')}".rstrip())
+
+    rows = []
+    for model in sorted(state["models"]):
+        sizes = [st["size"] for st in state["files"].values() if st.get("model") == model]
+        rows.append((model, len(sizes), human(sum(sizes)),
+                     f"https://gofile.io/d/{state['models'][model]['code']}"))
+
+    os.makedirs(os.path.dirname(args.manifest), exist_ok=True)
+    with open(args.manifest, "w") as fh:
+        fh.write("model\tfiles\tsize\turl\n")
+        for model, count, size, link in rows:
+            fh.write(f"{model}\t{count}\t{size}\t{link}\n")
+
+    if not args.quiet:
+        log(f"\nuploaded {uploaded} file(s), {len(failed)} failed")
+    if args.quiet:
+        for _, _, _, link in rows:
+            print(link)
+    else:
+        print("\nmodel\tfiles\tsize\tshare link")
+        for model, count, size, link in rows:
+            print(f"{model}\t{count}\t{size}\t{link}")
+
+    if failed:
+        log("\nfailed uploads:")
+        for name, status in failed:
+            log(f"  {name}: {status}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

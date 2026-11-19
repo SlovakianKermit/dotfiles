@@ -1,0 +1,49 @@
+.TH GOFILE-PUBLISH-REMOTE 1 "2026-11-19" "gofile-publish-remote" "User Commands"
+.SH NAME
+gofile-publish-remote \- run gofile-publish on the Proxmox server over ssh
+.SH SYNOPSIS
+.B gofile-publish-remote
+[\fIOPTIONS\fP]
+.SH DESCRIPTION
+.B gofile-publish-remote
+is a thin local wrapper that runs
+.BR gofile-publish (1)
+on the Proxmox server, so recordings are read and uploaded by the machine that
+holds them instead of being pulled across the network first. It connects with
+.BR ssh (1)
+non\-interactively (no TTY, with the host's
+.B RemoteCommand
+disabled) and executes
+.B /usr/local/bin/gofile-publish
+with whatever arguments are given.
+.P
+The token file, state file and manifests therefore live on the server, not on
+the desktop.
+.SH ENVIRONMENT
+.TP
+.B GOFILE_PUBLISH_SERVER
+ssh host to use. Default:
+.IR proxmox .
+.TP
+.B GOFILE_PUBLISH_BIN
+Remote executable path. Default:
+.IR /usr/local/bin/gofile-publish .
+.SH EXAMPLES
+Dry run on the server:
+.IP
+.EX
+gofile-publish-remote \-\-dry\-run
+.EE
+.P
+Upload one model:
+.IP
+.EX
+gofile-publish-remote \-\-model abbytheran
+.EE
+.SH EXIT STATUS
+Exit status of the remote command, or ssh's own status if the connection fails.
+.SH SEE ALSO
+.BR gofile-publish (1),
+.BR ssh (1)
+.SH AUTHOR
+Written for local use.

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVER="${GOFILE_PUBLISH_SERVER:-proxmox}"
+REMOTE_BIN="${GOFILE_PUBLISH_BIN:-/usr/local/bin/gofile-publish}"
+
+SSH_OPTS=(-o RemoteCommand=none -o RequestTTY=no -o BatchMode=yes)
+
+exec ssh "${SSH_OPTS[@]}" "$SERVER" \
+  env PYTHONUNBUFFERED=1 "$REMOTE_BIN" "$@"

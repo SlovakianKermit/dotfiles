@@ -1,0 +1,138 @@
+.TH GOFILE-PUBLISH 1 "2026-11-19" "gofile-publish" "User Commands"
+.SH NAME
+gofile-publish \- upload .ts recordings to gofile.io, one folder per model
+.SH SYNOPSIS
+.B gofile-publish
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B gofile-publish
+scans a directory for
+.B .ts
+recordings, derives a model name from each filename prefix, and uploads every
+file into a public gofile.io folder named after that model, under the account's
+root folder.
+.P
+A free gofile account cannot list its own remote contents through the API, so
+the script keeps a JSON state file that is the only record of what exists where:
+model name to folder UUID and share code, plus one entry per uploaded file. A
+re\-run skips files already recorded at the same byte size, so an interrupted
+run resumes where it stopped.
+.P
+Uploads are delegated to
+.BR curl (1)
+so multi\-gigabyte files are streamed from disk instead of being buffered in
+memory. gofile uploads are not resumable: an interrupted file restarts from
+zero. Transfers are sequential, because the uplink saturates on a single stream
+and extra concurrency only slows each one down.
+.P
+The model name is the filename prefix before the recording timestamp:
+.IR abbytheran_2026-11-17_20-33-50_423.ts
+becomes
+.IR abbytheran .
+.SH OPTIONS
+.TP
+.BI \-\-dir " DIR"
+Source directory. Default:
+.IR /mnt/pve/Data_Storage/vr .
+.TP
+.BI \-\-root " UUID"
+UUID of the account root folder. Required once; afterwards it is read from the
+state file. The value is shown on the gofile account profile page.
+.TP
+.BI \-\-model " NAME"
+Only process this model. Repeatable.
+.TP
+.BI \-\-limit " N"
+Stop after N successful uploads.
+.TP
+.BI \-\-min\-size " GB"
+Skip files smaller than this many decimal gigabytes.
+.TP
+.BI \-\-state " FILE"
+State file. Default:
+.IR ~/.local/state/gofile-publish/state.json .
+Delete it and the script loses track of existing folders and uploads.
+.TP
+.BI \-\-token\-file " FILE"
+File containing the gofile API token. Default:
+.IR ~/.config/gofile/token .
+The environment variable
+.B GOFILE_TOKEN
+takes precedence.
+.TP
+.BI \-\-manifest " FILE"
+TSV of model, file count, total size and share link. Rewritten at the end of
+every run. Default:
+.IR ~/.local/state/gofile-publish/links.tsv .
+.TP
+.B \-n, \-\-dry\-run
+Print the per\-model plan and folder links without uploading anything. Does not
+require a root folder.
+.TP
+.B \-q, \-\-quiet
+Print only share links, one per line, for scripting.
+.SH BEHAVIOUR
+.SS What it does
+.IP \(bu 2
+Creates one public folder per model under the account root, remembered in the
+state file.
+.IP \(bu 2
+Uploads matching files into that folder, recording id, md5 and size.
+.IP \(bu 2
+Retries rate\-limited and transport failures up to three times.
+.SS Requirements
+.IP \(bu 2
+.BR curl (1)
+.IP \(bu 2
+A gofile API token.
+.SH EXAMPLES
+See what would be uploaded, grouped by model:
+.IP
+.EX
+gofile-publish \-\-dry\-run
+.EE
+.P
+First real run for one model, after setting the root folder once:
+.IP
+.EX
+gofile-publish \-\-root ecb747d3\-1610\-48a9\-815e\-9a42a77ad520 \-\-model abbytheran
+.EE
+.P
+Upload everything that is not recorded yet:
+.IP
+.EX
+gofile-publish
+.EE
+.P
+Just the share links:
+.IP
+.EX
+gofile-publish \-\-quiet
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+All pending uploads succeeded.
+.TP
+.B 1
+One or more uploads failed, or a required argument was missing.
+.SH FILES
+.TP
+.I ~/.local/state/gofile-publish/state.json
+Folder and upload records. Losing it means losing the mapping of local files to
+remote folders.
+.TP
+.I ~/.local/state/gofile-publish/links.tsv
+Last generated manifest.
+.TP
+.I ~/.config/gofile/token
+API token, mode 600.
+.SH SEE ALSO
+.BR gofile-publish-remote (1),
+.BR curl (1)
+.SH BUGS
+gofile uploads cannot be resumed, so a dropped connection wastes the bytes sent
+so far. Free accounts keep a file only while it is downloaded at least every ten
+days, so old posts can lose their links.
+.SH AUTHOR
+Written for local use.
