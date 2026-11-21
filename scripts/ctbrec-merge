@@ -79,16 +79,15 @@ def probe_header(path):
     return start, duration, vsig, asig, tuple(sorted(pids))
 
 
-def entry_duration(entry, probed, args):
-    """Length of a recording, either probed or inferred from mtime.
+def entry_duration(entry, probed):
+    """Length of a recording, from the container or inferred from mtime.
 
-    mtime is only the recording's end when nothing has touched the file since
-    it was written.  Files that were copied, moved or re-tagged later carry an
-    unrelated mtime, which makes the inferred duration far too long and turns
-    the gap test into nonsense.  --duration-from probe reads the container
-    duration instead.
+    The header probe is preferred: mtime is only the recording's end when
+    nothing has touched the file since it was written.  Copied, moved or
+    re-tagged files carry an unrelated mtime, so the fallback is only used
+    when the container reports no duration.
     """
-    if args.duration_from == "probe" and probed is not None and probed > 0:
+    if probed is not None and probed > 0:
         return probed
     return max(0.0, entry["mtime"] - entry["start"])
 
@@ -464,12 +463,12 @@ def part_gate(args):
     return wait_for_drain(args, sampler, cooldown=False)
 
 
-def find_chain_groups(rows, threshold):
+def find_chain_groups(rows, window):
+    """Chain start-sorted rows whose adjacent start times are within window."""
     groups = []
     cur = [rows[0]]
     for r in rows[1:]:
-        gap = r["start"] - (cur[-1]["start"] + cur[-1]["dur"])
-        if -threshold <= gap <= threshold:
+        if r["start"] - cur[-1]["start"] <= window:
             cur.append(r)
         else:
             if len(cur) >= 2:
@@ -511,63 +510,64 @@ def collect_entries(cpath, now, age, active_paths=None):
 
 def process_group(model, entries, args):
     entries = sorted(entries, key=lambda e: e["start"])
-    candidates = []
-    for prev, cur in zip(entries, entries[1:]):
-        gap_mtime = cur["start"] - prev["mtime"]
-        if gap_mtime <= args.gap + args.slack:
-            if not candidates or candidates[-1] is not prev:
-                candidates.append(prev)
-            if not candidates or candidates[-1] is not cur:
-                candidates.append(cur)
-    if len(candidates) >= 2:
-        print(f"scanning [{model}] ({len(candidates)} candidate file(s))")
-    if len(candidates) < 2:
-        return (0, 0, 0, 0, 0, [])
-
-    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        results = list(ex.map(lambda e: (e, probe_header(e["path"])), candidates))
-    by_path = {}
-    for e, p in results:
-        if p is None:
-            print(f"  warn: could not probe {e['name']}", file=sys.stderr)
-            continue
-        e["start_time"], probed_dur, e["vsig"], e["asig"], e["pids"] = p
-        e["dur"] = entry_duration(e, probed_dur, args)
-        by_path[e["path"]] = e
-    candidates = [e for e in candidates if e["path"] in by_path]
-    candidates.sort(key=lambda e: e["start"])
-
-    groups = find_chain_groups(candidates, args.gap)
+    window = args.within * 3600.0
+    chunks = find_chain_groups(entries, window)
 
     merged = bytes_out = n_del = n_keep = skipped = 0
     summary = []
-    for group in groups:
-        parts = [group[0]]
-        for e in group[1:]:
-            if e["vsig"] == parts[-1]["vsig"] and e["asig"] == parts[-1]["asig"]:
-                parts.append(e)
-            else:
-                if len(parts) >= 2:
-                    res = merge_run(parts, args)
-                    if res["merged"]:
-                        merged += 1
-                        bytes_out += res["size"]
-                        n_del += res["n_del"]
-                        n_keep += res["n_keep"]
-                        summary.append(res)
+    for chunk in chunks:
+        print(f"scanning [{model}] ({len(chunk)} candidate file(s))")
+        with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+            results = list(ex.map(lambda e: (e, probe_header(e["path"])), chunk))
+
+        candidates = []
+        groups = []
+
+        def flush():
+            nonlocal candidates
+            if len(candidates) >= 2:
+                groups.extend(find_chain_groups(candidates, window))
+            candidates = []
+
+        for e, p in results:
+            if p is None:
+                print(f"  warn: could not probe {e['name']}", file=sys.stderr)
+                flush()
+                continue
+            if candidates and e["start"] - candidates[-1]["start"] > window:
+                flush()
+            e["start_time"], probed_dur, e["vsig"], e["asig"], e["pids"] = p
+            e["dur"] = entry_duration(e, probed_dur)
+            candidates.append(e)
+        flush()
+
+        for group in groups:
+            parts = [group[0]]
+            for e in group[1:]:
+                if e["vsig"] == parts[-1]["vsig"] and e["asig"] == parts[-1]["asig"]:
+                    parts.append(e)
                 else:
-                    skipped += len(parts)
-                parts = [e]
-        if len(parts) >= 2:
-            res = merge_run(parts, args)
-            if res["merged"]:
-                merged += 1
-                bytes_out += res["size"]
-                n_del += res["n_del"]
-                n_keep += res["n_keep"]
-                summary.append(res)
-        else:
-            skipped += len(parts)
+                    if len(parts) >= 2:
+                        res = merge_run(parts, args)
+                        if res["merged"]:
+                            merged += 1
+                            bytes_out += res["size"]
+                            n_del += res["n_del"]
+                            n_keep += res["n_keep"]
+                            summary.append(res)
+                    else:
+                        skipped += len(parts)
+                    parts = [e]
+            if len(parts) >= 2:
+                res = merge_run(parts, args)
+                if res["merged"]:
+                    merged += 1
+                    bytes_out += res["size"]
+                    n_del += res["n_del"]
+                    n_keep += res["n_keep"]
+                    summary.append(res)
+            else:
+                skipped += len(parts)
     return (merged, bytes_out, n_del, n_keep, skipped, summary)
 
 
@@ -602,7 +602,7 @@ def rate_txt(started, in_bytes, out_bytes):
 def merge_run(group, args):
     gaps = []
     for prev, cur in zip(group, group[1:]):
-        gaps.append(round(cur["start"] - (prev["start"] + prev["dur"])))
+        gaps.append(round(cur["start"] - prev["start"]))
     gap_txt = ", ".join(f"{g}s" for g in gaps)
 
     model = group[0]["model"]
@@ -1280,7 +1280,8 @@ MODES = {
 def main():
     ap = argparse.ArgumentParser(
         prog="ctbrec-merge",
-        description="Losslessly merge ctbrec recordings of the same model that were split by a restart (small gaps).",
+        description="Losslessly merge ctbrec recordings of the same model whose "
+                    "filename start times are within a few hours of each other.",
     )
     ap.add_argument("-m", "--mode", choices=sorted(MODES), default="balanced",
                     help="io policy preset: max = all bandwidth, no waits; "
@@ -1290,15 +1291,9 @@ def main():
                     help="print current disk busy/stall/unflushed figures and the active policy, then exit")
     ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
                     help="base directory (one folder per model, or flat .mts files)")
-    ap.add_argument("--gap", type=int, default=3600,
-                    help="max gap in seconds between recordings to merge (default 3600)")
-    ap.add_argument("--duration-from", choices=["mtime", "probe"], default="mtime",
-                    help="how to measure each recording's length: mtime = last-modified "
-                         "minus the start time in its name (cheap, default); probe = "
-                         "ffprobe container duration (accurate for copied files whose "
-                         "mtime is unrelated to the recording's end)")
-    ap.add_argument("--slack", type=int, default=30,
-                    help="extra seconds of slack when finding candidates via mtime (default 30)")
+    ap.add_argument("--within", type=float, default=3.0,
+                    help="merge recordings whose filename start times are within "
+                         "this many hours of the previous part (default 3, decimals allowed)")
     ap.add_argument("--age", type=int, default=300,
                     help="skip files modified in the last N seconds (default 300)")
     ap.add_argument("--no-lsof", action="store_true",
@@ -1361,6 +1356,10 @@ def main():
     adv.add_argument("--io-device", default=None,
                      help="block device for the io cap (default: detected from --dir)")
     args = ap.parse_args()
+
+    if args.within <= 0:
+        print("error: --within must be greater than zero", file=sys.stderr)
+        return 1
 
     preset = MODES[args.mode]
     for key, val in preset.items():

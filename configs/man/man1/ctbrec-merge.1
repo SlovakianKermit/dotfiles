@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE 1 "2026-10-31" "ctbrec-merge" "User Commands"
+.TH CTBREC-MERGE 1 "2026-11-21" "ctbrec-merge" "User Commands"
 .SH NAME
 ctbrec-merge \- losslessly merge and repair ctbrec transport stream recordings
 .SH SYNOPSIS
@@ -11,9 +11,11 @@ merges MPEG transport stream recordings written by
 When ctbrec is briefly stopped or restarted, a single model's stream is split
 into several
 .B .ts
-parts. This script finds parts belonging to the same model whose gap between
-the end of one part and the start of the next is small, and joins them
-losslessly (stream copy, no re-encode).
+parts. This script groups parts belonging to the same model whose filename
+start times are within a few hours of each other and joins each group
+losslessly (stream copy, no re-encode). File modification times are not used
+to decide what belongs together, so copied or re-tagged recordings group
+correctly.
 .P
 Two layouts are supported:
 .IP \(bu 2
@@ -62,14 +64,12 @@ under
 .BR \-\-keep ),
 while the output keeps the first part's thumbnail.
 .P
-By default a recording's length is derived from its modification time. That is
-only valid while nothing has touched the file since it was written; a copied or
-re\-tagged file carries an unrelated mtime, which makes the computed end time
-(and therefore the gap test) meaningless. Use
-.B \-\-duration\-from probe
-to read the container duration with
-.BR ffprobe (1)
-instead.
+A model's recordings are ordered by the start timestamp in the filename and
+chained while each start is within
+.B \-\-within
+hours of the previous part's start. A long stream split into short parts
+therefore collapses into one file, while a new session that begins hours later
+starts a new group. Modification times play no part in grouping.
 .P
 With
 .BR \-\-verify ,
@@ -168,35 +168,13 @@ Useful for answering "is the disk busy right now and why".
 Base directory to scan. Defaults to
 .BR /mnt/pve/Data_Storage/ctbrec .
 .TP
-.B \-\-gap \fISECONDS\fR
-Maximum gap, in seconds, between the end of one part and the start of the next
-for the parts to be merged. Defaults to
-.BR 3600
-(60 minutes).
-.TP
-.B \-\-duration\-from \fI\,mtime|probe\/\fR
-How to measure each recording's length:
-.B mtime
-(last\-modified minus the start time in the filename) or
-.B probe
-(container duration from
-.BR ffprobe (1)).
-Defaults to
-.BR mtime .
-Use
-.B probe
-for files whose mtimes are unreliable, such as recordings copied later or
-stored on a share that rewrites timestamps; with
-.BR mtime
-the computed end can be hours or days after the real content ends, which makes
-the
-.B \-\-gap
-test match parts that are not actually adjacent.
-.TP
-.B \-\-slack \fISECONDS\fR
-Extra slack, in seconds, allowed when pre\-selecting candidates by modification
-time. Defaults to
-.BR 30 .
+.B \-\-within \fIHOURS\fR
+Merge parts whose filename start times are within this many hours of the
+previous part's start (adjacent chaining). Decimals are allowed, so
+.B \-\-within 1.5
+means ninety minutes. Defaults to
+.BR 3 .
+The value must be greater than zero.
 .TP
 .B \-\-age \fISECONDS\fR
 Skip files modified within the last
@@ -498,15 +476,19 @@ When
 is on a network filesystem there is no block device and the cap is skipped.
 .SH BEHAVIOUR
 .IP \(bu 2
-Each candidate part is probed with a short, header\-only
+Parts are first chained by the start timestamp parsed from the filename: a
+new group begins when a part starts more than
+.B \-\-within
+hours after the previous part. Only groups of two or more files are probed.
+Each candidate is then read with a short, header\-only
 .B ffprobe
-read for start time, codec parameters, and stream PIDs. Duration is estimated
-from the filename start time and the file modification time, avoiding a full
-read of every candidate.
+for start time, codec parameters, stream PIDs, and container duration.
 .IP \(bu 2
-Adjacent parts with matching parameters, matching PIDs, and a gap within
-.B \-\-gap
-are joined.
+Adjacent parts with matching parameters, matching PIDs, and start times still
+within the
+.B \-\-within
+window are joined. A file that cannot be probed breaks the chain rather than
+being bridged over.
 .IP \(bu 2
 Append mode copies each later part with
 .BR "ffmpeg \-c copy \-output_ts_offset" ,
@@ -650,10 +632,10 @@ ctbrec-merge \-\-dir /mnt/shared/Ctbrec/Recording \-\-top\-level
 .EE
 .P
 Merge recordings whose mtimes are unreliable (e.g. copied to a share), using
-the real container duration for the one\-hour gap rule:
+a ninety\-minute name\-based window:
 .IP
 .EX
-ctbrec-merge \-\-dir /mnt/shared/VR \-\-top\-level \-\-duration\-from probe \-\-verify
+ctbrec-merge \-\-dir /mnt/shared/VR \-\-top\-level \-\-within 1.5 \-\-verify
 .EE
 .P
 Preview and then repair merged files that have phantom timeline gaps:
