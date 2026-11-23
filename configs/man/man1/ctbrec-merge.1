@@ -1,4 +1,4 @@
-.TH CTBREC-MERGE 1 "2026-11-21" "ctbrec-merge" "User Commands"
+.TH CTBREC-MERGE 1 "2026-11-23" "ctbrec-merge" "User Commands"
 .SH NAME
 ctbrec-merge \- losslessly merge and repair ctbrec transport stream recordings
 .SH SYNOPSIS
@@ -91,16 +91,49 @@ single
 preset; the individual knobs are still there as overrides but normally do not
 need to be touched.
 .TP
+.B auto
+(default) Look at the storage behind
+.BR \-\-dir
+and choose
+.B ssd
+when it is a local solid\-state device,
+.B balanced
+otherwise (a spindle, a network mount, or anything that cannot be classified).
+The rotational attribute of the leaf disks under the mount is read from
+.BR /sys/block/*/queue/rotational ,
+walking through partitions and stacked devices (dm, md) and into their slaves,
+so a filesystem on an LVM volume or a btrfs partition is still classified by
+the drive actually holding it. Automatic detection only ever relaxes the
+spindle protections; it never adds pacing to an explicitly chosen mode.
+.TP
+.B ssd
+Full throughput, chosen automatically by
+.BR auto :
+no bandwidth cap, no cooldown, no drain gate, and
+.B \-\-jobs
+defaults to 8. On an SSD every pacing device in
+.B balanced
+only costs wall\-clock time \-\- the 60M cap is a fraction of the drive, and a
+drain gate measures the burst it has just started and then sits out its quiet
+window, which is where the long pauses between parts come from. A stream copy
+is sequential, so it does not disturb the drive either; keep
+.B balanced
+or
+.B reserved
+if the recordings share the SSD with something that must not be slowed.
+.TP
 .B max
 Full throughput: no bandwidth cap, no cooldown, no drain waits, and
 .B \-\-jobs
-defaults to 8 for probing. Use it when nothing is recording.
+defaults to 8 for probing. Use it when nothing is recording. Same numbers as
+.BR ssd ,
+but selected unconditionally.
 .TP
 .B balanced
-(default) Steady 60M/s read and write per device, no burst, a short cooldown
+Steady 60M/s read and write per device, no burst, a short cooldown
 and a drain check before every burst \-\- including between the parts of a
 single group, so a nine\-part merge is nine paced bursts rather than one
-five\-minute one. 60M rather than 90M because this drive drains about
+five\-minute one. 60M rather than 90M because a 2 TB spindle drains about
 50\-80 MB/s: above that the page cache outruns the drive, the unflushed backlog
 grows into the gigabyte, and io pressure climbs with it.
 .TP
@@ -147,22 +180,28 @@ and
 .BR ffprobe (1).
 .SH OPTIONS
 .TP
-.B \-m, \-\-mode \fI\,max|balanced|reserved\/\fR
+.B \-m, \-\-mode \fI\,auto|ssd|max|balanced|reserved\/\fR
 Choose the io policy preset. Defaults to
-.BR balanced .
-Each preset fills in every pacing knob below; any knob given explicitly on the
-command line still wins.
+.BR auto ,
+which picks
+.B ssd
+for a local solid\-state device and
+.B balanced
+otherwise. Each preset fills in every pacing knob below; any knob given
+explicitly on the command line still wins.
 .TP
 .B \-\-status
-Print the measured disk busy percentage, average queue depth, io stall
-percentage, unflushed (\fIDirty\fR + \fIWriteback\fR) megabytes, the detected
-device, whether the bandwidth cap can be applied, and the thresholds of the
-active mode, then exit without merging. Both a one\-second sample and the
+Print the detected storage class (ssd, hdd, network or unknown) and the reason,
+the measured disk busy percentage, average queue depth, io stall percentage,
+unflushed (\fIDirty\fR + \fIWriteback\fR) megabytes, the detected device,
+whether the bandwidth cap can be applied, and the thresholds of the active
+mode, then exit without merging. Both a one\-second sample and the
 .B \-\-drain\-window
 mean are shown; the mean is what the gate acts on. The stall figure is reported
 but not gated on (see
 .BR \-\-io\-wait\-threshold ).
-Useful for answering "is the disk busy right now and why".
+Useful for answering "is the disk busy right now and why" and for checking
+that a mode was detected as expected.
 .TP
 .B \-\-dir \fIDIR\fR
 Base directory to scan. Defaults to
@@ -219,8 +258,12 @@ timestamp glitches already present in the source do not block the merge.
 .TP
 .B \-j, \-\-jobs \fIN\fR
 Number of parallel header probes. Defaults to 1, except 8 under
-.BR "\-\-mode max" ;
-probing is I/O\-light and serial probing avoids seek thrash on a busy disk.
+.BR ssd ,
+.BR max ,
+and therefore under
+.B auto
+on an SSD; probing is I/O\-light and serial probing avoids seek thrash on a
+busy spindle.
 .TP
 .B \-\-no\-append
 Disable append mode and always remux via
@@ -250,6 +293,8 @@ Minimum time to sleep before starting another burst. Defaults to 5 under
 30 under
 .BR reserved ,
 and 0 under
+.B ssd
+and
 .BR max .
 .TP
 .B \-\-io\-wait\-max \fISECONDS\fR
@@ -260,7 +305,10 @@ for the disk to drain before starting a burst. Defaults to 120 under
 600 under
 .BR reserved ,
 and 0 (no gate at all) under
+.B ssd
+and
 .BR max .
+With no gate the per\-part check disappears too, so a group runs as one burst.
 .TP
 .B \-\-io\-wait\-threshold \fIPERCENT\fR
 Io stall percentage considered drained, measured from the cumulative
@@ -306,6 +354,8 @@ and a merging run 3\-13. Defaults to 1.5 under
 0.7 under
 .BR reserved ,
 0 (ignored) under
+.B ssd
+and
 .BR max .
 .TP
 .B \-\-disk\-busy\-threshold \fIPERCENT\fR
@@ -318,6 +368,8 @@ mean. Defaults to 60 under
 30 under
 .BR reserved ,
 100 (ignored) under
+.B ssd
+and
 .BR max .
 .TP
 .B \-\-drain\-dirty\-mb \fIMB\fR
@@ -339,6 +391,8 @@ Defaults to 256 under
 64 under
 .BR reserved ,
 0 (ignored) under
+.B ssd
+and
 .BR max .
 .TP
 .B \-\-drain\-sample \fISECONDS\fR
@@ -374,6 +428,8 @@ output, and adding to it is what drove the disk to 100% for minutes;
 always ends the run with the remaining groups left for the next one. Defaults to
 .B proceed
 under
+.B ssd
+,
 .B max
 and
 .BR balanced ,
@@ -409,6 +465,8 @@ bitrate and so its content duration. Defaults to
 .TP
 .B \-\-nice \fIN\fR
 Nice level for the merge and repair ffmpeg. Defaults to 0 under
+.BR ssd
+and
 .BR max ,
 10 under
 .BR balanced ,
@@ -419,6 +477,7 @@ Nice level for the merge and repair ffmpeg. Defaults to 0 under
 Ionice class for the merge and repair ffmpeg. Defaults to
 .B best\-effort
 (nice 7) under
+.BR ssd ,
 .B max
 and
 .BR balanced ,
@@ -445,6 +504,8 @@ under
 and
 .B 0
 (no cap) under
+.B ssd
+and
 .BR max .
 .B 0
 leaves only
@@ -457,6 +518,8 @@ rather than failing.
 .B \-\-io\-weight \fIN\fR
 cgroup io weight (1\-10000) for the scope hosting that ffmpeg. Defaults to 1000
 under
+.B ssd
+and
 .BR max ,
 100 under
 .BR balanced ,
@@ -589,10 +652,23 @@ Preview the merge plan for the default server directory:
 ctbrec-merge \-\-dry\-run
 .EE
 .P
-Merge with the default balanced policy (90M/s cap, short waits):
+Merge with the detected policy (default: full speed on an SSD, the paced
+balanced profile on a spindle):
 .IP
 .EX
 ctbrec-merge
+.EE
+.P
+Check which policy the storage would be given:
+.IP
+.EX
+ctbrec-merge \-\-status
+.EE
+.P
+Force the paced profile on an SSD, e.g. because a live encode shares it:
+.IP
+.EX
+ctbrec-merge \-\-mode balanced
 .EE
 .P
 Use the whole disk because nothing is being recorded:
@@ -605,12 +681,6 @@ Stay out of the way of a live encode on the same spindle:
 .IP
 .EX
 ctbrec-merge \-\-mode reserved
-.EE
-.P
-Ask what the disk is doing right now:
-.IP
-.EX
-ctbrec-merge \-\-status
 .EE
 .P
 Merge with the originals kept (forces a concat remux):

@@ -651,7 +651,12 @@ def merge_run(group, args):
         os.remove(part_path)
     except OSError:
         pass
-    list_txt = "".join(f"file '{e['path']}'\n" for e in group)
+    # ffmpeg resolves the paths in the list relative to the list file, which
+    # lives in the temp directory, so they must be absolute. Single quotes in a
+    # model name are escaped in the concat syntax's own way.
+    list_txt = "".join(
+        "file '%s'\n" % os.path.abspath(e["path"]).replace("'", "'\\''")
+        for e in group)
     print(f"  remuxing {len(group)} parts with ffmpeg concat")
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
         tf.write(list_txt)
@@ -973,14 +978,118 @@ def scan_pts_jumps(path, max_jump=2.0, chunk_packets=20000):
     return jumps
 
 
+_MOUNT_CACHE = {}
+
+
+def mount_info(path):
+    """(source, fstype) of the mount holding path, cached per directory.
+
+    Called from ``io_priority_prefix`` once per part, so the cache keeps the
+    findmnt fork (a few milliseconds, but a few thousand times a run) off the
+    per-part path.
+    """
+    key = os.path.realpath(path)
+    hit = _MOUNT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    r = subprocess.run(["findmnt", "-no", "SOURCE,FSTYPE", "--target", key],
+                       capture_output=True, text=True)
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    # --target walks the mount stack and prints every layer over the path
+    # (an autofs stub, then the real cifs mount on top of it); the last line is
+    # the one actually serving the file.
+    parts = lines[-1].split() if lines else []
+    info = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
+    # A btrfs subvolume is reported as /dev/sda2[/@home].
+    if "[" in info[0]:
+        info = (info[0].split("[", 1)[0], info[1])
+    _MOUNT_CACHE[key] = info
+    return info
+
+
 def backing_device(path):
     """Block device backing path, or None for network/virtual filesystems."""
-    r = subprocess.run(["findmnt", "-no", "SOURCE", "--target", path],
-                       capture_output=True, text=True)
-    src = r.stdout.strip()
+    src = mount_info(path)[0]
     if src.startswith("/dev/"):
         return src
     return None
+
+
+NETWORK_FSTYPES = {
+    "cifs", "smb3", "smbfs", "nfs", "nfs4", "fuse.sshfs", "9p",
+    "virtiofs", "ceph", "glusterfs",
+}
+
+
+def _rotational_flags(maj, mino, seen):
+    """Rotational flag of every leaf disk under one block device.
+
+    A stacked device (dm, md, device-mapper on LVM) carries its own
+    ``queue/rotational``, and it is 1 by default no matter what it is built
+    from, so the flags of its slaves are what count. A partition inherits its
+    disk's value and needs no special case.
+    """
+    key = (maj, mino)
+    if key in seen:
+        return set()
+    seen.add(key)
+    base = f"/sys/dev/block/{maj}:{mino}"
+    try:
+        slaves = sorted(os.listdir(os.path.join(base, "slaves")))
+    except OSError:
+        slaves = []
+    if slaves:
+        out = set()
+        for s in slaves:
+            try:
+                with open(f"/sys/class/block/{s}/dev") as f:
+                    smaj, smin = (int(x) for x in f.read().strip().split(":"))
+            except (OSError, ValueError):
+                continue
+            out |= _rotational_flags(smaj, smin, seen)
+        if out:
+            return out
+    # A partition has no queue/ of its own; the attribute lives on the disk one
+    # level up, so walk up the sysfs path until it appears.
+    real = os.path.realpath(base)
+    for _ in range(4):
+        try:
+            with open(os.path.join(real, "queue", "rotational")) as f:
+                return {f.read().strip() == "1"}
+        except OSError:
+            pass
+        parent = os.path.dirname(real)
+        if parent == real:
+            break
+        real = parent
+    return set()
+
+
+def storage_class(path):
+    """Classify the storage behind path and say why.
+
+    Returns ``(kind, device, note)`` with kind in ``ssd``, ``hdd``,
+    ``network`` or ``unknown``. The kind is what the ``auto`` mode keys off:
+    the hdd profile exists to keep a seek-penalised, low-throughput spindle
+    from being buried (60 MB/s cap, drain gates between parts, serial
+    probing), and on an SSD every one of those is pure lost time -- the drive
+    answers the queue in microseconds, so a drain gate only ever measures the
+    burst that just finished and then sits out its quiet window.
+    """
+    src, fstype = mount_info(path)
+    if not src.startswith("/dev/"):
+        kind = "network" if fstype in NETWORK_FSTYPES else "unknown"
+        return kind, None, f"{fstype or 'unknown'} on {src or 'unknown'}"
+    try:
+        st = os.stat(src)
+    except OSError:
+        return "unknown", src, f"cannot stat {src}"
+    flags = _rotational_flags(os.major(st.st_rdev), os.minor(st.st_rdev), set())
+    if not flags:
+        return "unknown", src, "no rotational attribute"
+    if True in flags:
+        return "hdd", src, f"{fstype} on {src}, rotational=1"
+    return "ssd", src, f"{fstype} on {src}, rotational=0"
 
 
 def io_priority_prefix(args):
@@ -998,13 +1107,14 @@ def io_priority_prefix(args):
     else:
         inner += ["ionice", "-c2", "-n7"]
     rate = (args.io_rate or "").strip()
-    device = args.io_device or backing_device(args.dir)
-    if rate and rate not in ("0", "off", "none") and device and args.io_scope:
-        return ["systemd-run", "--scope", "-q", "--collect", "--no-ask-password",
-                "-p", f"IOReadBandwidthMax={device} {rate}",
-                "-p", f"IOWriteBandwidthMax={device} {rate}",
-                "-p", f"IOWeight={args.io_weight}",
-                "--"] + inner
+    if rate and rate not in ("0", "off", "none") and args.io_scope:
+        device = args.io_device or backing_device(args.dir)
+        if device:
+            return ["systemd-run", "--scope", "-q", "--collect", "--no-ask-password",
+                    "-p", f"IOReadBandwidthMax={device} {rate}",
+                    "-p", f"IOWriteBandwidthMax={device} {rate}",
+                    "-p", f"IOWeight={args.io_weight}",
+                    "--"] + inner
     return inner
 
 
@@ -1276,6 +1386,31 @@ MODES = {
                      drain_timeout_action="stop"),
 }
 
+# An SSD has no seek penalty and microseconds of service time, so every
+# pacing device in the profiles above only adds wall-clock time: the 60M cap
+# is a tenth of the drive, the drain gate measures the burst it just started
+# and then sits out its quiet window, and serial probing turns a few hundred
+# header reads into a minute of silence.  The ssd policy is therefore simply
+# max, as its own name so that --mode auto can select it and so a retuned
+# spindle profile cannot leak into it.
+MODES["ssd"] = dict(MODES["max"])
+
+
+def mode_label(args):
+    """'ssd (auto: ssd, btrfs on /dev/nvme1n1p2, rotational=0)' for the banner."""
+    if args.mode_requested == args.mode:
+        return args.mode
+    return f"{args.mode} (from --mode auto: {args.storage_kind}, {args.storage_note})"
+
+
+def gate_label(args):
+    """One-line description of the drain gate, or that there is none."""
+    if args.io_wait_max <= 0:
+        return "no drain gate"
+    return (f"drain {args.io_wait_max:.0f}s @ queue <{args.drain_queue_max:g}, "
+            f"busy <{args.disk_busy_threshold:.0f}%, "
+            f"unflushed <{args.drain_dirty_mb:.0f} MB, {args.drain_window:.0f}s mean")
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -1283,10 +1418,11 @@ def main():
         description="Losslessly merge ctbrec recordings of the same model whose "
                     "filename start times are within a few hours of each other.",
     )
-    ap.add_argument("-m", "--mode", choices=sorted(MODES), default="balanced",
-                    help="io policy preset: max = all bandwidth, no waits; "
-                         "balanced = capped, brief waits (default); "
-                         "reserved = heavy cap, stops when the disk stays busy")
+    ap.add_argument("-m", "--mode", choices=sorted(MODES) + ["auto"], default="auto",
+                    help="io policy preset: auto = detect the storage behind --dir "
+                         "and pick ssd on an SSD, balanced on a spindle (default); "
+                         "ssd/max = all bandwidth, no waits; balanced = capped, brief "
+                         "waits; reserved = heavy cap, stops when the disk stays busy")
     ap.add_argument("--status", action="store_true",
                     help="print current disk busy/stall/unflushed figures and the active policy, then exit")
     ap.add_argument("--dir", default="/mnt/pve/Data_Storage/ctbrec",
@@ -1361,15 +1497,24 @@ def main():
         print("error: --within must be greater than zero", file=sys.stderr)
         return 1
 
+    if not os.path.isdir(args.dir):
+        print(f"error: {args.dir} is not a directory", file=sys.stderr)
+        return 1
+
+    kind, storage_dev, storage_note = storage_class(args.dir)
+    args.storage_kind = kind
+    args.storage_note = storage_note
+    args.mode_requested = args.mode
+    if args.mode == "auto":
+        # auto only relaxes the spindle protections; it never adds pacing that
+        # an explicitly chosen mode would not have had.
+        args.mode = "ssd" if kind == "ssd" else "balanced"
+
     preset = MODES[args.mode]
     for key, val in preset.items():
         if getattr(args, key) is None:
             setattr(args, key, val)
     args.io_scope = None
-
-    if not os.path.isdir(args.dir):
-        print(f"error: {args.dir} is not a directory", file=sys.stderr)
-        return 1
 
     if args.status:
         dev = args.io_device or backing_device(args.dir) or "no block device"
@@ -1395,7 +1540,8 @@ def main():
         def num(v, fmt="{:.1f}"):
             return "n/a" if v is None else fmt.format(v)
 
-        print(f"mode: {args.mode}  (io cap {args.io_rate or 'off'}, weight {args.io_weight}, jobs {args.jobs})")
+        print(f"mode: {mode_label(args)}  (io cap {args.io_rate or 'off'}, weight {args.io_weight}, jobs {args.jobs})")
+        print(f"storage: {args.storage_kind}  ({args.storage_note})")
         print(f"device: {dev}  [{', '.join(f'{a}:{b}' for a, b in devs) or 'no block device'}]")
         ensure_io_scope(args)
         print(f"scope: {'active' if args.io_scope else 'unavailable (nice/ionice only)'}")
@@ -1403,10 +1549,7 @@ def main():
               f"stall {pct(st['stall'])}   unflushed {mb(st['dirty_mb'])}")
         print(f"mean ({args.drain_window:.0f}s): busy {pct(mean['util'])}   queue {num(mean['aqu'])}   "
               f"stall {pct(mean['stall'])}   unflushed {mb(mean['dirty_mb'])}")
-        print(f"gate: quiet when {args.drain_window:.0f}s-mean queue < {args.drain_queue_max:g}, "
-              f"busy < {args.disk_busy_threshold:.0f}%, "
-              f"unflushed < {args.drain_dirty_mb:.0f} MB for {args.drain_quiet:.0f}s "
-              f"(wait {args.io_wait_max:.0f}s)")
+        print(f"gate: {gate_label(args)}")
         print("stall is the root cgroup's io pressure: kernel writeback threads "
               "dominate it, so it is reported but not gated on")
         return 0
@@ -1417,11 +1560,8 @@ def main():
         print(f"error: only {free_pct:.1f}% free (< --min-free-pct {args.min_free_pct:.0f}), refusing to merge", file=sys.stderr)
         return 1
 
-    print(f"mode: {args.mode}  (io cap {args.io_rate or 'off'} x2, weight {args.io_weight}, "
-          f"jobs {args.jobs}, cooldown {args.cooldown:.0f}s, "
-          f"drain {args.io_wait_max:.0f}s @ queue <{args.drain_queue_max:g}, "
-          f"busy <{args.disk_busy_threshold:.0f}%, "
-          f"unflushed <{args.drain_dirty_mb:.0f} MB, {args.drain_window:.0f}s mean)")
+    print(f"mode: {mode_label(args)}  (io cap {args.io_rate or 'off'} x2, weight {args.io_weight}, "
+          f"jobs {args.jobs}, cooldown {args.cooldown:.0f}s, {gate_label(args)})")
 
     now = datetime.now().timestamp()
     active_paths = None
