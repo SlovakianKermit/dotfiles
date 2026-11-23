@@ -1398,6 +1398,33 @@ MODES = {
 MODES["ssd"] = dict(MODES["max"])
 
 
+def report_no_groups(args, flat, top_files, recs_found):
+    """Explain an empty scan instead of printing a bare "0 files merged".
+
+    The commonest cause is a directory holding something else -- a HandBrake
+    output folder full of .mkv, say -- which otherwise looks exactly like a
+    successful but pointless run. Only .ts/.mts parts are ever merged: the
+    byte-append path and the PTS checks are built on MPEG transport packets.
+    """
+    if recs_found == 0:
+        exts = {}
+        for name in top_files:
+            ext = os.path.splitext(name)[1].lower() or "(no extension)"
+            exts[ext] = exts.get(ext, 0) + 1
+        shown = ", ".join(f"{n}x {e}" for e, n in
+                          sorted(exts.items(), key=lambda kv: -kv[1])[:4])
+        print(f"nothing to do: no .ts/.mts recordings under {args.dir}"
+              + (f" (found {shown})" if shown else ""))
+    elif flat:
+        print(f"nothing to do: {recs_found} recording(s) in {args.dir} but no two "
+              f"of a model start within --within {args.within:g}h of each other, "
+              f"or their codec parameters differ")
+    else:
+        print(f"nothing to do: no model folder under {args.dir} holds two or "
+              f"more recordings within --within {args.within:g}h of each other "
+              f"(codec parameter mismatches also split a group)")
+
+
 def mode_label(args):
     """'ssd (auto: ssd, btrfs on /dev/nvme1n1p2, rotational=0)' for the banner."""
     if args.mode_requested == args.mode:
@@ -1595,9 +1622,12 @@ def main():
     top_files = [f for f in files if os.path.isfile(os.path.join(args.dir, f))]
     has_top_recordings = any(parse_filename(f) for f in top_files)
     model_groups = []
-    if args.top_level or has_top_recordings:
+    flat = args.top_level or has_top_recordings
+    recs_found = 0
+    if flat:
         entries, act = collect_entries(args.dir, now, args.age, active_paths)
         active += act
+        recs_found += len(entries)
         by_model = {}
         for e in entries:
             by_model.setdefault(e["model"], []).append(e)
@@ -1607,8 +1637,12 @@ def main():
             cpath = os.path.join(args.dir, d)
             entries, act = collect_entries(cpath, now, args.age, active_paths)
             active += act
+            recs_found += len(entries)
             if len(entries) >= 2:
                 model_groups.append((d, entries))
+
+    if not model_groups:
+        report_no_groups(args, flat, top_files, recs_found)
 
     budget = args.max_run_gb * 1e9
     sampler = None if args.dry_run else DiskSampler(device_targets(args.dir))

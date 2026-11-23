@@ -32,6 +32,17 @@ in which case
 .B \-\-top\-level
 is implied and files are grouped by the model name in the filename.
 .P
+Only
+.B .ts
+and
+.B .mts
+files are considered, because both the append path and the PTS checks work on
+MPEG transport packets. Anything else in the directory \-\- a HandBrake output
+folder full of
+.BR .mkv ,
+for example \-\- is ignored, and a run that finds no candidates says so on
+stdout instead of silently reporting "0 files merged".
+.P
 Two filename forms are recognised:
 .BI model _YYYY\-MM\-DD_HH\-MM\-SS_mmm.ts
 and
