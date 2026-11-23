@@ -1026,8 +1026,8 @@ def _rotational_flags(maj, mino, seen):
 
     A stacked device (dm, md, device-mapper on LVM) carries its own
     ``queue/rotational``, and it is 1 by default no matter what it is built
-    from, so the flags of its slaves are what count. A partition inherits its
-    disk's value and needs no special case.
+    from, so the flags of its slaves are what count. A partition has no queue
+    attributes of its own at all; those are read from the disk above it.
     """
     key = (maj, mino)
     if key in seen:
@@ -1088,6 +1088,8 @@ def storage_class(path):
     if not flags:
         return "unknown", src, "no rotational attribute"
     if True in flags:
+        # A device built from both kinds is treated as a spindle: the pacing
+        # only costs time, while guessing wrong costs the drive.
         return "hdd", src, f"{fstype} on {src}, rotational=1"
     return "ssd", src, f"{fstype} on {src}, rotational=0"
 
