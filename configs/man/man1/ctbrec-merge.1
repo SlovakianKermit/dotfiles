@@ -1,6 +1,6 @@
 .TH CTBREC-MERGE 1 "2026-11-23" "ctbrec-merge" "User Commands"
 .SH NAME
-ctbrec-merge \- losslessly merge and repair ctbrec transport stream recordings
+ctbrec-merge \- losslessly merge and repair ctbrec recordings (.ts, .mts, .mkv)
 .SH SYNOPSIS
 .B ctbrec-merge
 [\fIOPTIONS\fP]
@@ -13,7 +13,12 @@ into several
 .B .ts
 parts. This script groups parts belonging to the same model whose filename
 start times are within a few hours of each other and joins each group
-losslessly (stream copy, no re-encode). File modification times are not used
+losslessly (stream copy, no re-encode). Matroska
+.B .mkv
+files carrying the same
+.BI model _date_time
+name are handled the same way, which is what makes a HandBrake output folder
+mergeable. File modification times are not used
 to decide what belongs together, so copied or re-tagged recordings group
 correctly.
 .P
@@ -26,27 +31,33 @@ One subdirectory per model under
 Flat
 .B .mts
 /.ts
+/.mkv
 files directly in
 .BR \-\-dir ,
 in which case
 .B \-\-top\-level
 is implied and files are grouped by the model name in the filename.
 .P
-Only
+Three extensions are considered:
 .B .ts
 and
 .B .mts
-files are considered, because both the append path and the PTS checks work on
-MPEG transport packets. Anything else in the directory \-\- a HandBrake output
-folder full of
-.BR .mkv ,
-for example \-\- is ignored, and a run that finds no candidates says so on
-stdout instead of silently reporting "0 files merged".
+transport streams, as written by ctbrec, and
+.B .mkv
+Matroska files -- typically the output of a HandBrake pass over the same
+recordings. Groups never mix containers. A transport stream is merged by
+appending packets (see BEHAVIOUR); a Matroska file is merged with a plain
+.B "ffmpeg \-f concat \-c copy"
+remux into Matroska, because there is no byte-level append for it and the
+transport-stream checks (packet size, PID, PTS scan) do not apply. A run that
+finds no candidates says so on stdout instead of silently reporting "0 files
+merged".
 .P
-Two filename forms are recognised:
+Three filename forms are recognised:
 .BI model _YYYY\-MM\-DD_HH\-MM\-SS_mmm.ts
-and
-.BI model _Chaturbate_YYYYMMDD\-HHMMSS.mts .
+/.mts/.mkv,
+.BI model _Chaturbate_YYYYMMDD\-HHMMSS.ts
+/.mts/.mkv.
 .P
 By default the join is written by
 .B append
@@ -61,7 +72,11 @@ or
 .BR \-\-no\-append ),
 the script falls back to a full
 .B ffmpeg \-f concat \-c copy
-remux.
+remux. A Matroska group always takes that path: the concat remux is written
+straight into the
+.B .part
+file rather than through a pipe, so the muxer can seek back and record the
+duration and the cue index.
 .P
 When a thumbnail (the same basename with
 .BR .jpg ,
@@ -259,13 +274,14 @@ never enter subdirectories.
 .TP
 .B \-\-verify
 Check the joined output before deleting the originals (extra full read of the
-output). The duration is compared against the expected timeline, and the raw
-transport PTS is scanned for discontinuities. In append mode the expected
-timeline is
+output). The duration is compared against the expected timeline, and for a
+transport stream the raw PTS is scanned for discontinuities. In append mode the
+expected timeline is
 .B one part after another
 with the wall\-clock gaps removed. A PTS discontinuity found in append mode
 rolls the append back and retries the group as a full concat remux, so
-timestamp glitches already present in the source do not block the merge.
+timestamp glitches already present in the source do not block the merge. A
+Matroska group is checked by duration only.
 .TP
 .B \-j, \-\-jobs \fIN\fR
 Number of parallel header probes. Defaults to 1, except 8 under
@@ -459,7 +475,10 @@ of merged output in one run.
 .B \-\-fix\-timestamps
 Repair mode: scan the recordings and remux, in place, any whose container
 duration far exceeds its actual content, removing the phantom timeline gaps of
-an earlier merge. No merging is performed in this mode.
+an earlier merge. No merging is performed in this mode. This is a transport
+stream measurement (packet sizes and PTS continuity), so
+.B .mkv
+files are skipped.
 .TP
 .B \-\-fix\-threshold \fIRATIO\fR
 Repair files whose container\-duration / content\-duration ratio exceeds

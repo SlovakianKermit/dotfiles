@@ -23,16 +23,26 @@ for that patch).
 This is the same operation as clicking the portrait box in
 the Edit Model dialog, but reachable from the portrait viewer itself.
 .P
-ctbrec serves its web interface from resources inside the server jar. Its
-launcher puts
+ctbrec serves its web interface from resources inside the server jar. The
+service must put
 .I /opt/ctbrec/patch
-first on the classpath, and the static file servlet resolves resources through
-the class loader, so a file placed at
+first on its classpath
+.RB ( \-cp
+.IR /opt/ctbrec/patch:ctbrec\-server\-<version>\-final.jar ),
+and the static file servlet resolves resources through the class loader, so a
+file placed at
 .I /opt/ctbrec/patch/html/static/index.html
 or
 .I models.js
-silently overrides the jar copy. No jar modification and no server restart is
-needed; a normal browser reload picks it up.
+silently overrides the jar copy. The jar itself is never modified.
+.P
+ctbrec 26.10.25 reads the static resources at startup, so the service is
+restarted after deploying (a normal browser reload then picks it up). If
+recordings are active the script refuses to restart unless
+.B \-\-force\-restart
+is given; use
+.B \-\-no\-restart
+to deploy now and load the overrides at the next restart.
 .P
 The script extracts the pristine files from the installed jar, checks that the
 patch anchors are present and unique, applies the changes, verifies the
@@ -88,6 +98,13 @@ overridable with
 .TP
 .B \-\-dry\-run
 Find the jar and verify the anchors without deploying anything.
+.TP
+.B \-\-no\-restart
+Deploy the override files without restarting ctbrec. The running server keeps
+serving the stock resources until its next restart.
+.TP
+.B \-\-force\-restart
+Restart ctbrec even when recordings are active.
 .SH WHAT CHANGES
 .IP \(bu 2
 .I index.html

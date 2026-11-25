@@ -28,7 +28,6 @@ cachyos-zsh-config
 cachy-update
 char-white
 chwd
-coolercontrol
 freedownloadmanager
 gamescope
 grub-btrfs-support

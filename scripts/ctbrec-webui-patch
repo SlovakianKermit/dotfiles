@@ -2,9 +2,10 @@
 """ctbrec-webui-patch - add a "Fetch from stream" button to the ctbrec WebUI.
 
 The ctbrec server serves its web interface from resources inside the server
-jar.  Its launcher puts /opt/ctbrec/patch first on the classpath, so a file at
+jar.  Its service puts /opt/ctbrec/patch first on the classpath, so a file at
 /opt/ctbrec/patch/html/static/<name> overrides the jar copy without touching
-the jar and without restarting the server.
+the jar.  ctbrec 26.10.25 reads these resources at startup, so the service is
+restarted afterwards (refused while recordings are active unless forced).
 
 This script extracts the pristine index.html and models.js from the installed
 jar, applies a small, anchored patch (a button in the portrait popup which
@@ -16,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 
 SSH_OPTS = (
     "-o",
@@ -46,8 +49,10 @@ INDEX_PATCHED = """            <p class="text-muted mt-2">No portrait available<
           </button>
         </div>"""
 
-SCRIPT_TAG = '<script src="models.js"></script>'
-SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch3"></script>'
+# The script tag carries a build-version cache buster upstream (e.g.
+# models.js?v=26.10.25), so match any query string rather than one exact tag.
+SCRIPT_TAG_RE = re.compile(r'<script src="models\.js(?:\?[^"]*)?"></script>')
+SCRIPT_TAG_PATCHED = '<script src="models.js?v=portrait-fetch4"></script>'
 
 MODELS_ANCHOR = "function showPortraitPopup(model) {"
 MODELS_PATCHED = """// ctbrec-webui-patch: model currently shown in the portrait popup
@@ -156,12 +161,12 @@ def patch_index(source: str, dry_run: bool) -> str:
         fail("index.html from the jar is already patched; refusing to double-patch")
     if source.count(INDEX_ANCHOR) != 1:
         fail("index.html anchor not unique; the upstream layout changed")
-    if source.count(SCRIPT_TAG) != 1:
+    if len(SCRIPT_TAG_RE.findall(source)) != 1:
         fail("index.html script tag anchor not unique; the upstream layout changed")
     if dry_run:
         return source
     source = source.replace(INDEX_ANCHOR, INDEX_PATCHED)
-    source = source.replace(SCRIPT_TAG, SCRIPT_TAG_PATCHED)
+    source = SCRIPT_TAG_RE.sub(SCRIPT_TAG_PATCHED, source)
     return source
 
 
@@ -239,6 +244,45 @@ def deployed_has_marker(server: str, vmid: str, remote_dir: str, name: str) -> b
         return False
 
 
+def served_has_marker(server: str, vmid: str, name: str) -> bool:
+    """Check the resource the running server actually serves, not just the file."""
+    script = (
+        "curl -sk https://127.0.0.1:8443/static/" + name
+        + " | grep -c " + shlex.quote(MARKER) + " || true"
+    )
+    result = container(server, vmid, script)
+    try:
+        return int(result.decode().strip() or 0) > 0
+    except ValueError:
+        return False
+
+
+def active_recordings(server: str, vmid: str) -> list[str]:
+    code = (
+        "import json,ssl,urllib.request;"
+        "ctx=ssl._create_unverified_context();"
+        "req=urllib.request.Request('https://127.0.0.1:8443/rec',"
+        "data=b'{\"action\":\"listAll\"}',"
+        "headers={'Content-Type':'application/json'},method='POST');"
+        "d=json.load(urllib.request.urlopen(req,context=ctx,timeout=30));"
+        "print('\\n'.join(x.get('name','?') for x in (d.get('currentlyRecording') or [])))"
+    )
+    result = container(server, vmid, f"python3 -c {shlex.quote(code)} || true")
+    return [line for line in result.decode("utf-8", "replace").splitlines() if line.strip()]
+
+
+def restart_and_wait(server: str, vmid: str) -> None:
+    container(server, vmid, "systemctl restart ctbrec")
+    for _ in range(30):
+        probe = container(
+            server, vmid, "ss -ltn | grep -q ':8443' && echo up || true"
+        )
+        if probe.decode().strip() == "up":
+            return
+        time.sleep(2)
+    fail("ctbrec did not start listening on 8443 within 60s")
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="ctbrec-webui-patch",
@@ -268,6 +312,16 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="check the anchors and print the plan"
+    )
+    parser.add_argument(
+        "--no-restart",
+        action="store_true",
+        help="deploy without restarting ctbrec (the overrides load on the next restart)",
+    )
+    parser.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="restart even if recordings are active",
     )
     args = parser.parse_args(argv)
 
@@ -323,7 +377,30 @@ def main(argv: list[str]) -> int:
 
     if not deployed_has_marker(args.server, args.vmid, args.remote_dir, "index.html"):
         fail("deployed index.html is missing the patch marker")
-    print("patch applied: portrait popup now has a 'Fetch from stream' button")
+
+    if args.no_restart:
+        print("patch deployed; ctbrec caches static resources, so restart it"
+              " (systemctl restart ctbrec) or re-run without --no-restart")
+        return 0
+
+    active = active_recordings(args.server, args.vmid)
+    if active and not args.force_restart:
+        print("ctbrec must restart to serve the override, but these recordings are"
+              " active:", file=sys.stderr)
+        for name in active:
+            print(f"  {name}", file=sys.stderr)
+        print("re-run with --force-restart to interrupt them, or --no-restart to"
+              " deploy and restart later.", file=sys.stderr)
+        return 1
+
+    print("restarting ctbrec to load the static overrides")
+    restart_and_wait(args.server, args.vmid)
+
+    if not served_has_marker(args.server, args.vmid, "index.html"):
+        fail("the running server still serves the stock index.html; "
+             "check that /opt/ctbrec/patch is first on the classpath")
+    print("patch applied and verified: the portrait popup now has a"
+          " 'Fetch from stream' button")
     print("Reload the WebUI (Ctrl+Shift+R if the browser cached models.js).")
     return 0
 

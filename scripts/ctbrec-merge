@@ -13,8 +13,15 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-FILENAME_RE = re.compile(r'^(.+)_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_(\d{3})\.ts$')
-FLAT_RE = re.compile(r'^(.+)_Chaturbate_(\d{8})-(\d{6})\.mts$')
+FILENAME_RE = re.compile(
+    r'^(.+)_(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_(\d{3})\.(ts|mts|mkv)$')
+FLAT_RE = re.compile(r'^(.+)_Chaturbate_(\d{8})-(\d{6})\.(ts|mts|mkv)$')
+
+# Only transport streams can be byte-appended and PTS-scanned; a Matroska file
+# from a HandBrake pass is joined with a plain stream-copy concat instead.
+TS_EXTS = (".ts", ".mts")
+VIDEO_EXTS = TS_EXTS + (".mkv",)
+MUXERS = {".ts": "mpegts", ".mts": "mpegts", ".mkv": "matroska"}
 
 VKEY = ("codec_name", "width", "height")
 AKEY = ("codec_name", "sample_rate", "channels")
@@ -158,7 +165,7 @@ def active_write_paths(root):
                 target = os.readlink(fdpath)
             except OSError:
                 continue
-            if not (target.endswith(".ts") or target.endswith(".mts")):
+            if not target.lower().endswith(VIDEO_EXTS):
                 continue
             try:
                 st = os.stat(fdpath)
@@ -483,7 +490,8 @@ def collect_entries(cpath, now, age, active_paths=None):
     entries = []
     active = 0
     for name in sorted(os.listdir(cpath)):
-        if not (name.endswith(".ts") or name.endswith(".mts")):
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in VIDEO_EXTS:
             continue
         parsed = parse_filename(name)
         if not parsed:
@@ -500,7 +508,7 @@ def collect_entries(cpath, now, age, active_paths=None):
             active += 1
             continue
         entries.append({
-            "name": name, "path": path,
+            "name": name, "path": path, "ext": ext,
             "model": parsed[0], "start": parsed[1],
             "size": st.st_size, "mtime": st.st_mtime,
             "dir": cpath,
@@ -544,7 +552,8 @@ def process_group(model, entries, args):
         for group in groups:
             parts = [group[0]]
             for e in group[1:]:
-                if e["vsig"] == parts[-1]["vsig"] and e["asig"] == parts[-1]["asig"]:
+                if e["vsig"] == parts[-1]["vsig"] and e["asig"] == parts[-1]["asig"] \
+                        and e["ext"] == parts[-1]["ext"]:
                     parts.append(e)
                 else:
                     if len(parts) >= 2:
@@ -573,6 +582,10 @@ def process_group(model, entries, args):
 
 def append_preflight(group):
     if len(group) < 2:
+        return None
+    if any(e.get("ext") not in TS_EXTS for e in group):
+        # Only a transport stream can be extended by appending packets at a
+        # corrected PTS offset; Matroska needs the concat remux.
         return None
     sizes = {}
     for e in group:
@@ -663,12 +676,21 @@ def merge_run(group, args):
         list_path = tf.name
     started = time.monotonic()
     limiter = RateLimiter(parse_rate(args.io_rate))
+    muxer = MUXERS.get(group[0].get("ext", ".ts"), "mpegts")
+    # Matroska has to be able to seek back over its own output to write the
+    # duration and the cue index, so it is written straight to the .part file
+    # instead of through the pipe; the pipe copy exists to let the token bucket
+    # shape a transport stream, and a seek-index-free mkv (Duration: N/A, no
+    # cues) is not worth keeping to preserve that. The cgroup cap still applies
+    # to the child on a host where one can be created.
+    direct = muxer != "mpegts"
     proc = None
     try:
         cmd = io_priority_prefix(args) + [
                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                "-f", "concat", "-safe", "0", "-i", list_path,
-               "-map", "0", "-c", "copy", "-f", "mpegts", "pipe:1"]
+               "-map", "0", "-c", "copy", "-f", muxer]
+        cmd += [part_path] if direct else ["pipe:1"]
         errf = tempfile.TemporaryFile()
         # The output is copied through this process rather than written by
         # ffmpeg directly: a direct write lands in the page cache at memory
@@ -680,15 +702,16 @@ def merge_run(group, args):
             rc = 127
             stderr = f"could not run ffmpeg: {exc}"
         else:
-            with open(part_path, "wb") as f:
-                while True:
-                    chunk = proc.stdout.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    limiter.add(len(chunk))
-                f.flush()
-                os.fsync(f.fileno())
+            if not direct:
+                with open(part_path, "wb") as f:
+                    while True:
+                        chunk = proc.stdout.read(1 << 20)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        limiter.add(len(chunk))
+                    f.flush()
+                    os.fsync(f.fileno())
             rc = proc.wait()
             errf.seek(0)
             stderr = errf.read().decode(errors="replace")
@@ -1293,6 +1316,9 @@ def run_repair(args, active_paths, now):
     for d in dirs:
         es, _act = collect_entries(d, now, args.age, active_paths)
         entries.extend(es)
+    # Phantom-gap detection is a transport-stream measurement (packet sizes and
+    # PTS continuity), so a Matroska file is not repairable here.
+    entries = [e for e in entries if e.get("ext") in TS_EXTS]
     entries.sort(key=lambda e: e["start"])
     print(f"scanning {len(entries)} file(s) for phantom timeline gaps...")
 
@@ -1413,7 +1439,7 @@ def report_no_groups(args, flat, top_files, recs_found):
             exts[ext] = exts.get(ext, 0) + 1
         shown = ", ".join(f"{n}x {e}" for e, n in
                           sorted(exts.items(), key=lambda kv: -kv[1])[:4])
-        print(f"nothing to do: no .ts/.mts recordings under {args.dir}"
+        print(f"nothing to do: no .ts/.mts/.mkv recordings under {args.dir}"
               + (f" (found {shown})" if shown else ""))
     elif flat:
         print(f"nothing to do: {recs_found} recording(s) in {args.dir} but no two "
@@ -1684,7 +1710,7 @@ def main():
     if kept:
         print(f"      {kept} originals moved to .merged_originals/")
     if skipped_params:
-        print(f"      {skipped_params} files not merged (codec/params differ)")
+        print(f"      {skipped_params} files not merged (codec/params or container differ)")
     if active:
         print(f"      {active} files skipped (open for writing or modified within --age)")
     return 0

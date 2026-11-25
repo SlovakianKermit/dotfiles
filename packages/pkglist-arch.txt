@@ -25,6 +25,7 @@ btrfs-assistant
 btrfs-progs
 calf
 cantarell-fonts
+coolercontrol
 copyparty
 cpupower
 cryptsetup
