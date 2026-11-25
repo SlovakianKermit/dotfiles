@@ -1,0 +1,84 @@
+.TH MOUSE-SCROLL-TOGGLE 1 2026-11-25 "mouse-scroll-toggle" "User Commands"
+.SH NAME
+mouse-scroll-toggle \- toggle KDE middle-button (drag) scrolling
+.SH SYNOPSIS
+.B mouse-scroll-toggle
+.RI [ on | off | toggle | status ]
+.RB [ \-\-device
+.IR NAME ]
+.SH DESCRIPTION
+.B mouse-scroll-toggle
+flips the KDE setting
+.RB \(lq "Scroll when moving the pointer while pressing the middle button" \(rq
+(libinput
+.IR scroll\-on\-button\-down )
+for pointer devices.
+.P
+With the feature on, holding the middle button turns pointer motion into
+scrolling, which means the middle button is swallowed and never reaches
+applications \(em typically breaking middle-click actions in games. Turning it
+off restores a normal middle click.
+.P
+Changes are applied live through
+.BR org.kde.KWin
+and persisted to
+.IR ~/.config/kcminputrc
+by KWin itself; the new state survives logout and reboot. A desktop
+notification is shown when the state changes.
+.P
+When turning the feature on, the script re-enables only the devices it last
+switched off, so unrelated devices that happen to support the feature are left
+alone. Without such a record it falls back to every matching device.
+.SH OPTIONS
+.TP
+.B on
+Enable middle-button scrolling.
+.TP
+.B off
+Disable middle-button scrolling.
+.TP
+.B toggle
+Flip the current state. This is the default.
+.TP
+.B status
+Print each matching device and its current state, then exit.
+.TP
+.BI \-\-device " NAME"
+Only act on devices whose name contains
+.IR NAME .
+By default every pointer device that supports the feature is considered.
+.SH FILES
+.TP
+.I ~/.config/kcminputrc
+Per-device libinput settings written by KWin, including
+.IR ScrollMethod .
+.TP
+.I ~/.local/state/mouse-scroll-toggle/devices
+Sysnames of the devices most recently switched off, used to restore exactly
+those devices when turning the feature back on.
+.SH EXAMPLES
+Enable or disable the feature ahead of a game:
+.EX
+mouse-scroll-toggle off
+mouse-scroll-toggle on
+.EE
+.P
+Bind
+.B toggle
+to a global shortcut (for example
+.IR Meta+Shift+M )
+by putting it in the
+.I Exec=
+line of a
+.I .desktop
+file marked
+.IR X\-KDE\-GlobalAccel\-CommandShortcut=true .
+.P
+Restrict to one device:
+.EX
+mouse-scroll-toggle status --device "CX 2.4G"
+.EE
+.SH SEE ALSO
+.BR kwin_wayland (1),
+.BR busctl (1),
+.BR kwriteconfig6 (1)

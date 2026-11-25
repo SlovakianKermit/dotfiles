@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Mouse Scroll Toggle
+Comment=Toggle middle-button scrolling (KDE/libinput)
+Exec=/home/killian/.local/bin/mouse-scroll-toggle toggle
+Icon=input-mouse
+Type=Application
+NoDisplay=true
+StartupNotify=false
+X-KDE-GlobalAccel-CommandShortcut=true

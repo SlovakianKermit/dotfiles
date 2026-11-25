@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# mouse-scroll-toggle - toggle KDE/libinput middle-button (drag) scrolling
+set -euo pipefail
+
+SERVICE=org.kde.KWin
+MGR_PATH=/org/kde/KWin/InputDevice
+IFACE=org.kde.KWin.InputDevice
+MGR_IFACE=org.kde.KWin.InputDeviceManager
+
+usage() {
+	cat <<'EOF'
+Usage: mouse-scroll-toggle [on|off|toggle|status] [--device NAME]
+
+Toggle the KDE "Scroll when moving the pointer while pressing the middle
+button" setting (libinput scroll-on-button-down) for pointer devices.
+
+  on       enable  middle-button scrolling
+  off      disable middle-button scrolling (restores middle click, e.g. in games)
+  toggle   flip the current state (default)
+  status   print the state and exit
+
+  --device NAME   only act on devices whose name contains NAME
+                  (default: every pointer that supports the feature)
+
+Changes are applied live through KWin and persisted to ~/.config/kcminputrc.
+EOF
+}
+
+action=toggle
+filter=""
+
+while (($#)); do
+	case "$1" in
+	on | off | toggle | status) action=$1 ;;
+	--device)
+		shift
+		[[ ${1:-} ]] || { usage >&2; exit 2; }
+		filter=$1
+		;;
+	--device=*) filter=${1#--device=} ;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*)
+		echo "mouse-scroll-toggle: unknown argument: $1" >&2
+		usage >&2
+		exit 2
+		;;
+	esac
+	shift
+done
+
+if ! busctl --user status "$SERVICE" >/dev/null 2>&1; then
+	echo "mouse-scroll-toggle: $SERVICE is not running (is this a KDE session?)" >&2
+	exit 1
+fi
+
+mapfile -t sysnames < <(
+	busctl --user call "$SERVICE" "$MGR_PATH" "$MGR_IFACE" ListPointers |
+		sed -e 's/^as [0-9]* *//' -e 's/"//g' | tr -s ' ' '\n'
+)
+
+declare -a paths names sysnames_all states
+for sysname in "${sysnames[@]}"; do
+	[[ $sysname ]] || continue
+	path=$MGR_PATH/$sysname
+	supports=$(busctl --user get-property "$SERVICE" "$path" "$IFACE" supportsScrollOnButtonDown | awk '{print $NF}')
+	[[ $supports == true ]] || continue
+	name=$(busctl --user get-property "$SERVICE" "$path" "$IFACE" name | cut -d'"' -f2)
+	if [[ -n $filter && $name != *"$filter"* ]]; then
+		continue
+	fi
+	state=$(busctl --user get-property "$SERVICE" "$path" "$IFACE" scrollOnButtonDown | awk '{print $NF}')
+	paths+=("$path")
+	names+=("$name")
+	sysnames_all+=("$sysname")
+	states+=("$state")
+done
+
+if ((${#paths[@]} == 0)); then
+	echo "mouse-scroll-toggle: no matching pointer device supports middle-button scrolling" >&2
+	exit 1
+fi
+
+if [[ $action == status ]]; then
+	for i in "${!paths[@]}"; do
+		printf '%s: %s\n' "${names[$i]}" "${states[$i]}"
+	done
+	exit 0
+fi
+
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/mouse-scroll-toggle
+STATE_FILE=$STATE_DIR/devices
+
+target=false
+if [[ $action == toggle ]]; then
+	for state in "${states[@]}"; do
+		[[ $state == true ]] && { target=false; break; } || target=true
+	done
+elif [[ $action == on ]]; then
+	target=true
+fi
+
+declare -a selected=()
+if [[ $target == false ]]; then
+	# Turning off: only touch devices that are currently on.
+	for i in "${!paths[@]}"; do
+		[[ ${states[$i]} == true ]] && selected+=("$i")
+	done
+elif [[ -n $filter ]]; then
+	for i in "${!paths[@]}"; do selected+=("$i"); done
+else
+	# Turning on: restore the devices this script last switched off.
+	if [[ -r $STATE_FILE ]]; then
+		mapfile -t remembered <"$STATE_FILE"
+		for i in "${!paths[@]}"; do
+			for s in "${remembered[@]}"; do
+				[[ $s == "${sysnames_all[$i]}" ]] && { selected+=("$i"); break; }
+			done
+		done
+	fi
+	# No usable memory: fall back to every matching device.
+	if ((${#selected[@]} == 0)); then
+		for i in "${!paths[@]}"; do selected+=("$i"); done
+	fi
+fi
+
+if ((${#selected[@]} == 0)); then
+	[[ $target == true ]] && echo "Middle-button scrolling: already on" ||
+		echo "Middle-button scrolling: already off"
+	exit 0
+fi
+
+for i in "${selected[@]}"; do
+	[[ ${states[$i]} == "$target" ]] && continue
+	busctl --user set-property "$SERVICE" "${paths[$i]}" "$IFACE" scrollOnButtonDown b "$target"
+done
+
+if [[ $target == false ]]; then
+	mkdir -p "$STATE_DIR"
+	: >"$STATE_FILE"
+	for i in "${selected[@]}"; do
+		printf '%s\n' "${sysnames_all[$i]}" >>"$STATE_FILE"
+	done
+fi
+
+if [[ $target == true ]]; then
+	msg="Middle-button scrolling: ON"
+else
+	msg="Middle-button scrolling: OFF"
+fi
+
+command -v notify-send >/dev/null && notify-send -a mouse-scroll-toggle -t 2000 "$msg"
+echo "$msg"
