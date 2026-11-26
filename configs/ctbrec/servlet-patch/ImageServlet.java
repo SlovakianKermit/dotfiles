@@ -242,34 +242,51 @@ extends AbstractCtbrecServlet {
         }
     }
 
-    private File findNewestRecordingFile(Model model) {
-        File newestFile = null;
-        java.time.Instant newestDate = null;
+    private List<File> findRecordingFiles(Model model, int maxFiles) {
+        java.util.List<File> files = new java.util.ArrayList<>();
+        java.util.List<ctbrec.Recording> recordings = new java.util.ArrayList<>();
         try {
-            List<ctbrec.Recording> recordings = this.recorder.getRecordings();
-            for (ctbrec.Recording recording : recordings) {
-                Model recordedModel = recording.getModel();
-                if (recordedModel == null || !recordedModel.getUrl().equals(model.getUrl())) {
-                    continue;
-                }
-                File file = recording.getPostProcessedFile();
-                if (file == null || !file.isFile()) {
-                    file = recording.getAbsoluteFile();
-                }
-                if (file == null || !file.isFile()) {
-                    continue;
-                }
-                java.time.Instant start = recording.getStartDate();
-                if (newestFile == null || (start != null && newestDate != null && start.isAfter(newestDate))) {
-                    newestFile = file;
-                    newestDate = start;
-                }
-            }
+            recordings.addAll(this.recorder.getRecordings());
         }
         catch (Exception e) {
             log.warn("Could not list recordings for {}: {}", (Object)model.getName(), (Object)e.getMessage());
+            return files;
         }
-        return newestFile;
+        recordings.removeIf(r -> r.getModel() == null
+                || !r.getModel().getUrl().equals(model.getUrl()));
+        recordings.sort((a, b) -> {
+            java.time.Instant x = a.getStartDate();
+            java.time.Instant y = b.getStartDate();
+            if (x == null) {
+                return 1;
+            }
+            if (y == null) {
+                return -1;
+            }
+            return y.compareTo(x);
+        });
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        for (ctbrec.Recording recording : recordings) {
+            File file = recording.getPostProcessedFile();
+            if (file == null || !file.isFile()) {
+                file = recording.getAbsoluteFile();
+            }
+            if (file == null || !file.isFile()) {
+                continue;
+            }
+            // A file smaller than this cannot contain enough decoded video to
+            // extract a meaningful frame; fall through to the next recording.
+            if (file.length() < 1024L * 1024L) {
+                continue;
+            }
+            if (seen.add(file.getAbsolutePath())) {
+                files.add(file);
+                if (files.size() >= maxFiles) {
+                    break;
+                }
+            }
+        }
+        return files;
     }
 
     private byte[] runProcess(java.util.List<String> command, long timeoutSeconds) {
@@ -422,8 +439,8 @@ extends AbstractCtbrecServlet {
     }
 
     private byte[] recordingFrame(Model model) {
-        File file = this.findNewestRecordingFile(model);
-        if (file == null) {
+        List<File> files = this.findRecordingFiles(model, 4);
+        if (files.isEmpty()) {
             return null;
         }
         boolean active = false;
@@ -432,42 +449,44 @@ extends AbstractCtbrecServlet {
         }
         catch (Exception ignored) {
         }
-        long size = file.length();
         long slice = 16L * 1024L * 1024L;
-        java.util.List<Long> offsets = new java.util.ArrayList<>();
-        if (active) {
-            offsets.add(Math.max(0L, size - slice));
-            if (size > 2 * slice) {
-                offsets.add(Math.max(0L, size - 2 * slice));
-            }
-            offsets.add(size / 2L);
-        }
-        else {
-            offsets.add(size / 2L);
-            offsets.add((long)(size * 0.3));
-            offsets.add((long)(size * 0.7));
-        }
-        offsets.add(0L);
         String url = model.getUrl() == null ? "" : model.getUrl();
         boolean vrSideBySide = url.contains("vr.stripchat") || model.getClass().getName().contains("VR");
         byte[] best = null;
-        for (long position : offsets) {
-            byte[] frame = this.extractFrame(file, position, vrSideBySide);
-            if (frame == null) {
-                continue;
+        // Newest first.  A recording that has only just started is too young to
+        // yield a frame, so keep trying older files for the same model.
+        for (int index = 0; index < files.size(); ++index) {
+            File file = files.get(index);
+            long size = file.length();
+            java.util.List<Long> offsets = new java.util.ArrayList<>();
+            if (active && index == 0) {
+                offsets.add(Math.max(0L, size - slice));
+                if (size > 2 * slice) {
+                    offsets.add(Math.max(0L, size - 2 * slice));
+                }
+                offsets.add(size / 2L);
             }
-            if (best == null || frame.length > best.length) {
-                best = frame;
+            else {
+                offsets.add(size / 2L);
+                offsets.add((long)(size * 0.3));
+                offsets.add((long)(size * 0.7));
             }
-            // A blank/transition frame compresses to almost nothing; try the
-            // next position instead of storing a grey rectangle.
-            if (frame.length >= 2500) {
-                best = frame;
-                break;
+            offsets.add(0L);
+            for (long position : offsets) {
+                byte[] frame = this.extractFrame(file, position, vrSideBySide);
+                if (frame == null) {
+                    continue;
+                }
+                if (best == null || frame.length > best.length) {
+                    best = frame;
+                }
+                // A blank/transition frame compresses to almost nothing; try the
+                // next position (or the next recording) instead of storing it.
+                if (frame.length >= 2500) {
+                    log.info("Generated portrait from recording for model: {} ({})", (Object)model.getName(), (Object)file.getName());
+                    return frame;
+                }
             }
-        }
-        if (best != null) {
-            log.info("Generated portrait from recording for model: {} ({})", (Object)model.getName(), (Object)file.getName());
         }
         return best;
     }
@@ -482,39 +501,41 @@ extends AbstractCtbrecServlet {
             }
             Model model = modelOpt.get();
             String previewUrl;
-            if (model instanceof PortraitUrlProvider) {
-                // Stripchat's preview URLs are often a static cover image, so
-                // prefer a frame from the newest recording (the actual stream).
-                byte[] frame = this.recordingFrame(model);
-                if (frame != null && frame.length < 2500) {
-                    // A blank or transition frame: never overwrite a usable
-                    // portrait with it. Serve the existing one if there is one.
-                    Optional<byte[]> existing = this.portraitStore.loadModelPortraitByModelUrl(modelUrl);
-                    if (existing.isPresent()) {
-                        byte[] bytes = existing.get();
-                        resp.setStatus(200);
-                        resp.setContentType("image/jpeg");
-                        resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-                        resp.setContentLength(bytes.length);
-                        resp.getOutputStream().write(bytes, 0, bytes.length);
-                        resp.getOutputStream().flush();
-                        return;
-                    }
-                    frame = null;
-                }
-                if (frame != null) {
-                    if (!previewOnly) {
-                        this.portraitStore.writePortrait(modelUrl, frame);
-                        log.info("Fetched and saved portrait (recording frame) for model: {}", (Object)model.getName());
-                    }
+            // Prefer a frame from the newest recording (the actual stream) for
+            // every site, not just the ones whose preview URL is a static
+            // cover.  Chaturbate's thumbnail is only live while the model is
+            // online and otherwise falls back to the default picture.
+            byte[] frame = this.recordingFrame(model);
+            if (frame != null && frame.length < 2500) {
+                // A blank or transition frame: never overwrite a usable
+                // portrait with it. Serve the existing one if there is one.
+                Optional<byte[]> existing = this.portraitStore.loadModelPortraitByModelUrl(modelUrl);
+                if (existing.isPresent()) {
+                    byte[] bytes = existing.get();
                     resp.setStatus(200);
                     resp.setContentType("image/jpeg");
                     resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-                    resp.setContentLength(frame.length);
-                    resp.getOutputStream().write(frame, 0, frame.length);
+                    resp.setContentLength(bytes.length);
+                    resp.getOutputStream().write(bytes, 0, bytes.length);
                     resp.getOutputStream().flush();
                     return;
                 }
+                frame = null;
+            }
+            if (frame != null) {
+                if (!previewOnly) {
+                    this.portraitStore.writePortrait(modelUrl, frame);
+                    log.info("Fetched and saved portrait (recording frame) for model: {}", (Object)model.getName());
+                }
+                resp.setStatus(200);
+                resp.setContentType("image/jpeg");
+                resp.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+                resp.setContentLength(frame.length);
+                resp.getOutputStream().write(frame, 0, frame.length);
+                resp.getOutputStream().flush();
+                return;
+            }
+            if (model instanceof PortraitUrlProvider) {
                 // No recording available: fall back to the site's snapshot URL.
                 // Never fall back to the site avatar: it is the default
                 // offline picture and looks nothing like the stream.
@@ -595,8 +616,18 @@ extends AbstractCtbrecServlet {
                     imageData = rawImageData;
                 }
                 if (!previewOnly) {
-                    this.portraitStore.writePortrait(modelUrl, imageData);
-                    log.info("Fetched and saved portrait for model: {}", (Object)model.getName());
+                    // If the bytes are identical to the stored portrait this is
+                    // the site's static image being served again, not a fresh
+                    // snapshot.  Keep it (there is no recording to do better)
+                    // but say so instead of pretending it was refreshed.
+                    Optional<byte[]> existingPortrait = this.portraitStore.loadModelPortraitByModelUrl(modelUrl);
+                    if (existingPortrait.isPresent()
+                            && java.util.Arrays.equals(existingPortrait.get(), imageData)) {
+                        log.info("Portrait snapshot unchanged (static image) for model: {}", (Object)model.getName());
+                    } else {
+                        this.portraitStore.writePortrait(modelUrl, imageData);
+                        log.info("Fetched and saved portrait for model: {}", (Object)model.getName());
+                    }
                 } else {
                     log.debug("Fetched portrait preview for model: {} (not saved)", (Object)model.getName());
                 }
