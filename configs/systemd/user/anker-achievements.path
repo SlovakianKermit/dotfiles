@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch Anker Launcher activity for completed game installs
+
+[Path]
+# The launcher rewrites files here when a download or install finishes. The
+# directory is watched rather than activity.json so an atomic replace does not
+# silently drop the watch.
+PathModified=%h/.config/net.ankergames.launcher
+Unit=anker-achievements.service
+
+[Install]
+WantedBy=default.target

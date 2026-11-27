@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily safety net for AnkerGames achievement conversion
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 04:15
+RandomizedDelaySec=45min
+Persistent=true
+Unit=anker-achievements-full.service
+
+[Install]
+WantedBy=timers.target

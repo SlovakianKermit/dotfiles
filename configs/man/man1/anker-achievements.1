@@ -1,0 +1,208 @@
+.TH ANKER\-ACHIEVEMENTS 1 "2026-11-27" "anker-achievements" "User Commands"
+.SH NAME
+anker\-achievements \- make Steam achievements work in non-online AnkerGames titles
+.SH SYNOPSIS
+.B anker\-achievements
+.B list
+[\fB\-\-json\fR]
+.P
+.B anker\-achievements
+.B fix
+[\fIGAME\fR ...]
+[\fB\-\-all\fR]
+[\fB\-\-dry-run\fR]
+[\fB\-\-refresh-schema\fR]
+.P
+.B anker\-achievements
+.B auto
+[\fB\-\-full\fR]
+[\fB\-\-recent-hours\fR \fIHOURS\fR]
+[\fB\-\-quiet\fR]
+.P
+.B anker\-achievements
+.B restore
+\fIGAME\fR ...
+[\fB\-\-all\fR]
+[\fB\-\-dry-run\fR]
+.P
+.B anker\-achievements
+.B pool
+[\fB\-\-download\fR]
+.SH DESCRIPTION
+.B anker\-achievements
+converts the Steam emulator used by most AnkerGames releases from RUNE,
+CODEX, EMPRESS or a similar crack to
+.BR Goldberg
+(gbe\_fork), then writes the game's real achievement definitions into
+.IR steam_settings/achievements.json .
+.P
+Those cracks provide no achievement list. Games ask the emulator for the list,
+receive nothing, and never call the Steamworks unlock API, so the Anker
+Launcher's Achievements tab stays at zero. Goldberg reads a local schema, which
+this tool obtains from the public Steam achievements page for the game's AppID.
+.P
+Online\-fix titles are never modified. Their emulator also carries the
+multiplayer fix, and replacing it would break online play. The tool detects
+.IR OnlineFix.ini
+and skips the whole game.
+.P
+A conversion is recorded under
+.IR ~/.local/share/anker\-achievements .
+Original DLLs and old emulator state are copied to the backup directory before
+anything is replaced, so
+.B restore
+can undo it.
+.SH OPTIONS
+.SS list
+.TP
+.B \-\-json
+Print the game table as JSON.
+.SS fix
+.TP
+.BI GAME " ..."
+Game ID, slug, or title substring. With no games, the default is every
+installed title.
+.TP
+.B \-\-all
+Explicitly select every installed title.
+.TP
+.B \-\-dry-run
+Print what would change without touching a file.
+.TP
+.B \-\-refresh-schema
+Ignore the cached Steam schema and fetch it again.
+.SS auto
+.TP
+.B \-\-full
+Scan every played game instead of only games with a recently completed
+install. This is what the daily timer uses.
+.TP
+.BI \-\-recent-hours " HOURS"
+How far back to look for completed install events. Default: 6.
+.TP
+.B \-\-quiet
+Suppress lines for games that were skipped.
+.SS restore
+.TP
+.BI GAME " ..."
+Game ID, slug, or title substring.
+.TP
+.B \-\-all
+Restore every game recorded in the state file.
+.TP
+.B \-\-dry-run
+Show what would be undone.
+.SS pool
+.TP
+.B \-\-download
+Download the latest gbe\_fork Windows release instead of reusing a Goldberg
+DLL found in an installed game.
+.SH BEHAVIOUR
+.SS Conversion
+For each eligible game the tool:
+.IP \(bu 2
+backs up \fIsteam_api64.dll\fR (or \fIsteam_api.dll\fR) outside the game folder;
+.IP \(bu 2
+copies the matching Goldberg binary in its place;
+.IP \(bu 2
+writes \fIsteam_appid.txt\fR and
+.IR steam_settings/achievements.json ;
+.IP \(bu 2
+moves the old emulator's state out of
+.IR "\fI<prefix>/drive_c/users/Public/Documents/Steam/RUNE/<appid>\fR"
+and similar folders, so the launcher does not keep reading an empty
+\fIachievements.ini\fR.
+.P
+Only the architecture the game actually uses is replaced. If a release ships
+both API DLLs, the 64\-bit one wins.
+.SS Automation
+The companion systemd user units run the tool without user action:
+.IP \(bu 2
+\fBanker\-achievements.path\fR watches
+\fI~/.config/net.ankergames.launcher\fR and runs
+.B "auto"
+after the launcher finishes an install or update;
+.IP \(bu 2
+\fBanker\-achievements-full.timer\fR runs
+.B "auto \-\-full"
+once a day and shortly after login as a safety net.
+.P
+Neither is a polling daemon. The path unit is event\-driven, and
+.B auto
+exits immediately when there is no new completed install to process. Games are
+skipped while they are running, so a DLL is never replaced mid\-session.
+.SS Limitations
+Achievements already unlocked under the old emulator are not replayed. The
+Steam backend decides when an achievement is awarded, and a save that predates
+the conversion cannot re\-trigger events that already happened. New unlocks are
+recorded from the first launch after conversion.
+.SH EXAMPLES
+See the current state of every installed game:
+.IP
+.EX
+anker\-achievements list
+.EE
+.P
+See what a full conversion would do:
+.IP
+.EX
+anker\-achievements fix \-\-dry\-run
+.EE
+.P
+Convert ROUTINE only:
+.IP
+.EX
+anker\-achievements fix 3128
+.EE
+.P
+Convert every non\-online title:
+.IP
+.EX
+anker\-achievements fix \-\-all
+.EE
+.P
+Undo the recorded changes for one game:
+.IP
+.EX
+anker\-achievements restore 3128
+.EE
+.P
+Run the same job the timer runs:
+.IP
+.EX
+anker\-achievements auto \-\-full
+.EE
+.SH EXIT STATUS
+.TP
+.B 0
+Success, including a run where every game was skipped.
+.TP
+.B 1
+Bad selection, no games matched, or a required download/extraction failed.
+.SH FILES
+.TP
+.I ~/.config/net.ankergames.launcher/library.json
+Installed games and their Steam AppIDs.
+.TP
+.I ~/.config/net.ankergames.launcher/activity.json
+Completed install events used by
+.BR "auto" .
+.TP
+.I ~/.local/share/anker-achievements/
+State, cached Steam schemas, the Goldberg DLL cache and backups.
+.TP
+.I ~/.local/share/anker-achievements/backups/<game-id>/
+Original DLLs and old emulator state.
+.TP
+.I ~/.config/systemd/user/anker-achievements.path
+Event\-driven install hook.
+.TP
+.I ~/.config/systemd/user/anker-achievements-full.timer
+Daily safety net.
+.SH SEE ALSO
+.BR anker\-launcher (1),
+.BR systemctl (1),
+.BR systemd.path (5),
+.BR systemd.timer (5)
+.SH AUTHOR
+Written for local use.

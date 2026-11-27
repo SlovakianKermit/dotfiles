@@ -1,0 +1,1034 @@
+#!/usr/bin/env python3
+"""Give AnkerGames' non-online titles working Steam achievements.
+
+RUNE, CODEX, EMPRESS and similar cracks write an achievements.ini but provide
+no achievement definitions, so UE and Unity games ask the emulator for the
+list, get nothing, and never unlock anything. The Anker Launcher can only
+display what the emulator saved, so its Achievements tab stays at zero.
+
+This tool replaces those emulators with Goldberg (gbe_fork) for games that are
+not online-fix builds, and writes the real Steam achievement schema into
+steam_settings/achievements.json. Online-fix games are never touched because
+their emulator also carries the multiplayer fix.
+
+Run it by hand:
+
+    anker-achievements list
+    anker-achievements fix --dry-run
+    anker-achievements fix --all
+
+or let the companion systemd path unit and daily timer call:
+
+    anker-achievements auto          # after a completed launcher install
+    anker-achievements auto --full   # daily safety net
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+LAUNCHER_CONFIG = Path(
+    os.environ.get("ANKER_LAUNCHER_CONFIG", HOME / ".config/net.ankergames.launcher")
+)
+LIBRARY_FILE = LAUNCHER_CONFIG / "library.json"
+ACTIVITY_FILE = LAUNCHER_CONFIG / "activity.json"
+DATA = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "anker-achievements"
+BACKUPS = DATA / "backups"
+POOL = DATA / "goldberg"
+SCHEMAS = DATA / "schemas"
+STATE_FILE = DATA / "state.json"
+LOCK_FILE = DATA / "auto.lock"
+
+STEAM_STATS = "https://steamcommunity.com/stats/{appid}/achievements?l=english"
+GBE_RELEASES = "https://api.github.com/repos/Detanup01/gbe_fork/releases/latest"
+UA = "anker-achievements/1.0 (+local tool)"
+
+DLL_NAMES = ("steam_api64.dll", "steam_api.dll")
+PRUNE_DIRS = {
+    "__pycache__",
+    ".git",
+    "node_modules",
+    "Content",
+    "Paks",
+    "Movies",
+    "Audio",
+    "Saved",
+    "Logs",
+    "CrashReportClient",
+    "shadercache",
+    "compatdata",
+    "steamapps",
+}
+
+
+# ---------------------------------------------------------------- utilities
+
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json_atomic(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def load_state():
+    state = read_json(STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
+    state.setdefault("version", 1)
+    state.setdefault("games", {})
+    state.setdefault("auto_seen", [])
+    return state
+
+
+def save_state(state):
+    write_json_atomic(STATE_FILE, state)
+
+
+def pe_machine(path):
+    """Return 'x64', 'x86' or None from a PE file header."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(0x100)
+            if len(head) < 0x40 or head[:2] != b"MZ":
+                return None
+            off = struct.unpack_from("<I", head, 0x3C)[0]
+            fh.seek(off)
+            sig = fh.read(6)
+            if len(sig) < 6 or sig[:4] != b"PE\0\0":
+                return None
+            machine = struct.unpack_from("<H", sig, 4)[0]
+            return {0x8664: "x64", 0x14C: "x86"}.get(machine)
+    except OSError:
+        return None
+
+
+def is_goldberg_dll(path):
+    """gbe_fork embeds its own save folder name; a RUNE/CODEX DLL does not."""
+    if not path or not Path(path).is_file():
+        return False
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    return False
+                if b"GSE Saves" in chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def is_inside(path, parent):
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+# ---------------------------------------------------------------- library
+
+
+def load_games():
+    data = read_json(LIBRARY_FILE, {})
+    games = data.get("games", {}) if isinstance(data, dict) else {}
+    result = []
+    for gid, raw in games.items():
+        if not isinstance(raw, dict):
+            continue
+        root = raw.get("root")
+        if not root:
+            continue
+        src = raw.get("source") or {}
+        if isinstance(src, dict) and isinstance(src.get("source"), dict):
+            src = src["source"]
+        appid = None
+        if isinstance(src, dict):
+            appid = src.get("steam_app_id")
+        appid = appid or raw.get("steam_app_id")
+        result.append(
+            {
+                "id": str(gid),
+                "title": raw.get("title") or str(gid),
+                "root": Path(root),
+                "appid": str(appid) if appid else None,
+                "prefix": None,
+                "raw": raw,
+            }
+        )
+    return result
+
+
+def find_game(games, selector):
+    selector = selector.lower()
+    exact = [g for g in games if g["id"] == selector]
+    if exact:
+        return exact[0]
+    matches = [
+        g
+        for g in games
+        if selector in g["title"].lower() or selector in str(g["root"]).lower()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        names = ", ".join(f"{g['id']} {g['title']}" for g in matches)
+        raise SystemExit(f"anker-achievements: '{selector}' matches several games: {names}")
+    raise SystemExit(f"anker-achievements: no installed game matches '{selector}'")
+
+
+def find_prefix(game):
+    if game.get("prefix"):
+        return game["prefix"]
+    raw = game["raw"]
+    if raw.get("prefix_library"):
+        candidate = Path(str(raw["prefix_library"]))
+        if candidate.is_dir():
+            game["prefix"] = candidate
+            return candidate
+    library_root = raw.get("library_root")
+    roots = []
+    if library_root:
+        roots.append(Path(library_root))
+    roots.append(game["root"].parent)
+    roots.append(game["root"].parent.parent)
+    for base in roots:
+        for name in ("Prefixes", "prefixes"):
+            candidate = base / name / game["id"]
+            if candidate.is_dir():
+                game["prefix"] = candidate
+                return candidate
+    return None
+
+
+def appid_for(game, target_dir=None, dll_dir=None):
+    if game.get("appid"):
+        return game["appid"]
+    candidates = []
+    if target_dir:
+        candidates += [
+            target_dir / "steam_settings/steam_appid.txt",
+            target_dir / "steam_appid.txt",
+        ]
+    if dll_dir:
+        candidates += [
+            dll_dir / "steam_settings/steam_appid.txt",
+            dll_dir / "steam_appid.txt",
+        ]
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if text.isdigit():
+                return text
+        except OSError:
+            pass
+    ini_paths = []
+    for base in {target_dir, dll_dir}:
+        if base:
+            ini_paths += [base / "steam_emu.ini", base / "OnlineFix.ini"]
+    for path in ini_paths:
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for key in ("RealAppId", "AppId"):
+            m = re.search(rf"^\s*{key}\s*=\s*(\d+)", text, re.MULTILINE)
+            if m:
+                value = m.group(1)
+                if value != "480":
+                    return value
+    return None
+
+
+# ---------------------------------------------------------------- emulator scan
+
+
+def walk_dirs(root, maxdepth=10):
+    root = Path(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        try:
+            depth = len(d.relative_to(root).parts)
+        except ValueError:
+            continue
+        dirnames[:] = [n for n in dirnames if n not in PRUNE_DIRS]
+        if depth >= maxdepth:
+            dirnames[:] = []
+        yield d, set(dirnames), set(filenames)
+
+
+def dlls_in(directory):
+    result = []
+    for name in DLL_NAMES:
+        candidate = directory / name
+        if candidate.is_file():
+            result.append(candidate)
+    return result
+
+
+def scan_game(game):
+    """Return a dict describing the game's Steam emulators."""
+    result = {
+        "game": game,
+        "missing": False,
+        "onlinefix": False,
+        "targets": [],
+        "running": False,
+    }
+    root = game["root"]
+    if not root.is_dir():
+        result["missing"] = True
+        return result
+    result["running"] = game_running(root)
+
+    seen = set()
+    for d, dirnames, filenames in walk_dirs(root):
+        if any(n.lower() == "onlinefix.ini" for n in filenames):
+            result["onlinefix"] = True
+        has_settings = "steam_settings" in dirnames
+        has_emu = any(n.lower() in ("steam_emu.ini", "onlinefix.ini") for n in filenames)
+        if not (has_settings or has_emu):
+            continue
+        key = str(d.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        dlls = dlls_in(d)
+        if not dlls:
+            # Some Unity/UE layouts keep the config beside the executable and
+            # the DLL one level below/above it.
+            for parent in (d.parent, d.parent.parent):
+                dlls = dlls_in(parent)
+                if dlls:
+                    d = parent
+                    break
+        if not dlls:
+            continue
+        has_settings = (d / "steam_settings").is_dir()
+        any_goldberg = any(is_goldberg_dll(p) for p in dlls)
+        kind = "goldberg" if any_goldberg else "legacy"
+        result["targets"].append(
+            {
+                "dir": d,
+                "dlls": dlls,
+                "kind": kind,
+                "settings": d / "steam_settings",
+                "schema": d / "steam_settings/achievements.json",
+            }
+        )
+    return result
+
+
+def is_played(game):
+    raw = game["raw"]
+    try:
+        if int(raw.get("playtime_minutes") or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return bool(raw.get("last_played_at"))
+
+
+def game_running(root):
+    needle = str(root).encode("utf-8", "surrogateescape")
+    needle_text = str(root)
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+    me = os.getpid()
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == me:
+            continue
+        try:
+            exe = os.readlink(entry / "exe")
+        except OSError:
+            exe = ""
+        low = exe.lower()
+        # Only Wine/Proton loaders and native game binaries count. Shells,
+        # editors and this tool may have the path in their command line too.
+        if not (
+            "wine" in low
+            or "proton" in low
+            or low.endswith(".exe")
+            or needle_text in exe
+        ):
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle in cmdline:
+            return True
+    return False
+
+
+def game_status(scan):
+    game = scan["game"]
+    if scan["missing"]:
+        return "not installed"
+    if scan["onlinefix"]:
+        return "online-fix (skipped)"
+    if not scan["targets"]:
+        return "no Steam emulator"
+    if any(t["kind"] == "legacy" for t in scan["targets"]):
+        return "RUNE/legacy"
+    if all(t["schema"].is_file() for t in scan["targets"]):
+        return "Goldberg + schema"
+    return "Goldberg (no schema)"
+
+
+# ---------------------------------------------------------------- Steam schema
+
+
+def fetch_schema(appid):
+    url = STEAM_STATS.format(appid=appid)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            html = response.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeError(f"could not read Steam stats for {appid}: {exc}")
+
+    entries = {}
+    patterns = [
+        r'\{\\"internal_key\\":\d+.*?\\"groupid\\":\d+\}',
+        r'\{"internal_key":\d+.*?"groupid":\d+\}',
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, html):
+            raw = match.group().replace('\\"', '"').replace("\\\\", "\\")
+            try:
+                item = json.loads(raw)
+            except ValueError:
+                continue
+            name = item.get("api_name")
+            if not name:
+                continue
+            entries[name] = item
+        if entries:
+            break
+    return list(entries.values())
+
+
+def load_schema(appid, refresh=False):
+    if not appid or not str(appid).isdigit():
+        return []
+    cache = SCHEMAS / f"{appid}.json"
+    if cache.is_file() and not refresh:
+        cached = read_json(cache, [])
+        if isinstance(cached, list) and cached:
+            return cached
+    entries = fetch_schema(appid)
+    if entries:
+        write_json_atomic(cache, entries)
+    return entries
+
+
+def definitions(entries):
+    out = []
+    for item in entries:
+        name = item.get("api_name")
+        if not name:
+            continue
+        out.append(
+            {
+                "name": name,
+                "displayName": item.get("name") or name,
+                "description": item.get("description") or "",
+                "hidden": "1" if item.get("hidden") else "0",
+            }
+        )
+    return out
+
+
+def schema_needs_update(path, entries):
+    desired = definitions(entries)
+    existing = read_json(path, None)
+    if not isinstance(existing, list):
+        return True
+    have = {item.get("name") for item in existing if isinstance(item, dict)}
+    return any(item["name"] not in have for item in desired)
+
+
+def write_schema(path, entries):
+    """Create/merge a Goldberg achievement definition list.
+
+    Returns a short status string: created, updated, unchanged.
+    """
+    desired = definitions(entries)
+    if not desired:
+        return "unchanged"
+    existing = read_json(path, None)
+    if existing is None:
+        write_json_atomic(path, desired)
+        return "created"
+    if not isinstance(existing, list):
+        # An unrecognised shape (for example a runtime save copied into the
+        # wrong place) must be preserved before replacing it.
+        backup_file(path, path.with_name(path.name + ".orig"))
+        write_json_atomic(path, desired)
+        return "replaced"
+    have = {item.get("name") for item in existing if isinstance(item, dict)}
+    missing = [item for item in desired if item["name"] not in have]
+    if not missing:
+        return "unchanged"
+    existing.extend(missing)
+    write_json_atomic(path, existing)
+    return "updated"
+
+
+# ---------------------------------------------------------------- Goldberg pool
+
+
+def download_pool():
+    POOL.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(
+        GBE_RELEASES, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            release = json.load(response)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RuntimeError(f"could not query gbe_fork releases: {exc}")
+    assets = release.get("assets") or []
+    preferred = ["emu-win-release-vs26.7z", "emu-win-release-vs22.7z"]
+    asset = next((a for a in assets if a.get("name") in preferred), None)
+    if not asset:
+        raise RuntimeError("no Windows release archive found in the latest gbe_fork release")
+    fd, archive_name = tempfile.mkstemp(prefix="gbe-", suffix=".7z")
+    os.close(fd)
+    archive = Path(archive_name)
+    try:
+        eprint(f"anker-achievements: downloading {asset['name']}...")
+        req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=180) as response, open(archive, "wb") as fh:
+            shutil.copyfileobj(response, fh)
+        extractor = shutil.which("7z") or shutil.which("7zz")
+        if not extractor:
+            raise RuntimeError("7z is required to unpack the Goldberg release")
+        for arch, name in (("x64", "steam_api64.dll"), ("x86", "steam_api.dll")):
+            with tempfile.TemporaryDirectory(prefix="gbe-out-") as tmp:
+                member = f"release/regular/{arch}/{name}"
+                proc = subprocess.run(
+                    [extractor, "e", "-y", str(archive), member, f"-o{tmp}"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                extracted = Path(tmp) / name
+                if proc.returncode != 0 or not extracted.is_file():
+                    if arch == "x64":
+                        raise RuntimeError(f"could not extract {member} from the release")
+                    eprint(f"anker-achievements: no {arch} DLL in the release; 32-bit games need one from a game")
+                    continue
+                shutil.copy2(extracted, POOL / name)
+    finally:
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+
+
+def seed_pool_from_games(games):
+    """Reuse a Goldberg DLL already present in an installed game."""
+    found = {"x64": None, "x86": None}
+    for game in games:
+        if not game["root"].is_dir():
+            continue
+        for d, _dirnames, _filenames in walk_dirs(game["root"], maxdepth=10):
+            for name in DLL_NAMES:
+                path = d / name
+                if path.is_file() and is_goldberg_dll(path):
+                    arch = "x64" if name.endswith("64.dll") else "x86"
+                    if found[arch] is None or path.stat().st_size > found[arch].stat().st_size:
+                        found[arch] = path
+    for arch, path in found.items():
+        if path and not (POOL / path.name).exists():
+            POOL.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, POOL / path.name)
+
+
+def ensure_pool(arch, games):
+    name = "steam_api64.dll" if arch == "x64" else "steam_api.dll"
+    target = POOL / name
+    if target.is_file():
+        return target
+    seed_pool_from_games(games)
+    if target.is_file():
+        return target
+    download_pool()
+    if not target.is_file():
+        raise RuntimeError(f"Goldberg {arch} DLL is still missing after download")
+    return target
+
+
+# ---------------------------------------------------------------- file actions
+
+
+def backup_file(src, dst):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dst = dst.with_name(dst.name + f".{stamp}")
+    shutil.copy2(src, dst)
+    return dst
+
+
+def record_action(state, gid, action):
+    game = state["games"].setdefault(gid, {"actions": []})
+    game.setdefault("actions", []).append(action)
+
+
+def legacy_state_paths(prefix, appid):
+    if not prefix or not appid:
+        return []
+    base = prefix / "drive_c/users/Public/Documents"
+    paths = [
+        base / "Steam/RUNE" / appid,
+        base / "Steam/CODEX" / appid,
+        base / "Steam/EMPRESS" / appid,
+        base / "Steam/SKIDROW" / appid,
+        base / "Steam/RAZOR1911" / appid,
+        base / "Steam/3DM" / appid,
+        base / "EMPRESS" / appid,
+        base / "CODEX" / appid,
+        base / "SKIDROW" / appid,
+    ]
+    return [path for path in paths if path.is_dir()]
+
+
+def move_legacy_state(state, game, appid, prefix, dry_run):
+    gid = game["id"]
+    moved = []
+    for src in legacy_state_paths(prefix, appid):
+        dst = BACKUPS / gid / "legacy-state" / f"{src.parent.name}-{src.name}"
+        if dst.exists():
+            dst = dst.with_name(dst.name + "-" + time.strftime("%Y%m%d-%H%M%S"))
+        if dry_run:
+            moved.append((src, dst))
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        record_action(state, gid, {"type": "move", "src": str(src), "dst": str(dst)})
+        moved.append((src, dst))
+    return moved
+
+
+def ensure_appid_files(state, gid, target_dir, appid, dry_run):
+    """Write steam_appid.txt beside the DLL and in steam_settings."""
+    changes = []
+    for path in (target_dir / "steam_settings/steam_appid.txt", target_dir / "steam_appid.txt"):
+        existed = path.is_file()
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore").strip() if existed else ""
+        except OSError:
+            text = ""
+        if text == appid:
+            continue
+        if dry_run:
+            changes.append(f"write {path}")
+            continue
+        if existed:
+            backup = backup_file(path, BACKUPS / gid / "appid" / path.with_name(path.name + ".orig"))
+            record_action(state, gid, {"type": "modify", "path": str(path), "backup": str(backup)})
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(appid + "\n", encoding="utf-8")
+        if not existed:
+            record_action(state, gid, {"type": "create", "path": str(path)})
+        changes.append(f"wrote {path}")
+    return changes
+
+
+def convert_target(state, game, appid, target, games, dry_run):
+    gid = game["id"]
+    changes = []
+    target_dir = target["dir"]
+    settings_dir = target["settings"]
+    dlls = [p for p in target["dlls"] if not is_goldberg_dll(p)]
+    if not dlls:
+        return changes
+    # Most releases ship both the 32- and 64-bit API. Only the one matching
+    # the game's own executable is used; replacing the other is needless risk.
+    x64 = [p for p in dlls if p.name.lower() == "steam_api64.dll"]
+    if x64:
+        dlls = x64
+
+    for dll in dlls:
+        arch = pe_machine(dll)
+        if arch not in ("x64", "x86"):
+            changes.append(f"skip {dll.name}: unknown architecture")
+            continue
+        if dry_run:
+            changes.append(f"replace {dll} (Goldberg {arch})")
+            continue
+        pool = ensure_pool(arch, games)
+        rel = dll.relative_to(game["root"])
+        backup = backup_file(dll, BACKUPS / gid / rel.with_name(dll.name + ".orig"))
+        record_action(state, gid, {"type": "replace", "path": str(dll), "backup": str(backup)})
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pool, dll)
+        changes.append(f"replaced {dll.name} with Goldberg {arch}")
+
+    if dry_run:
+        changes.extend(ensure_appid_files(state, gid, target_dir, appid, dry_run=True))
+        changes.append(f"write {target['schema']}")
+        return changes
+
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    changes.extend(ensure_appid_files(state, gid, target_dir, appid, dry_run=False))
+
+    schema_state = write_schema(target["schema"], load_schema(appid))
+    if schema_state in ("created", "replaced"):
+        record_action(state, gid, {"type": "create", "path": str(target["schema"])})
+    changes.append(f"schema {schema_state}")
+    return changes
+
+
+def fix_game(game, state, games, dry_run=False, refresh_schema=False):
+    scan = scan_game(game)
+    label = f"{game['id']} {game['title']}"
+    if scan["missing"]:
+        return f"{label}: not installed"
+    if scan["onlinefix"]:
+        return f"{label}: skipped (online-fix; multiplayer emulator left intact)"
+    if scan["running"]:
+        return f"{label}: skipped (game is running)"
+    if not scan["targets"]:
+        return f"{label}: skipped (no Steam emulator)"
+
+    appid = game.get("appid")
+    for target in scan["targets"]:
+        appid = appid or appid_for(game, target["dir"], target["dlls"][0].parent)
+    if not appid:
+        return f"{label}: skipped (could not determine Steam AppID)"
+
+    entries = load_schema(appid, refresh=refresh_schema)
+    if not entries:
+        return f"{label}: skipped (no Steam achievements for appid {appid})"
+
+    prefix = find_prefix(game)
+    changes = []
+    legacy_targets = [t for t in scan["targets"] if t["kind"] == "legacy"]
+    goldberg_targets = [t for t in scan["targets"] if t["kind"] == "goldberg"]
+
+    for target in goldberg_targets:
+        needed = schema_needs_update(target["schema"], entries)
+        if dry_run:
+            if needed:
+                changes.append(f"would write schema {target['schema']}")
+            changes.extend(ensure_appid_files(state, game["id"], target["dir"], appid, True))
+            continue
+        changes.extend(ensure_appid_files(state, game["id"], target["dir"], appid, False))
+        status = write_schema(target["schema"], entries)
+        if status in ("created", "replaced"):
+            record_action(state, game["id"], {"type": "create", "path": str(target["schema"])})
+        if status != "unchanged":
+            changes.append(f"schema {status}")
+
+    for target in legacy_targets:
+        changes.extend(convert_target(state, game, appid, target, games, dry_run))
+
+    if legacy_targets:
+        if prefix:
+            moved = move_legacy_state(state, game, appid, prefix, dry_run)
+            for src, dst in moved:
+                changes.append(f"moved {src} -> {dst}")
+        else:
+            changes.append("no Wine prefix found; old emulator state left in place")
+
+    if not changes:
+        return f"{label}: ok ({game_status(scan)})"
+    if dry_run:
+        return f"{label}: would change\n    " + "\n    ".join(changes)
+    return f"{label}: " + "; ".join(changes)
+
+
+# ---------------------------------------------------------------- commands
+
+
+def cmd_list(args):
+    games = load_games()
+    rows = []
+    for game in games:
+        scan = scan_game(game)
+        rows.append(
+            {
+                "id": game["id"],
+                "title": game["title"],
+                "appid": game.get("appid"),
+                "status": game_status(scan),
+            }
+        )
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("No installed games found in the Anker Launcher library.")
+        return 0
+    width = max(len(r["title"]) for r in rows)
+    for row in rows:
+        print(
+            f"{row['id']:>5}  {row['title']:<{width}}  "
+            f"{row['appid'] or '-':>8}  {row['status']}"
+        )
+    return 0
+
+
+def select_games(args, games):
+    if getattr(args, "all", False) or not getattr(args, "games", None):
+        return games
+    selected = []
+    for selector in args.games:
+        game = find_game(games, selector)
+        if game not in selected:
+            selected.append(game)
+    return selected
+
+
+def cmd_fix(args):
+    games = load_games()
+    selected = select_games(args, games)
+    if not selected:
+        print("No games selected.")
+        return 1
+    state = load_state()
+    changed = 0
+    for game in selected:
+        line = fix_game(
+            game,
+            state,
+            games,
+            dry_run=args.dry_run,
+            refresh_schema=args.refresh_schema,
+        )
+        print(line)
+        if "skipped" not in line and "not installed" not in line and ": ok " not in line:
+            changed += 1
+    if not args.dry_run:
+        save_state(state)
+    return 0
+
+
+def recent_install_ids(hours):
+    events = read_json(ACTIVITY_FILE, [])
+    if not isinstance(events, list):
+        return []
+    cutoff = time.time() - hours * 3600
+    ids = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("kind") != "install" or event.get("outcome") != "completed":
+            continue
+        try:
+            at = float(event.get("at") or 0)
+        except (TypeError, ValueError):
+            continue
+        gid = event.get("game_id")
+        if gid and at >= cutoff and str(gid) not in ids:
+            ids.append(str(gid))
+    return ids
+
+
+def cmd_auto(args):
+    DATA.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    games = load_games()
+    state = load_state()
+    if args.full:
+        # The daily safety net only revisits games that have been played. A
+        # fresh install is handled by the path unit as soon as it completes.
+        selected = [g for g in games if is_played(g)]
+    else:
+        ids = recent_install_ids(args.recent_hours)
+        seen = set(state.get("auto_seen", []))
+        events = [
+            e
+            for e in (read_json(ACTIVITY_FILE, []) or [])
+            if isinstance(e, dict)
+            and e.get("kind") == "install"
+            and e.get("outcome") == "completed"
+            and str(e.get("game_id")) in ids
+        ]
+        new_events = [e for e in events if e.get("id") not in seen]
+        if not new_events:
+            return 0
+        selected = [
+            g for g in games if g["id"] in {str(e.get("game_id")) for e in new_events}
+        ]
+        for event in new_events:
+            seen.add(event.get("id"))
+        state["auto_seen"] = list(seen)[-200:]
+
+    if not selected:
+        return 0
+    for game in selected:
+        line = fix_game(game, state, games, dry_run=False, refresh_schema=False)
+        if not args.quiet or "skipped" not in line:
+            print(line, flush=True)
+    save_state(state)
+    return 0
+
+
+def cmd_restore(args):
+    games = load_games()
+    state = load_state()
+    selected = select_games(args, games) if getattr(args, "all", False) else [
+        find_game(games, selector) for selector in args.games
+    ]
+    restored = 0
+    for game in selected:
+        gid = game["id"]
+        entry = state["games"].get(gid)
+        if not entry or not entry.get("actions"):
+            print(f"{gid} {game['title']}: nothing recorded to restore")
+            continue
+        if game_running(game["root"]):
+            print(f"{gid} {game['title']}: skipped (game is running)")
+            continue
+        if args.dry_run:
+            print(f"{gid} {game['title']}: would undo {len(entry['actions'])} actions")
+            continue
+        for action in reversed(entry["actions"]):
+            kind = action.get("type")
+            try:
+                if kind == "replace":
+                    shutil.copy2(action["backup"], action["path"])
+                elif kind == "modify":
+                    shutil.copy2(action["backup"], action["path"])
+                elif kind == "create":
+                    Path(action["path"]).unlink(missing_ok=True)
+                elif kind == "move":
+                    src, dst = Path(action["src"]), Path(action["dst"])
+                    if dst.exists():
+                        src.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(dst), str(src))
+            except OSError as exc:
+                eprint(f"{gid}: could not undo {kind} {action}: {exc}")
+        state["games"].pop(gid, None)
+        restored += 1
+        print(f"{gid} {game['title']}: restored")
+    if restored and not args.dry_run:
+        save_state(state)
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="anker-achievements",
+        description="Add working Steam achievements to non-online AnkerGames titles.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_list = sub.add_parser("list", help="show every installed game and its emulator status")
+    p_list.add_argument("--json", action="store_true", help="machine-readable output")
+    p_list.set_defaults(func=cmd_list)
+
+    p_fix = sub.add_parser(
+        "fix",
+        help="convert RUNE-style emulators to Goldberg and write the Steam schema",
+    )
+    p_fix.add_argument("games", nargs="*", help="game id, slug or title substring")
+    p_fix.add_argument("--all", action="store_true", help="every installed game (default)")
+    p_fix.add_argument("--dry-run", action="store_true", help="show what would change")
+    p_fix.add_argument(
+        "--refresh-schema",
+        action="store_true",
+        help="ignore the cached Steam schema and fetch it again",
+    )
+    p_fix.set_defaults(func=cmd_fix)
+
+    p_auto = sub.add_parser(
+        "auto",
+        help="quiet, lock-protected run for the systemd units",
+    )
+    p_auto.add_argument(
+        "--full",
+        action="store_true",
+        help="scan every installed game instead of just completed installs",
+    )
+    p_auto.add_argument(
+        "--recent-hours",
+        type=float,
+        default=6.0,
+        help="how far back to look for completed installs (default: 6)",
+    )
+    p_auto.add_argument("--quiet", action="store_true", help="only report real changes")
+    p_auto.set_defaults(func=cmd_auto)
+
+    p_restore = sub.add_parser("restore", help="undo a conversion recorded by this tool")
+    p_restore.add_argument("games", nargs="*", help="game id, slug or title substring")
+    p_restore.add_argument("--all", action="store_true", help="restore every recorded game")
+    p_restore.add_argument("--dry-run", action="store_true", help="show the plan only")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_pool = sub.add_parser("pool", help="populate the local Goldberg DLL cache")
+    p_pool.add_argument("--download", action="store_true", help="download the latest gbe_fork release")
+    p_pool.set_defaults(func=cmd_pool)
+
+    return parser
+
+
+def cmd_pool(args):
+    games = load_games()
+    if args.download:
+        download_pool()
+    else:
+        seed_pool_from_games(games)
+        for name in DLL_NAMES:
+            path = POOL / name
+            print(f"{name}: {'ok' if path.is_file() else 'missing'}")
+    return 0
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

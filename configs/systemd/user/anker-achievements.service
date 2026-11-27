@@ -1,0 +1,12 @@
+[Unit]
+Description=Convert newly installed AnkerGames titles to Goldberg achievements
+Documentation=man:anker-achievements(1)
+# Coalesce the burst of writes the launcher makes while downloading.
+TriggerLimitIntervalSec=30
+TriggerLimitBurst=1
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/anker-achievements auto --quiet
+Nice=10
+IOSchedulingClass=idle

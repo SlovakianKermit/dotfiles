@@ -1,0 +1,9 @@
+[Unit]
+Description=Daily AnkerGames achievement safety scan
+Documentation=man:anker-achievements(1)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/anker-achievements auto --full --quiet
+Nice=10
+IOSchedulingClass=idle
