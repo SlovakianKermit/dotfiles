@@ -1,4 +1,4 @@
-.TH CUMCAMS-DL 1 "2026-11-13" "cumcams-dl" "User Commands"
+.TH CUMCAMS-DL 1 "2026-11-27" "cumcams-dl" "User Commands"
 .SH NAME
 cumcams-dl \- download cumcams.cc videos over HLS, queueing several at once
 .SH SYNOPSIS
@@ -11,6 +11,10 @@ cumcams-dl \- download cumcams.cc videos over HLS, queueing several at once
 \fB\-f\fR \fIFILE\fR
 [\fB\-P\fR \fIN\fR]
 [\fIOPTIONS\fR]
+.P
+.B cumcams-dl
+\fB\-q\fR
+\fB\-f\fR \fIFILE\fR
 .SH DESCRIPTION
 .B cumcams-dl
 downloads archived shows from
@@ -56,6 +60,15 @@ videos at once. Default:
 This is the main throughput lever: the 2 MB/s ceiling applies per video, so
 two videos roughly double the aggregate rate (measured 3.47 MB/s across two,
 against 2.05 MB/s for one). Values above three are untested.
+.TP
+.B \-q, \-\-queue
+Queue mode: download one video at a time, strictly in the order the URLs were
+given, logging
+.IR "job i/N"
+before each. Any
+.B \-P
+value is ignored. Use this when the connection shield must not be provoked, or
+when a predictable order matters. A failure does not abort the queue.
 .TP
 .BI \-o " DIR"
 Output directory for finished files. Default:
@@ -159,6 +172,10 @@ Up to
 jobs run at the same time, each in its own thread with its own
 .BR yt\-dlp
 process, its own work directory, and its own 2 MB/s budget.
+With
+.B \-\-queue
+exactly one job runs at a time, in list order, which trades aggregate
+throughput for a gentler connection footprint.
 A failed video does not stop the others; the exit status reports the failure
 and re-running the same command resumes only the missing chunks.
 .SS Resume
@@ -220,6 +237,12 @@ Queue everything in a list file, three at a time:
 .IP
 .EX
 cumcams-dl \-f ~/cams-todo.txt \-P 3
+.EE
+.P
+Queue a list file one at a time, in order:
+.IP
+.EX
+cumcams-dl \-q \-f ~/cams-todo.txt
 .EE
 .P
 Send a single show somewhere else under a chosen name:

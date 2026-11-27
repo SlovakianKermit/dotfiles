@@ -45,7 +45,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -444,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="read URLs from FILE, one per line; # starts a comment")
     ap.add_argument("-P", "--parallel", type=int, default=2,
                     help="videos to download at once (default: 2)")
+    ap.add_argument("-q", "--queue", action="store_true",
+                    help="queue mode: one video at a time, in the order given")
     ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_OUT,
                     help=f"output directory (default: {DEFAULT_OUT})")
     ap.add_argument("-n", "--name",
@@ -475,23 +477,41 @@ def main(argv: list[str] | None = None) -> int:
             raise Failure("--name only makes sense with a single URL")
         check_deps(need_ffmpeg=not args.no_mux)
 
-        log(f"{len(urls)} video(s), {args.parallel} at a time")
         failures: list[tuple[str, str]] = []
         done: list[Path] = []
 
-        workers = max(1, min(args.parallel, len(urls)))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(process_video, u, args): u for u in urls}
-            for fut in concurrent.futures.as_completed(futures):
-                url = futures[fut]
+        if args.queue and args.parallel > 1:
+            log("queue mode: ignoring --parallel, one video at a time")
+        workers = 1 if args.queue else max(1, min(args.parallel, len(urls)))
+        log(f"{len(urls)} video(s), {'queued' if args.queue else f'{workers} at a time'}")
+
+        def record(url: str, exc: Failure | None, dest: Path | None) -> None:
+            if exc is not None:
+                failures.append((url, str(exc)))
+                print(f"cumcams-dl: {url}: {exc}", file=sys.stderr)
+            elif dest:
+                done.append(dest)
+
+        if args.queue:
+            for i, url in enumerate(urls, 1):
+                log(f"job {i}/{len(urls)}: {url}")
                 try:
-                    dest = fut.result()
+                    dest = process_video(url, args)
                 except Failure as exc:
-                    failures.append((url, str(exc)))
-                    print(f"cumcams-dl: {url}: {exc}", file=sys.stderr)
+                    record(url, exc, None)
                 else:
-                    if dest:
-                        done.append(dest)
+                    record(url, None, dest)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(process_video, u, args): u for u in urls}
+                for fut in concurrent.futures.as_completed(futures):
+                    url = futures[fut]
+                    try:
+                        dest = fut.result()
+                    except Failure as exc:
+                        record(url, exc, None)
+                    else:
+                        record(url, None, dest)
 
         if done:
             log(f"finished {len(done)} file(s) in {args.outdir.expanduser()}")
