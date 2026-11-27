@@ -54,3 +54,8 @@ window-width = 150
 window-height = 40
 
 gtk-custom-css = ~/.config/ghostty/tab-style.css
+
+# Never ask for confirmation when closing a surface, even if a process is
+# running. Prevents the "process is still running" dialog from blocking
+# window close (e.g. on suspend/shutdown).
+confirm-close-surface = false

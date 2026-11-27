@@ -21,7 +21,6 @@ bluez-obex
 bluez-utils
 breeze-gtk
 btop
-btrfs-assistant
 btrfs-progs
 calf
 cantarell-fonts

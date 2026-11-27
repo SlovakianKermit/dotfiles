@@ -1,5 +1,6 @@
 amd-ucode
 brave-bin
+btrfs-assistant
 cachyos-emerald-kde-theme-git
 cachyos-fish-config
 cachyos-gaming-applications
