@@ -74,6 +74,36 @@ when a predictable order matters. A failure does not abort the queue.
 Output directory for finished files. Default:
 .IR ~/Videos/cumcams .
 .TP
+.BI \-\-staging " DIR"
+Scratch directory holding the per-video work directories. Default:
+.RB $TMPDIR
+if set, otherwise
+.IR /var/tmp .
+Never fall back to a RAM-backed
+.I /tmp
+by accident: a full stream is several GiB and a filled tmpfs takes the whole
+session down with it.
+.TP
+.B \-\-clean
+Delete every
+.IR cumcams\-dl\- ID
+work directory in the staging root before doing anything else. With no URLs and
+no
+.B \-\-file
+it cleans and exits with status 0. Do not run it while another
+.B cumcams-dl
+is downloading, since it removes that run's partial data as well.
+.TP
+.BI \-\-stale\-days " N"
+At startup, delete work directories in the staging root whose modification time
+is more than
+.I N
+days old. Default:
+.BR 3 .
+Set to
+.B 0
+to disable the sweep.
+.TP
 .BI \-n " NAME"
 Output basename, without extension. Only valid with a single URL; with several
 names are derived from each stream path, e.g.\&
@@ -183,7 +213,7 @@ Chunks are named
 .IR NAME .0000.ts ,
 .IR NAME .0001.ts ,
 and so on, inside
-.IR ${TMPDIR}/cumcams-dl-\fIID\fR .
+.IR \fISTAGING\fR/cumcams\-dl\- ID .
 A chunk that is already complete is skipped, so re-running the same command
 continues where the previous run stopped, for every video in the queue.
 Work directories are removed once the remux succeeds unless
@@ -191,6 +221,29 @@ Work directories are removed once the remux succeeds unless
 or
 .B \-\-no\-mux
 is given.
+.P
+The merge is written to
+.IR NAME .mkv.part
+and renamed only after
+.BR ffmpeg (1)
+exits cleanly, so a killed run never leaves a truncated
+.I .mkv
+in the output directory.
+.SS Staging and disk space
+The work directory is deliberately on disk, not on a tmpfs, and is kept after a
+failure so the run can be resumed. Leftover directories are therefore the only
+thing that can grow without bound; the startup sweep
+.RB ( \-\-stale\-days )
+and
+.B \-\-clean
+exist to bound them.
+.P
+Two guards stop work before the disk fills:
+.B cumcams-dl
+refuses to start when the staging filesystem has less than 5 GiB free, and
+aborts mid-run when free space drops under 1 GiB, printing the path of the
+retained work directory. Before the merge it also checks that the output
+directory can hold the result.
 .SS Edge node discovery
 The API returns one edge host such as
 .I vi5b.cdnhlscloud.com
@@ -266,6 +319,19 @@ command. Completed chunks are skipped.
 .EX
 cumcams-dl \-f ~/cams-todo.txt
 .EE
+.P
+Reclaim the space left behind by abandoned downloads:
+.IP
+.EX
+cumcams-dl \-\-clean
+.EE
+.P
+Stage a large show on a specific disk instead of the default:
+.IP
+.EX
+cumcams-dl \-\-staging /mnt/data_storage/tmp \e
+    https://cumcams.cc/video/200367738/play
+.EE
 .SH EXIT STATUS
 .TP
 .B 0
@@ -285,10 +351,14 @@ Interrupted with SIGINT. Re-running the same command resumes.
 .I ~/Videos/cumcams
 Default output directory.
 .TP
-.I ${TMPDIR}/cumcams-dl-\fIID\fR
+.I /var/tmp/cumcams-dl-\fIID\fR
 Per-video work directory holding chunk playlists and intermediate
 .I .ts
-files.
+files, when
+.RB $TMPDIR
+is unset. Under
+.I /tmp
+this is a RAM-backed tmpfs and will exhaust memory instead of disk.
 .SH SEE ALSO
 .BR yt\-dlp (1),
 .BR ffmpeg (1)

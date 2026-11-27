@@ -26,18 +26,23 @@ Two details matter enough to be worth stating:
   The default of five is deliberate; raising it makes downloads slower.
 
 Chunks are written to a work directory keyed by video id, so an interrupted
-run resumes at the first missing chunk instead of starting over.
+run resumes at the first missing chunk instead of starting over.  The work
+directory lives on real disk (``--staging``, else ``$TMPDIR``, else
+``/var/tmp``), never in a RAM-backed /tmp: a full stream is several GiB and
+filling a tmpfs takes the whole desktop down with it.  Stale work dirs are
+garbage-collected on start, and the merge writes ``.part`` files so a killed
+mux never leaves a truncated .mkv behind.
 """
 
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import os
 import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -45,7 +50,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -53,6 +58,10 @@ UA = (
 )
 BASE = "https://cumcams.cc"
 DEFAULT_OUT = Path.home() / "Videos" / "cumcams"
+DEFAULT_STAGING = Path("/var/tmp")
+SPACE_FLOOR = 5 * 1024**3      # refuse to start below this much free staging
+SPACE_MARGIN = 1 * 1024**3     # abort a run that drops below this
+STALE_DAYS = 3
 
 # The site sits behind a BunnyCDN shield that answers 403 to plain requests.
 # These are the headers a real navigation actually sends.
@@ -306,13 +315,67 @@ def build_name(playlist_url: str, title: str) -> str:
     return clean[:120] or "video"
 
 
+def staging_root(args: argparse.Namespace) -> Path:
+    """Where chunk work dirs go: --staging, else $TMPDIR, else /var/tmp."""
+    if args.staging:
+        return args.staging.expanduser()
+    env = os.environ.get("TMPDIR")
+    if env:
+        return Path(env).expanduser()
+    return DEFAULT_STAGING
+
+
+def tree_size(root: Path) -> int:
+    total = 0
+    for f in root.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def ensure_space(path: Path, need: int, what: str) -> None:
+    """Fail early rather than mid-run on ENOSPC. Best effort on odd filesystems."""
+    try:
+        free = shutil.disk_usage(path).free
+    except OSError:
+        return
+    if free < need:
+        raise Failure(f"{what}: only {human(free)} free, need about {human(need)}")
+
+
+def gc_stale(root: Path, days: float | None) -> None:
+    """Delete cumcams-dl-* work dirs in root. days=None means all of them."""
+    cutoff = None if days is None else time.time() - days * 86400
+    try:
+        candidates = sorted(root.glob("cumcams-dl-*"))
+    except OSError:
+        return
+    for d in candidates:
+        try:
+            if not d.is_dir():
+                continue
+            if cutoff is not None and d.lstat().st_mtime >= cutoff:
+                continue
+            size = tree_size(d)
+            shutil.rmtree(d)
+        except OSError as exc:
+            log(f"cannot clean {d}: {exc.strerror or exc}")
+            continue
+        log(f"cleaned stale work dir {d} ({human(size)})")
+
+
 def concat_chunks(chunks: list[Path], tmpdir: Path, dest: Path) -> None:
     listing = tmpdir / "concat.txt"
     listing.write_text("".join(f"file '{c.as_posix()}'\n" for c in chunks))
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "concat", "-safe", "0", "-i", str(listing),
-        "-c", "copy", "-map", "0", str(dest),
+        "-c", "copy", "-map", "0",
+        # explicit muxer: the destination is a *.part while it is being written
+        "-f", "matroska", str(dest),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -351,8 +414,12 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
     if len(hosts) > 1:
         say("edge nodes: " + ", ".join(hosts))
 
-    work = Path(tempfile.gettempdir()) / f"cumcams-dl-{vid}"
-    work.mkdir(parents=True, exist_ok=True)
+    work = staging_root(args) / f"cumcams-dl-{vid}"
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise Failure(f"cannot create work dir {work}: {exc.strerror or exc}") from exc
+    ensure_space(work, SPACE_FLOOR, f"staging {work} is short on space (try --staging)")
     outdir = args.outdir.expanduser()
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -366,6 +433,14 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
 
     def worker(host: str, indices: list[int]) -> None:
         for idx in indices:
+            try:
+                free = shutil.disk_usage(work).free
+            except OSError:
+                free = SPACE_MARGIN
+            if free < SPACE_MARGIN:
+                raise Failure(
+                    f"staging filesystem nearly full ({human(free)} left); stopped before "
+                    f"the disk filled up, work dir kept at {work}")
             pl = work / f"{name}.{idx:04d}.m3u8"
             dest = work / f"{name}.{idx:04d}.ts"
             write_playlist(pl, chunks[idx], target, host)
@@ -385,7 +460,10 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
             fut.result()
 
     if errors:
-        raise Failure(f"{len(errors)} chunk(s) failed; re-run to resume:\n  " + "\n  ".join(errors))
+        raise Failure(
+            f"{len(errors)} chunk(s) failed; re-run to resume\n"
+            f"  partial data: {work} ({human(tree_size(work))})\n  "
+            + "\n  ".join(errors))
 
     ordered = [results[i] for i in range(len(chunks))]
     if args.no_mux:
@@ -393,8 +471,12 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
         return None
 
     dest = outdir / f"{name}.mkv"
+    ensure_space(outdir, sum(c.stat().st_size for c in ordered) + SPACE_MARGIN,
+                 f"not enough room for {dest}")
+    part = dest.with_name(dest.name + ".part")
     say(f"concatenating {len(ordered)} chunks -> {dest}")
-    concat_chunks(ordered, work, dest)
+    concat_chunks(ordered, work, part)
+    part.replace(dest)
     say(f"done: {dest} ({human(dest.stat().st_size)})")
 
     if not args.keep_chunks:
@@ -448,6 +530,15 @@ def main(argv: list[str] | None = None) -> int:
                     help="queue mode: one video at a time, in the order given")
     ap.add_argument("-o", "--outdir", type=Path, default=DEFAULT_OUT,
                     help=f"output directory (default: {DEFAULT_OUT})")
+    ap.add_argument("--staging", type=Path,
+                    help="scratch directory for chunk staging "
+                         f"(default: $TMPDIR, else {DEFAULT_STAGING})")
+    ap.add_argument("--clean", action="store_true",
+                    help="delete every work dir in the staging root first; "
+                         "exits if no URLs were given")
+    ap.add_argument("--stale-days", type=float, default=STALE_DAYS,
+                    help="auto-delete work dirs older than N days at start; "
+                         f"0 disables (default: {STALE_DAYS:g})")
     ap.add_argument("-n", "--name",
                     help="output basename; only valid with a single URL")
     ap.add_argument("-j", "--jobs", type=int, default=2,
@@ -472,6 +563,18 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     try:
+        staging = staging_root(args)
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise Failure(f"cannot use staging dir {staging}: {exc.strerror or exc}") from exc
+        if args.clean:
+            gc_stale(staging, None)
+            if not (args.urls or args.file):
+                return 0
+        elif args.stale_days > 0:
+            gc_stale(staging, args.stale_days)
+
         urls = collect_urls(args)
         if args.name and len(urls) > 1:
             raise Failure("--name only makes sense with a single URL")
