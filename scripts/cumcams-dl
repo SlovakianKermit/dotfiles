@@ -26,7 +26,9 @@ Two details matter enough to be worth stating:
   The default of five is deliberate; raising it makes downloads slower.
 
 Chunks are written to a work directory keyed by video id, so an interrupted
-run resumes at the first missing chunk instead of starting over.  The work
+run resumes at the first missing chunk instead of starting over, and a video
+whose output .mkv is already complete is skipped outright (``--overwrite``
+forces a fresh download).  The work
 directory lives on real disk (``--staging``, else ``$TMPDIR``, else
 ``/var/tmp``), never in a RAM-backed /tmp: a full stream is several GiB and
 filling a tmpfs takes the whole desktop down with it.  Stale work dirs are
@@ -50,7 +52,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -399,6 +401,12 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
     name = args.name or build_name(m3u8, title)
     tag = f"[{name}]"
 
+    outdir = args.outdir.expanduser()
+    dest = outdir / f"{name}.mkv"
+    if not args.no_mux and not args.overwrite and chunk_complete(dest):
+        say(f"already present, skipping: {dest}")
+        return dest
+
     segs, target = fetch_playlist(m3u8)
     duration = len(segs) * target
     say(f"{len(segs)} segments, {duration // 3600}h{duration % 3600 // 60:02d}m")
@@ -420,7 +428,6 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
     except OSError as exc:
         raise Failure(f"cannot create work dir {work}: {exc.strerror or exc}") from exc
     ensure_space(work, SPACE_FLOOR, f"staging {work} is short on space (try --staging)")
-    outdir = args.outdir.expanduser()
     outdir.mkdir(parents=True, exist_ok=True)
 
     size = max(1, args.chunk_size)
@@ -470,7 +477,6 @@ def process_video(page_url: str, args: argparse.Namespace) -> Path | None:
         say(f"chunks left in {work}")
         return None
 
-    dest = outdir / f"{name}.mkv"
     ensure_space(outdir, sum(c.stat().st_size for c in ordered) + SPACE_MARGIN,
                  f"not enough room for {dest}")
     part = dest.with_name(dest.name + ".part")
@@ -557,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="keep the per-chunk .ts files")
     ap.add_argument("--no-mux", action="store_true",
                     help="do not concat/remux; leave chunks in place")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="re-download videos whose output .mkv already exists")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print the resolved stream URL")
     ap.add_argument("-V", "--version", action="version", version=f"cumcams-dl {VERSION}")

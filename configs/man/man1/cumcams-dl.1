@@ -1,4 +1,4 @@
-.TH CUMCAMS-DL 1 "2026-11-27" "cumcams-dl" "User Commands"
+.TH CUMCAMS-DL 1 "2026-11-28" "cumcams-dl" "User Commands"
 .SH NAME
 cumcams-dl \- download cumcams.cc videos over HLS, queueing several at once
 .SH SYNOPSIS
@@ -161,6 +161,12 @@ files in the work directory and skip the
 .BR ffmpeg (1)
 concat and remux.
 .TP
+.B \-\-overwrite
+Download a video even when its output
+.I .mkv
+already exists. Without this flag a finished file is left alone, so re-running
+a list file only fetches what is missing.
+.TP
 .B \-v, \-\-verbose
 Print each resolved stream URL and page title.
 .TP
@@ -207,8 +213,22 @@ With
 exactly one job runs at a time, in list order, which trades aggregate
 throughput for a gentler connection footprint.
 A failed video does not stop the others; the exit status reports the failure
-and re-running the same command resumes only the missing chunks.
+and re-running the same command fetches only what is missing: videos whose
+output
+.I .mkv
+is already complete are skipped before any segment is requested.
 .SS Resume
+A video whose output
+.IR NAME .mkv
+already exists in the output directory and is larger than 1 KiB is skipped
+outright, which is what makes re-running a list file cheap: the
+page is still resolved to derive
+.I NAME
+(one metadata request per URL), but no playlist or segment is fetched.
+Pass
+.B \-\-overwrite
+to force such a video to be downloaded and replaced again.
+.P
 Chunks are named
 .IR NAME .0000.ts ,
 .IR NAME .0001.ts ,
@@ -314,7 +334,8 @@ cumcams-dl \-\-max\-segments 30 \-\-chunk\-size 30 \e
 .EE
 .P
 Recover from a CDN rate-limit: wait a few minutes, then re-run the identical
-command. Completed chunks are skipped.
+command. Finished videos and completed chunks are skipped, so only the
+incomplete ones are retried.
 .IP
 .EX
 cumcams-dl \-f ~/cams-todo.txt
